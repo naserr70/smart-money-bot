@@ -24,47 +24,47 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
-# ==================== تنظیمات (قابل تغییر با Environment Variables) ====================
+# ==================== تنظیمات ====================
 MIN_INFLOW_USD_5M = float(os.environ.get("MIN_INFLOW_USD_5M", 50_000))
 VOLUME_SPIKE_RATIO = float(os.environ.get("VOLUME_SPIKE_RATIO", 2.5))
 PRICE_PUMP_MIN = float(os.environ.get("PRICE_PUMP_MIN", 1.0))
 PRICE_PUMP_MAX = float(os.environ.get("PRICE_PUMP_MAX", 8.0))
-ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", 1800))  # ۳۰ دقیقه بین دو هشدار برای یک نماد
+ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", 1800))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 300))
 SEND_STATUS_REPORT = os.environ.get("SEND_STATUS_REPORT", "true").lower() == "true"
-HISTORY_WINDOW = int(os.environ.get("HISTORY_WINDOW", 12))  # تعداد دورهای قبلی برای میانگین حجم واقعی (۱۲ دور = ۱ ساعت)
+HISTORY_WINDOW = int(os.environ.get("HISTORY_WINDOW", 12))
+AUTO_DELETE_DELAY_SEC = int(os.environ.get("AUTO_DELETE_DELAY_SEC", 300))  # ۵ دقیقه برای حذف پیام‌های معمولی
 
-# 🗺️ لیست کامل تمامی رمزارزهای نوبیتکس (شامل پایه ریالی IRT + پایه تتری USDT)
-# معادل تمام ارزهای بازار نوبیتکس بر پایه USDT در مارکت جهانی
+# 🗺️ لیست کامل رمزارزهای نوبیتکس
 NOBITEX_ALL_ASSETS = [
-    # --- بیت‌کوین و ارزهای اصلی (Majors) ---
+    # --- بیت‌کوین و ارزهای اصلی ---
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
     "TRXUSDT", "DOTUSDT", "LINKUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "UNIUSDT",
     "ETCUSDT", "XLMUSDT", "STXUSDT", "XMRUSDT", "FILUSDT", "ATOMUSDT", "EGLDUSDT", "ALGOUSDT",
     "VETUSDT", "ICPUSDT", "HBARUSDT", "THETAUSDT", "XTZUSDT", "EOSUSDT", "IOTAUSDT", "NEOUSDT",
 
-    # --- لایه ۱، لایه ۲ و زیرساخت‌ها (L1 / L2) ---
+    # --- لایه ۱، لایه ۲ و زیرساخت‌ها ---
     "APTUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "MATICUSDT", "POLUSDT", "FTMUSDT", "INJUSDT",
     "TIAUSDT", "SEIUSDT", "STRKUSDT", "KASUSDT", "FLOWUSDT", "RONUSDT", "MANTRAUSDT", "MINAUSDT",
     "KAVAUSDT", "ASTRUSDT", "ANKRUSDT", "ROSEUSDT", "ZILUSDT", "IOTXUSDT", "ONEUSDT", "CKBUSDT",
     "GLMRUSDT", "MOVRUSDT", "STRAXUSDT", "KLAYUSDT", "CELOUSDT", "SKLUSDT", "QNTUSDT", "LDOUSDT",
     "METISUSDT", "MANTAUSDT", "ALTUSDT", "ZKUSDT", "EIGENUSDT", "SCRUSDT", "TAOUSDT",
 
-    # --- میم‌کوین‌ها و اکوسیستم تلگرام/تون (Memecoins & Telegram/TON Ecosystem) ---
+    # --- میم‌کوین‌ها و اکوسیستم تلگرام/تون ---
     "PEPEUSDT", "FLOKIUSDT", "BONKUSDT", "WIFUSDT", "NOTUSDT", "DOGSUSDT", "HMSTRUSDT", "TONUSDT",
     "MEMEUSDT", "PEOPLEUSDT", "BOMEUSDT", "NEIROUSDT", "CATSUSDT", "MAJORUSDT", "PENGUUSDT",
     "POPCATUSDT", "BABYDOGEUSDT", "1000SATSUSDT", "TURBOUSDT", "MYROUSDT", "MEWUSDT", "BRETTUSDT",
     "DEGENUSDT", "SLERFUSDT", "MOGUSDT", "COQUSDT", "SMILEUSDT", "LUNCUSDT", "USTCUSDT",
     "PNUTUSDT", "ACTUSDT", "MOODENGUSDT", "GOATUSDT", "HIPPOUSDT", "CATS-USDT", "XUSDT",
 
-    # --- دیفای، اوراکل و صرافی‌ها (DeFi & Yield) ---
+    # --- دیفای، اوراکل و صرافی‌ها ---
     "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "DYDXUSDT", "JUPUSDT", "PYTHUSDT", "PENDLEUSDT", "ENAUSDT",
     "ONDOUSDT", "OMUSDT", "RAYUSDT", "ORDIUSDT", "BLURUSDT", "ENSUSDT", "CRVUSDT", "MKRUSDT",
     "SNXUSDT", "COMPUSDT", "1INCHUSDT", "CAKEUSDT", "SUSHIUSDT", "CVXUSDT", "RPLUSDT", "BALUSDT",
     "FXSUSDT", "YFIUSDT", "KNCUSDT", "ZRXUSDT", "ALPHAUSDT", "BADGERUSDT", "REQUSDT", "DRIFTUSDT",
     "AEVOUSDT", "ETHFIUSDT", "MORPHOUSDT", "COWUSDT",
 
-    # --- هوش مصنوعی، متاورس و گیمینگ (AI & Gaming) ---
+    # --- هوش مصنوعی، متاورس و گیمینگ ---
     "FETUSDT", "AGIXUSDT", "OCEANUSDT", "RENDERUSDT", "RNDRUSDT", "WLDUSDT", "ARKMUSDT", "JTOUSDT",
     "SANDUSDT", "MANAUSDT", "AXSUSDT", "CHZUSDT", "GALAUSDT", "GMTUSDT", "AUDIOUSDT", "SLPUSDT",
     "ILVUSDT", "ALICEUSDT", "MAGICUSDT", "HIGHUSDT", "YGGUSDT", "SUPERUSDT", "PIXELUSDT",
@@ -78,7 +78,7 @@ NOBITEX_ALL_ASSETS = [
     "TFUELUSDT", "GASUSDT", "PROMUSDT", "LOOMUSDT", "SSVUSDT", "WAXPUSDT", "STEEMUSDT"
 ]
 
-# 🔄 نقشه متناظر‌سازی نمادها برای تطبیق با صرافی‌های بین‌المللی (Mapping Aliases)
+# 🔄 نقشه متناظر‌سازی نمادها (Mapping Aliases)
 SYMBOL_ALIASES = {
     "1000SATSUSDT": ["SATSUSDT", "1000SATS-USDT", "SATS-USDT"],
     "BABYDOGEUSDT": ["BABYDOGE-USDT", "1000000BABYDOGEUSDT", "BABYDOGEUSDT"],
@@ -91,19 +91,16 @@ SYMBOL_ALIASES = {
     "FLOKIUSDT": ["1000FLOKIUSDT", "FLOKI-USDT"]
 }
 
-# ساخت مجموعه جستجوی سریع
 target_symbols_set = set(NOBITEX_ALL_ASSETS)
-
-# افزودن نام‌های جایگزین به مجموعه تطبیق
 for main_symbol, aliases in SYMBOL_ALIASES.items():
     for alias in aliases:
         clean_alias = alias.replace("-", "")
         target_symbols_set.add(clean_alias)
 
-# ==================== وضعیت داخلی (state) ====================
+# ==================== وضعیت داخلی (State) ====================
 previous_market_snapshot = {}
-volume_history = {}          # symbol -> deque(maxlen=HISTORY_WINDOW) از inflowهای واقعی قبلی
-last_alert_time = {}         # symbol -> epoch زمان آخرین هشدار (برای کول‌داون)
+volume_history = {}
+last_alert_time = {}
 bot_state = {
     "last_cycle_at": None,
     "last_error": None,
@@ -112,7 +109,6 @@ bot_state = {
 }
 state_lock = threading.Lock()
 
-# ==================== HTTP Session با Retry ====================
 def build_session():
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
@@ -122,26 +118,45 @@ def build_session():
 
 http_session = build_session()
 
-
 def send_telegram(text):
+    """ارسال پیام معمولی و دائمی (مخصوص سیگنال‌ها)"""
     if not BOT_TOKEN or not CHAT_ID:
         log.error("BOT_TOKEN یا CHAT_ID تنظیم نشده است.")
-        return False
+        return None
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
         res = http_session.post(url, json=payload, timeout=10)
-        if res.status_code != 200:
-            log.warning(f"ارسال تلگرام ناموفق: {res.status_code} - {res.text[:200]}")
-        return res.status_code == 200
+        if res.status_code == 200:
+            return res.json().get("result", {}).get("message_id")
+        return None
     except Exception as e:
         log.error(f"خطا در ارسال پیام تلگرام: {e}")
-        return False
+        return None
 
+def delete_telegram_message(message_id):
+    """حذف یک پیام مشخص بر اساس message_id"""
+    if not BOT_TOKEN or not CHAT_ID or not message_id:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    payload = {"chat_id": CHAT_ID, "message_id": message_id}
+    try:
+        http_session.post(url, json=payload, timeout=10)
+    except Exception as e:
+        log.error(f"خطا در حذف پیام تلگرام: {e}")
+
+def send_and_schedule_delete(text, delay=AUTO_DELETE_DELAY_SEC):
+    """ارسال پیام موقت و زمان‌بندی حذف آن پس از چند ثانیه (مخصوص گزارش وضعیت)"""
+    msg_id = send_telegram(text)
+    if msg_id:
+        def delayed_delete():
+            time.sleep(delay)
+            delete_telegram_message(msg_id)
+        
+        threading.Thread(target=delayed_delete, daemon=True).start()
 
 def send_telegram_chunked(messages, max_len=3500):
-    """چند پیام کوچک را در قالب کمترین تعداد پیام تلگرام (برای جلوگیری از flood) ارسال می‌کند."""
     if not messages:
         return
     buffer = ""
@@ -154,9 +169,7 @@ def send_telegram_chunked(messages, max_len=3500):
     if buffer:
         send_telegram(buffer)
 
-
 def fetch_binance_ticker_data():
-    """دریافت داده‌های زنده جهانی از اندپوینت‌های مستقیم بایننس به همراه تطبیق Aliasها"""
     endpoints = [
         "https://api1.binance.com/api/v3/ticker/24hr",
         "https://api2.binance.com/api/v3/ticker/24hr",
@@ -181,24 +194,16 @@ def fetch_binance_ticker_data():
                         filtered[final_sym] = item
                 if filtered:
                     return filtered
-                log.warning(f"بایننس {url} پاسخ داد اما هیچ نمادی مچ نشد.")
-            else:
-                log.warning(f"بایننس {url} -> HTTP {res.status_code}: {res.text[:150]}")
         except Exception as e:
-            log.warning(f"اندپوینت {url} خطا داد: {e}")
+            log.warning(f"بایننس {url} خطا داد: {e}")
 
     return {}
 
-
 def fetch_kucoin_ticker_data():
-    """
-    منبع جایگزین: KuCoin معمولاً روی سرورهای کلاود بلاک جغرافیایی بایننس را ندارد.
-    """
     url = "https://api.kucoin.com/api/v1/market/allTickers"
     try:
         res = http_session.get(url, timeout=10)
         if res.status_code != 200:
-            log.warning(f"کوکوین -> HTTP {res.status_code}: {res.text[:150]}")
             return {}
 
         payload = res.json()
@@ -211,7 +216,6 @@ def fetch_kucoin_ticker_data():
                 continue
 
             normalized_sym = raw_symbol.replace("-USDT", "USDT")
-            
             matched_target = None
             if normalized_sym in target_symbols_set:
                 matched_target = normalized_sym
@@ -243,20 +247,16 @@ def fetch_kucoin_ticker_data():
         log.warning(f"کوکوین خطا داد: {e}")
         return {}
 
-
 def fetch_market_data():
-    """ابتدا بایننس، در صورت شکست به کوکوین سوییچ می‌کند."""
     data = fetch_binance_ticker_data()
     if data:
         return data, "binance"
 
-    log.warning("بایننس در دسترس نبود — سوییچ به KuCoin.")
     data = fetch_kucoin_ticker_data()
     if data:
         return data, "kucoin"
 
     return {}, "none"
-
 
 def is_in_cooldown(symbol):
     last = last_alert_time.get(symbol)
@@ -264,14 +264,11 @@ def is_in_cooldown(symbol):
         return False
     return (time.time() - last) < ALERT_COOLDOWN_SEC
 
-
 def get_dynamic_baseline(symbol, fallback_avg):
-    """استفاده از میانگین واقعی inflowهای قبلی همان نماد برای دقت بیشتر."""
     hist = volume_history.get(symbol)
     if hist and len(hist) >= 3:
         return max(statistics.mean(hist), 1.0)
     return max(fallback_avg, 1.0)
-
 
 def analyze_smart_money():
     global previous_market_snapshot
@@ -312,7 +309,6 @@ def analyze_smart_money():
                 baseline_vol = get_dynamic_baseline(clean_sym, fallback_avg_vol)
                 spike_multiplier = (vol_5m_inflow / baseline_vol) if baseline_vol > 0 else 1
 
-                # فیلتر ورود پول هوشمند (Whale Inflow)
                 if (
                     vol_5m_inflow >= (baseline_vol * VOLUME_SPIKE_RATIO)
                     and vol_5m_inflow >= MIN_INFLOW_USD_5M
@@ -326,7 +322,6 @@ def analyze_smart_money():
                     })
                     last_alert_time[clean_sym] = time.time()
 
-                # فیلتر خروج پول هوشمند (Whale Outflow)
                 elif (
                     vol_5m_inflow >= (baseline_vol * VOLUME_SPIKE_RATIO)
                     and vol_5m_inflow >= MIN_INFLOW_USD_5M
@@ -368,13 +363,15 @@ def analyze_smart_money():
             f"🎯 **توصیه:** احتمال توزیع/خروج نهنگ؛ احتیاط در نگهداری پوزیشن."
         )
 
+    # ارسال سیگنال‌ها (بدون حذف شدن، برای ثبت تاریخچه)
     if messages:
         send_telegram_chunked(messages)
 
+    # ارسال گزارش وضعیت (ارسال موقت و حذف خودکار بعد از ۵ دقیقه)
     if SEND_STATUS_REPORT:
         total_scanned = len(binance_stats) if binance_stats else 0
         status_msg = (
-            f"🟢 **گزارش رصد زنده مارکت**\n\n"
+            f"🟢 **گزارش رصد زنده مارکت** *(حذف خودکار پس از ۵ دقیقه)*\n\n"
             f"⏰ **زمان (UTC):** `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
             f"🌐 **منبع داده:** `{data_source}`\n"
             f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از تمامی بازارهای نوبیتکس\n"
@@ -382,17 +379,16 @@ def analyze_smart_money():
             f"📤 **سیگنال خروج:** `{len(outflow_signals)}` مورد\n"
             f"📡 **وضعیت سیستم:** فعال و ۲۴ ساعته"
         )
-        send_telegram(status_msg)
+        send_and_schedule_delete(status_msg)
 
     with state_lock:
         bot_state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
         bot_state["cycles_completed"] += 1
         bot_state["last_error"] = None
 
-
 def bot_loop():
     time.sleep(3)
-    send_telegram(
+    send_and_schedule_delete(
         "🚀 **سیستم تحلیل هوشمند فوق‌پایدار فعال شد.**\n"
         "پوشش جامع تمام بازارهای ریالی و تتری نوبیتکس با متناظر جهانی."
     )
@@ -403,28 +399,23 @@ def bot_loop():
             log.exception("خطای بحرانی در چرخه تحلیل")
             with state_lock:
                 bot_state["last_error"] = str(e)
-            send_telegram(f"⚠️ خطا در چرخه تحلیل رخ داد: `{e}`\nسیستم به کار خود ادامه می‌دهد.")
+            send_and_schedule_delete(f"⚠️ خطا در چرخه تحلیل رخ داد: `{e}`\nسیستم به کار خود ادامه می‌دهد.")
         time.sleep(SCAN_INTERVAL_SEC)
-
 
 def start_bot_thread():
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
 
-
 start_bot_thread()
-
 
 @app.route("/")
 def health_check():
     return "Smart Money Bot is Scanning All Nobitex Assets!", 200
 
-
 @app.route("/status")
 def status():
     with state_lock:
         return jsonify(bot_state)
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
