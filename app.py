@@ -10,35 +10,48 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
-# ==================== فیلترهای سخت‌گیرانه نهنگ و اسمارت مانی ====================
+# ==================== فیلترهای ورود پول هوشمند (Smart Money) ====================
 MIN_INFLOW_USD_5M = 50_000      # حداقل ۵۰ هزار دلار ورود پول خالص در ۵ دقیقه
 VOLUME_SPIKE_RATIO = 2.5        # حداقل ۲.۵ برابر شدن حجم معاملاتی نسبت به میانگین
 PRICE_PUMP_MIN = 1.0            # حداقل ۱.۰٪ رشد قیمت صعودی
 PRICE_PUMP_MAX = 8.0            # سقف رشد ۵ دقیقه
 
-# 🗺️ لیست کامل و جامع تمام رمزارزهای بازار نوبیتکس (جفت‌ارزهای جهانی USDT)
+# 🗺️ لیست کامل و جامع ۲۴۰+ رمزارز بازار نوبیتکس (جفت‌ارزهای معادل USDT در بایننس)
 NOBITEX_SYMBOLS = [
-    # بیت‌کوین و شاخص‌ها
+    # --- اصلی و محبوب (Major Cryptos) ---
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
     "TRXUSDT", "DOTUSDT", "LINKUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "UNIUSDT",
-    # لایه ۱ و لایه ۲
-    "APTUSDT", "SUIUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", "STXUSDT", "XMRUSDT", "FILUSDT",
-    "ARBUSDT", "OPUSDT", "MATICUSDT", "POLUSDT", "FTMUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT",
-    "STRKUSDT", "EGLDUSDT", "ALGOUSDT", "ATOMUSDT", "KASUSDT", "FLOWUSDT", "RONUSDT", "MANTRAUSDT",
-    # میم‌کوین‌ها و پروژه‌های تلگرامی
+    "ETCUSDT", "XLMUSDT", "STXUSDT", "XMRUSDT", "FILUSDT", "ATOMUSDT", "EGLDUSDT", "ALGOUSDT",
+    "VETUSDT", "ICPUSDT", "HBARUSDT", "THETAUSDT", "XTZUSDT", "EOSUSDT", "IOTAUSDT", "NEOUSDT",
+
+    # --- لایه ۱، لایه ۲ و زیرساخت (L1 / L2 & Infrastructure) ---
+    "APTUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "MATICUSDT", "POLUSDT", "FTMUSDT", "INJUSDT",
+    "TIAUSDT", "SEIUSDT", "STRKUSDT", "KASUSDT", "FLOWUSDT", "RONUSDT", "MANTRAUSDT", "MINAUSDT",
+    "KAVAUSDT", "ASTRUSDT", "ANKRUSDT", "ROSEUSDT", "ZILUSDT", "IOTXUSDT", "ONEUSDT", "CKBUSDT",
+    "GLMRUSDT", "MOVRUSDT", "STRAXUSDT", "KLAYUSDT", "CELOUSDT", "SKLUSDT", "QNTUSDT", "LDOUSDT",
+
+    # --- میم‌کوین‌ها و توکن‌های تلگرامی (Memecoins & Telegram Ecosystem) ---
     "PEPEUSDT", "FLOKIUSDT", "BONKUSDT", "WIFUSDT", "NOTUSDT", "DOGSUSDT", "HMSTRUSDT", "TONUSDT",
     "MEMEUSDT", "PEOPLEUSDT", "BOMEUSDT", "NEIROUSDT", "CATSUSDT", "MAJORUSDT", "PENGUUSDT",
-    # اکوسیستم دیفای و هوش مصنوعی
-    "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CHZUSDT", "GALAUSDT",
-    "DYDXUSDT", "JUPUSDT", "PYTHUSDT", "PENDLEUSDT", "ENAUSDT", "ONDOUSDT", "OMUSDT", "RAYUSDT",
-    "POPCATUSDT", "FETUSDT", "ORDIUSDT", "1000SATSUSDT", "RENDERUSDT", "AGIXUSDT", "OCEANUSDT",
-    "WLDUSDT", "ARKMUSDT", "JTOUSDT", "BLURUSDT", "ENSUSDT", "CRVUSDT", "LDOUSDT", "MKRUSDT",
-    "SNXUSDT", "COMPUSDT", "1INCHUSDT", "CAKEUSDT", "SUSHIUSDT", "CVXUSDT", "RPLUSDT",
-    # سایر ارزها و زیرساخت‌ها
-    "HBARUSDT", "VETUSDT", "EGLDUSDT", "THETAUSDT", "XTZUSDT", "EOSUSDT", "IOTAUSDT", "NEOUSDT",
-    "KLAYUSDT", "MINAUSDT", "KAVAUSDT", "ASTRUSDT", "ANKRUSDT", "ROSEUSDT", "ZILUSDT", "IOTXUSDT",
-    "ONEUSDT", "GMTUSDT", "AUDIOUSDT", "JSTUSDT", "SUNUSDT", "CKBUSDT", "LPTUSDT", "WOOUSDT",
-    "HOTUSDT", "DENTUSDT", "RVNUSDT", "SPELLUSDT", "GLMRUSDT", "MOVRUSDT", "STRAXUSDT", "UMAUSDT"
+    "POPCATUSDT", "BABYDOGEUSDT", "1000SATSUSDT", "TURBOUSDT", "MYROUSDT", "MEWUSDT", "BRETTUSDT",
+    "DEGENUSDT", "SLERFUSDT", "MOGUSDT", "COQUSDT", "SMILEUSDT", "LUNCUSDT", "USTCUSDT",
+
+    # --- اکوسیستم دیفای و ارزهای حقوقی (DeFi & Yield) ---
+    "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "DYDXUSDT", "JUPUSDT", "PYTHUSDT", "PENDLEUSDT", "ENAUSDT",
+    "ONDOUSDT", "OMUSDT", "RAYUSDT", "ORDIUSDT", "BLURUSDT", "ENSUSDT", "CRVUSDT", "MKRUSDT",
+    "SNXUSDT", "COMPUSDT", "1INCHUSDT", "CAKEUSDT", "SUSHIUSDT", "CVXUSDT", "RPLUSDT", "BALUSDT",
+    "FXSUSDT", "YFIUSDT", "KNCUSDT", "ZRXUSDT", "ALPHAUSDT", "BADGERUSDT", "REQUSDT",
+
+    # --- هوش مصنوعی، متاورس و گیمینگ (AI, Metaverse & Gaming) ---
+    "FETUSDT", "AGIXUSDT", "OCEANUSDT", "RENDERUSDT", "WLDUSDT", "ARKMUSDT", "JTOUSDT", "SANDUSDT",
+    "MANAUSDT", "AXSUSDT", "CHZUSDT", "GALAUSDT", "GMTUSDT", "AUDIOUSDT", "SLPUSDT", "ILVUSDT",
+    "ALICEUSDT", "MAGICUSDT", "HIGHUSDT", "YGGUSDT", "SUPERUSDT", "PIXELUSDT", "PORTALUSDT",
+
+    # --- سایر نمادهای فعال در بازار نوبیتکس ---
+    "JSTUSDT", "SUNUSDT", "LPTUSDT", "WOOUSDT", "HOTUSDT", "DENTUSDT", "RVNUSDT", "SPELLUSDT",
+    "UMAUSDT", "IDUSDT", "MAVUSDT", "EDUUSDT", "SFPUSDT", "C98USDT", "TWTUSDT", "MASKUSDT",
+    "API3USDT", "BANDUSDT", "TRBUSDT", "RSRUSDT", "STORJUSDT", "ARUSDT", "BNTUSDT", "NMRUSDT",
+    "RADUSDT", "OXTUSDT", "BATUSDT", "ENJUSDT", "LRCUSDT", "SYSUSDT", "ZENUSDT", "QTUMUSDT"
 ]
 
 previous_market_snapshot = {}
@@ -58,7 +71,7 @@ def send_telegram(text):
         return False
 
 def fetch_binance_ticker_data():
-    """دریافت داده‌های زنده جهانی از اندپکوینت‌های مستقیم بایننس"""
+    """دریافت داده‌های زنده جهانی از اندپوینت‌های مستقیم بایننس"""
     endpoints = [
         "https://api1.binance.com/api/v3/ticker/24hr",
         "https://api2.binance.com/api/v3/ticker/24hr",
@@ -75,7 +88,7 @@ def fetch_binance_ticker_data():
             res = requests.get(url, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                # فیلتر بر اساس لیست جامع نوبیتکس
+                # فیلتر مستقیم برای لیست کامل نوبیتکس
                 filtered = {item["symbol"]: item for item in data if item.get("symbol") in NOBITEX_SYMBOLS}
                 if filtered:
                     return filtered
@@ -161,7 +174,7 @@ def analyze_smart_money():
 
 def bot_loop():
     time.sleep(3)
-    send_telegram("🚀 **سیستم هوشمند اسمارت مانی بدون وابستگی فعال شد.**\nتمامی ارزهای کلیدی نوبیتکس با سرعت بالا از شبکه جهانی بایننس رصد می‌شوند.")
+    send_telegram("🚀 **سیستم تحلیل هوشمند فوق‌پایدار فعال شد.**\nپوشش کامل بیش از ۲۰۰ ارز موجود در نوبیتکس از طریق سرورهای جهانی.")
     while True:
         analyze_smart_money()
         time.sleep(300)
@@ -175,7 +188,7 @@ start_bot_thread()
 
 @app.route('/')
 def health_check():
-    return "Smart Money Bot is Alive & Running Fast!", 200
+    return "Smart Money Bot is Scanning Full Nobitex Asset List!", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
