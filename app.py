@@ -144,10 +144,72 @@ def fetch_binance_ticker_data():
                 filtered = {item["symbol"]: item for item in data if item.get("symbol") in NOBITEX_SYMBOLS}
                 if filtered:
                     return filtered
+                log.warning(f"بایننس {url} پاسخ داد اما هیچ نمادی مچ نشد.")
+            else:
+                # کد ۴۵۱ یعنی بلاک جغرافیایی (سرورهای آمریکایی مثل Render/AWS-US توسط بایننس مسدودند)
+                log.warning(f"بایننس {url} -> HTTP {res.status_code}: {res.text[:150]}")
         except Exception as e:
             log.warning(f"اندپوینت {url} خطا داد: {e}")
 
     return {}
+
+
+def fetch_kucoin_ticker_data():
+    """
+    منبع جایگزین: KuCoin معمولاً روی سرورهای کلاود (از جمله Render) بلاک جغرافیایی بایننس را ندارد.
+    خروجی را دقیقاً هم‌شکل خروجی بایننس (symbol -> {lastPrice, quoteVolume, priceChangePercent}) می‌سازد
+    تا بقیه‌ی کد بدون تغییر کار کند.
+    """
+    url = "https://api.kucoin.com/api/v1/market/allTickers"
+    try:
+        res = http_session.get(url, timeout=10)
+        if res.status_code != 200:
+            log.warning(f"کوکوین -> HTTP {res.status_code}: {res.text[:150]}")
+            return {}
+
+        payload = res.json()
+        tickers = payload.get("data", {}).get("ticker", [])
+        result = {}
+        for t in tickers:
+            raw_symbol = t.get("symbol", "")  # مثل "BTC-USDT"
+            if not raw_symbol.endswith("-USDT"):
+                continue
+            binance_style_symbol = raw_symbol.replace("-USDT", "USDT")  # مثل "BTCUSDT"
+            if binance_style_symbol not in NOBITEX_SYMBOLS:
+                continue
+
+            last_price = t.get("last")
+            vol_value = t.get("volValue")  # حجم بر حسب USDT (معادل quoteVolume بایننس)
+            change_rate = t.get("changeRate")  # کسری است، مثلاً 0.015 یعنی 1.5%
+
+            if last_price is None or vol_value is None or change_rate is None:
+                continue
+
+            result[binance_style_symbol] = {
+                "symbol": binance_style_symbol,
+                "lastPrice": last_price,
+                "quoteVolume": vol_value,
+                "priceChangePercent": float(change_rate) * 100,
+            }
+
+        return result
+    except Exception as e:
+        log.warning(f"کوکوین خطا داد: {e}")
+        return {}
+
+
+def fetch_market_data():
+    """ابتدا بایننس، در صورت شکست (مثلاً بلاک ۴۵۱ جغرافیایی) به کوکوین سوییچ می‌کند."""
+    data = fetch_binance_ticker_data()
+    if data:
+        return data, "binance"
+
+    log.warning("بایننس در دسترس نبود (به احتمال زیاد بلاک جغرافیایی) — سوییچ به KuCoin.")
+    data = fetch_kucoin_ticker_data()
+    if data:
+        return data, "kucoin"
+
+    return {}, "none"
 
 
 def is_in_cooldown(symbol):
@@ -171,7 +233,7 @@ def get_dynamic_baseline(symbol, fallback_avg):
 def analyze_smart_money():
     global previous_market_snapshot
 
-    binance_stats = fetch_binance_ticker_data()
+    binance_stats, data_source = fetch_market_data()
     inflow_signals = []
     outflow_signals = []
 
@@ -272,6 +334,7 @@ def analyze_smart_money():
         status_msg = (
             f"🟢 **گزارش رصد زنده مارکت**\n\n"
             f"⏰ **زمان (UTC):** `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
+            f"🌐 **منبع داده:** `{data_source}`\n"
             f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از بازار نوبیتکس\n"
             f"📥 **سیگنال ورود:** `{len(inflow_signals)}` مورد\n"
             f"📤 **سیگنال خروج:** `{len(outflow_signals)}` مورد\n"
