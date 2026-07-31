@@ -34,43 +34,71 @@ SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 300))
 SEND_STATUS_REPORT = os.environ.get("SEND_STATUS_REPORT", "true").lower() == "true"
 HISTORY_WINDOW = int(os.environ.get("HISTORY_WINDOW", 12))  # تعداد دورهای قبلی برای میانگین حجم واقعی (۱۲ دور = ۱ ساعت)
 
-# 🗺️ لیست کامل و جامع ۲۴۰+ رمزارز بازار نوبیتکس (جفت‌ارزهای معادل USDT در بایننس)
-NOBITEX_SYMBOLS = [
-    # --- اصلی و محبوب (Major Cryptos) ---
+# 🗺️ لیست کامل تمامی رمزارزهای نوبیتکس (شامل پایه ریالی IRT + پایه تتری USDT)
+# معادل تمام ارزهای بازار نوبیتکس بر پایه USDT در مارکت جهانی
+NOBITEX_ALL_ASSETS = [
+    # --- بیت‌کوین و ارزهای اصلی (Majors) ---
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
     "TRXUSDT", "DOTUSDT", "LINKUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "UNIUSDT",
     "ETCUSDT", "XLMUSDT", "STXUSDT", "XMRUSDT", "FILUSDT", "ATOMUSDT", "EGLDUSDT", "ALGOUSDT",
     "VETUSDT", "ICPUSDT", "HBARUSDT", "THETAUSDT", "XTZUSDT", "EOSUSDT", "IOTAUSDT", "NEOUSDT",
 
-    # --- لایه ۱، لایه ۲ و زیرساخت (L1 / L2 & Infrastructure) ---
+    # --- لایه ۱، لایه ۲ و زیرساخت‌ها (L1 / L2) ---
     "APTUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "MATICUSDT", "POLUSDT", "FTMUSDT", "INJUSDT",
     "TIAUSDT", "SEIUSDT", "STRKUSDT", "KASUSDT", "FLOWUSDT", "RONUSDT", "MANTRAUSDT", "MINAUSDT",
     "KAVAUSDT", "ASTRUSDT", "ANKRUSDT", "ROSEUSDT", "ZILUSDT", "IOTXUSDT", "ONEUSDT", "CKBUSDT",
     "GLMRUSDT", "MOVRUSDT", "STRAXUSDT", "KLAYUSDT", "CELOUSDT", "SKLUSDT", "QNTUSDT", "LDOUSDT",
+    "METISUSDT", "MANTAUSDT", "ALTUSDT", "ZKUSDT", "EIGENUSDT", "SCRUSDT", "TAOUSDT",
 
-    # --- میم‌کوین‌ها و توکن‌های تلگرامی (Memecoins & Telegram Ecosystem) ---
+    # --- میم‌کوین‌ها و اکوسیستم تلگرام/تون (Memecoins & Telegram/TON Ecosystem) ---
     "PEPEUSDT", "FLOKIUSDT", "BONKUSDT", "WIFUSDT", "NOTUSDT", "DOGSUSDT", "HMSTRUSDT", "TONUSDT",
     "MEMEUSDT", "PEOPLEUSDT", "BOMEUSDT", "NEIROUSDT", "CATSUSDT", "MAJORUSDT", "PENGUUSDT",
     "POPCATUSDT", "BABYDOGEUSDT", "1000SATSUSDT", "TURBOUSDT", "MYROUSDT", "MEWUSDT", "BRETTUSDT",
     "DEGENUSDT", "SLERFUSDT", "MOGUSDT", "COQUSDT", "SMILEUSDT", "LUNCUSDT", "USTCUSDT",
+    "PNUTUSDT", "ACTUSDT", "MOODENGUSDT", "GOATUSDT", "HIPPOUSDT", "CATS-USDT", "XUSDT",
 
-    # --- اکوسیستم دیفای و ارزهای حقوقی (DeFi & Yield) ---
+    # --- دیفای، اوراکل و صرافی‌ها (DeFi & Yield) ---
     "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "DYDXUSDT", "JUPUSDT", "PYTHUSDT", "PENDLEUSDT", "ENAUSDT",
     "ONDOUSDT", "OMUSDT", "RAYUSDT", "ORDIUSDT", "BLURUSDT", "ENSUSDT", "CRVUSDT", "MKRUSDT",
     "SNXUSDT", "COMPUSDT", "1INCHUSDT", "CAKEUSDT", "SUSHIUSDT", "CVXUSDT", "RPLUSDT", "BALUSDT",
-    "FXSUSDT", "YFIUSDT", "KNCUSDT", "ZRXUSDT", "ALPHAUSDT", "BADGERUSDT", "REQUSDT",
+    "FXSUSDT", "YFIUSDT", "KNCUSDT", "ZRXUSDT", "ALPHAUSDT", "BADGERUSDT", "REQUSDT", "DRIFTUSDT",
+    "AEVOUSDT", "ETHFIUSDT", "MORPHOUSDT", "COWUSDT",
 
-    # --- هوش مصنوعی، متاورس و گیمینگ (AI, Metaverse & Gaming) ---
-    "FETUSDT", "AGIXUSDT", "OCEANUSDT", "RENDERUSDT", "WLDUSDT", "ARKMUSDT", "JTOUSDT", "SANDUSDT",
-    "MANAUSDT", "AXSUSDT", "CHZUSDT", "GALAUSDT", "GMTUSDT", "AUDIOUSDT", "SLPUSDT", "ILVUSDT",
-    "ALICEUSDT", "MAGICUSDT", "HIGHUSDT", "YGGUSDT", "SUPERUSDT", "PIXELUSDT", "PORTALUSDT",
+    # --- هوش مصنوعی، متاورس و گیمینگ (AI & Gaming) ---
+    "FETUSDT", "AGIXUSDT", "OCEANUSDT", "RENDERUSDT", "RNDRUSDT", "WLDUSDT", "ARKMUSDT", "JTOUSDT",
+    "SANDUSDT", "MANAUSDT", "AXSUSDT", "CHZUSDT", "GALAUSDT", "GMTUSDT", "AUDIOUSDT", "SLPUSDT",
+    "ILVUSDT", "ALICEUSDT", "MAGICUSDT", "HIGHUSDT", "YGGUSDT", "SUPERUSDT", "PIXELUSDT",
+    "PORTALUSDT", "PRIMEUSDT", "IOUSDT", "ATHUSDT", "ASIUSDT", "CGPTUSDT",
 
-    # --- سایر نمادهای فعال در بازار نوبیتکس ---
+    # --- تمامی ارزهای بازار ریالی اختصاصی و سایر ارزها ---
     "JSTUSDT", "SUNUSDT", "LPTUSDT", "WOOUSDT", "HOTUSDT", "DENTUSDT", "RVNUSDT", "SPELLUSDT",
     "UMAUSDT", "IDUSDT", "MAVUSDT", "EDUUSDT", "SFPUSDT", "C98USDT", "TWTUSDT", "MASKUSDT",
     "API3USDT", "BANDUSDT", "TRBUSDT", "RSRUSDT", "STORJUSDT", "ARUSDT", "BNTUSDT", "NMRUSDT",
-    "RADUSDT", "OXTUSDT", "BATUSDT", "ENJUSDT", "LRCUSDT", "SYSUSDT", "ZENUSDT", "QTUMUSDT"
+    "RADUSDT", "OXTUSDT", "BATUSDT", "ENJUSDT", "LRCUSDT", "SYSUSDT", "ZENUSDT", "QTUMUSDT",
+    "TFUELUSDT", "GASUSDT", "PROMUSDT", "LOOMUSDT", "SSVUSDT", "WAXPUSDT", "STEEMUSDT"
 ]
+
+# 🔄 نقشه متناظر‌سازی نمادها برای تطبیق با صرافی‌های بین‌المللی (Mapping Aliases)
+SYMBOL_ALIASES = {
+    "1000SATSUSDT": ["SATSUSDT", "1000SATS-USDT", "SATS-USDT"],
+    "BABYDOGEUSDT": ["BABYDOGE-USDT", "1000000BABYDOGEUSDT", "BABYDOGEUSDT"],
+    "POLUSDT": ["MATICUSDT", "POL-USDT", "MATIC-USDT"],
+    "FETUSDT": ["ASIUSDT", "FET-USDT", "ASI-USDT"],
+    "RENDERUSDT": ["RNDRUSDT", "RENDER-USDT", "RNDR-USDT"],
+    "SHIBUSDT": ["1000SHIBUSDT", "SHIB-USDT"],
+    "BONKUSDT": ["1000BONKUSDT", "BONK-USDT"],
+    "PEPEUSDT": ["1000PEPEUSDT", "PEPE-USDT"],
+    "FLOKIUSDT": ["1000FLOKIUSDT", "FLOKI-USDT"]
+}
+
+# ساخت مجموعه جستجوی سریع
+target_symbols_set = set(NOBITEX_ALL_ASSETS)
+
+# افزودن نام‌های جایگزین به مجموعه تطبیق
+for main_symbol, aliases in SYMBOL_ALIASES.items():
+    for alias in aliases:
+        clean_alias = alias.replace("-", "")
+        target_symbols_set.add(clean_alias)
 
 # ==================== وضعیت داخلی (state) ====================
 previous_market_snapshot = {}
@@ -128,7 +156,7 @@ def send_telegram_chunked(messages, max_len=3500):
 
 
 def fetch_binance_ticker_data():
-    """دریافت داده‌های زنده جهانی از اندپوینت‌های مستقیم بایننس"""
+    """دریافت داده‌های زنده جهانی از اندپوینت‌های مستقیم بایننس به همراه تطبیق Aliasها"""
     endpoints = [
         "https://api1.binance.com/api/v3/ticker/24hr",
         "https://api2.binance.com/api/v3/ticker/24hr",
@@ -141,12 +169,20 @@ def fetch_binance_ticker_data():
             res = http_session.get(url, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                filtered = {item["symbol"]: item for item in data if item.get("symbol") in NOBITEX_SYMBOLS}
+                filtered = {}
+                for item in data:
+                    sym = item.get("symbol")
+                    if sym in target_symbols_set:
+                        final_sym = sym
+                        for main_s, aliases in SYMBOL_ALIASES.items():
+                            if sym in [a.replace("-", "") for a in aliases]:
+                                final_sym = main_s
+                                break
+                        filtered[final_sym] = item
                 if filtered:
                     return filtered
                 log.warning(f"بایننس {url} پاسخ داد اما هیچ نمادی مچ نشد.")
             else:
-                # کد ۴۵۱ یعنی بلاک جغرافیایی (سرورهای آمریکایی مثل Render/AWS-US توسط بایننس مسدودند)
                 log.warning(f"بایننس {url} -> HTTP {res.status_code}: {res.text[:150]}")
         except Exception as e:
             log.warning(f"اندپوینت {url} خطا داد: {e}")
@@ -156,9 +192,7 @@ def fetch_binance_ticker_data():
 
 def fetch_kucoin_ticker_data():
     """
-    منبع جایگزین: KuCoin معمولاً روی سرورهای کلاود (از جمله Render) بلاک جغرافیایی بایننس را ندارد.
-    خروجی را دقیقاً هم‌شکل خروجی بایننس (symbol -> {lastPrice, quoteVolume, priceChangePercent}) می‌سازد
-    تا بقیه‌ی کد بدون تغییر کار کند.
+    منبع جایگزین: KuCoin معمولاً روی سرورهای کلاود بلاک جغرافیایی بایننس را ندارد.
     """
     url = "https://api.kucoin.com/api/v1/market/allTickers"
     try:
@@ -170,25 +204,37 @@ def fetch_kucoin_ticker_data():
         payload = res.json()
         tickers = payload.get("data", {}).get("ticker", [])
         result = {}
+
         for t in tickers:
-            raw_symbol = t.get("symbol", "")  # مثل "BTC-USDT"
+            raw_symbol = t.get("symbol", "")
             if not raw_symbol.endswith("-USDT"):
                 continue
-            binance_style_symbol = raw_symbol.replace("-USDT", "USDT")  # مثل "BTCUSDT"
-            if binance_style_symbol not in NOBITEX_SYMBOLS:
+
+            normalized_sym = raw_symbol.replace("-USDT", "USDT")
+            
+            matched_target = None
+            if normalized_sym in target_symbols_set:
+                matched_target = normalized_sym
+            else:
+                for main_sym, aliases in SYMBOL_ALIASES.items():
+                    if normalized_sym in aliases or raw_symbol in aliases:
+                        matched_target = main_sym
+                        break
+
+            if not matched_target:
                 continue
 
             last_price = t.get("last")
-            vol_value = t.get("volValue")  # حجم بر حسب USDT (معادل quoteVolume بایننس)
-            change_rate = t.get("changeRate")  # کسری است، مثلاً 0.015 یعنی 1.5%
+            vol_value = t.get("volValue")
+            change_rate = t.get("changeRate")
 
             if last_price is None or vol_value is None or change_rate is None:
                 continue
 
-            result[binance_style_symbol] = {
-                "symbol": binance_style_symbol,
-                "lastPrice": last_price,
-                "quoteVolume": vol_value,
+            result[matched_target] = {
+                "symbol": matched_target,
+                "lastPrice": float(last_price),
+                "quoteVolume": float(vol_value),
                 "priceChangePercent": float(change_rate) * 100,
             }
 
@@ -199,12 +245,12 @@ def fetch_kucoin_ticker_data():
 
 
 def fetch_market_data():
-    """ابتدا بایننس، در صورت شکست (مثلاً بلاک ۴۵۱ جغرافیایی) به کوکوین سوییچ می‌کند."""
+    """ابتدا بایننس، در صورت شکست به کوکوین سوییچ می‌کند."""
     data = fetch_binance_ticker_data()
     if data:
         return data, "binance"
 
-    log.warning("بایننس در دسترس نبود (به احتمال زیاد بلاک جغرافیایی) — سوییچ به KuCoin.")
+    log.warning("بایننس در دسترس نبود — سوییچ به KuCoin.")
     data = fetch_kucoin_ticker_data()
     if data:
         return data, "kucoin"
@@ -220,10 +266,7 @@ def is_in_cooldown(symbol):
 
 
 def get_dynamic_baseline(symbol, fallback_avg):
-    """
-    به‌جای فرض توزیع یکنواخت حجم ۲۴ ساعته، از میانگین واقعی inflowهای قبلی همان نماد
-    استفاده می‌کند تا مبنای مقایسه دقیق‌تر و متناسب با رفتار خودِ آن کوین باشد.
-    """
+    """استفاده از میانگین واقعی inflowهای قبلی همان نماد برای دقت بیشتر."""
     hist = volume_history.get(symbol)
     if hist and len(hist) >= 3:
         return max(statistics.mean(hist), 1.0)
@@ -262,7 +305,6 @@ def analyze_smart_money():
                 vol_5m_inflow = vol_24h_usd - prev_vol
                 fallback_avg_vol = vol_24h_usd / 288
 
-                # به‌روزرسانی تاریخچه‌ی حجم واقعی این نماد (فقط مقادیر مثبت معنادار)
                 if vol_5m_inflow > 0:
                     hist = volume_history.setdefault(clean_sym, deque(maxlen=HISTORY_WINDOW))
                     hist.append(vol_5m_inflow)
@@ -270,7 +312,7 @@ def analyze_smart_money():
                 baseline_vol = get_dynamic_baseline(clean_sym, fallback_avg_vol)
                 spike_multiplier = (vol_5m_inflow / baseline_vol) if baseline_vol > 0 else 1
 
-                # فیلتر ورود پول هوشمند (Whale Inflow / Pump)
+                # فیلتر ورود پول هوشمند (Whale Inflow)
                 if (
                     vol_5m_inflow >= (baseline_vol * VOLUME_SPIKE_RATIO)
                     and vol_5m_inflow >= MIN_INFLOW_USD_5M
@@ -284,7 +326,7 @@ def analyze_smart_money():
                     })
                     last_alert_time[clean_sym] = time.time()
 
-                # فیلتر خروج پول هوشمند (Whale Outflow / Dump) — همان شرایط ولی با افت قیمت
+                # فیلتر خروج پول هوشمند (Whale Outflow)
                 elif (
                     vol_5m_inflow >= (baseline_vol * VOLUME_SPIKE_RATIO)
                     and vol_5m_inflow >= MIN_INFLOW_USD_5M
@@ -335,7 +377,7 @@ def analyze_smart_money():
             f"🟢 **گزارش رصد زنده مارکت**\n\n"
             f"⏰ **زمان (UTC):** `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
             f"🌐 **منبع داده:** `{data_source}`\n"
-            f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از بازار نوبیتکس\n"
+            f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از تمامی بازارهای نوبیتکس\n"
             f"📥 **سیگنال ورود:** `{len(inflow_signals)}` مورد\n"
             f"📤 **سیگنال خروج:** `{len(outflow_signals)}` مورد\n"
             f"📡 **وضعیت سیستم:** فعال و ۲۴ ساعته"
@@ -352,7 +394,7 @@ def bot_loop():
     time.sleep(3)
     send_telegram(
         "🚀 **سیستم تحلیل هوشمند فوق‌پایدار فعال شد.**\n"
-        "پوشش کامل بیش از ۲۰۰ ارز موجود در نوبیتکس، تشخیص ورود و خروج نهنگ."
+        "پوشش جامع تمام بازارهای ریالی و تتری نوبیتکس با متناظر جهانی."
     )
     while True:
         try:
@@ -361,7 +403,6 @@ def bot_loop():
             log.exception("خطای بحرانی در چرخه تحلیل")
             with state_lock:
                 bot_state["last_error"] = str(e)
-            # به کاربر هم اطلاع بده تا متوجه قطعی سکوت‌آمیز نشود
             send_telegram(f"⚠️ خطا در چرخه تحلیل رخ داد: `{e}`\nسیستم به کار خود ادامه می‌دهد.")
         time.sleep(SCAN_INTERVAL_SEC)
 
@@ -376,7 +417,7 @@ start_bot_thread()
 
 @app.route("/")
 def health_check():
-    return "Smart Money Bot is Scanning Full Nobitex Asset List!", 200
+    return "Smart Money Bot is Scanning All Nobitex Assets!", 200
 
 
 @app.route("/status")
