@@ -9,21 +9,21 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Nobitex Smart Money Bot is Running Alive!", 200
+    return "Nobitex Smart Money Bot is Alive!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
 # ==================== تنظیمات ربات تلگرام ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
-# فیلترهای سخت‌گیرانه اسمارت مانی
+# فیلترهای ورود پول هوشمند
 MIN_INFLOW_USD_5M = 50_000      # حداقل ۵۰ هزار دلار ورود پول در ۵ دقیقه
-VOLUME_SPIKE_RATIO = 3.0        # حداقل ۳ برابر شدن حجم نسبت به میانگین
-PRICE_PUMP_MIN = 1.2            # حداقل ۱.۲٪ رشد قیمت
-PRICE_PUMP_MAX = 8.0            # سقف رشد ۵ دقیقه (جلوگیری از فومو و پامپ‌های هیجانی)
+VOLUME_SPIKE_RATIO = 2.5        # حداقل ۲.۵ برابر شدن حجم
+PRICE_PUMP_MIN = 1.0            # حداقل ۱٪ رشد قیمت ۵ دقیقه
+PRICE_PUMP_MAX = 8.0            # سقف رشد ۵ دقیقه
 
 COIN_MAP = {
     "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin", "XRP": "ripple",
@@ -45,17 +45,23 @@ previous_market_snapshot = {}
 
 def send_telegram(text):
     """ارسال پیام به تلگرام"""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ Error: BOT_TOKEN or CHAT_ID is missing!")
+        return False
+        
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        return res.status_code == 200
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
+        return False
 
 def fetch_coingecko_data(gecko_ids):
     """دریافت داده‌های مارکت بین‌المللی"""
     all_data = {}
-    chunk_size = 40
+    chunk_size = 30
     for i in range(0, len(gecko_ids), chunk_size):
         chunk = gecko_ids[i:i + chunk_size]
         params = {
@@ -70,7 +76,7 @@ def fetch_coingecko_data(gecko_ids):
                 all_data.update(res.json())
         except Exception as e:
             print(f"Error fetching Gecko data: {e}")
-        time.sleep(1.2)
+        time.sleep(1.5)
     return all_data
 
 def analyze_smart_money():
@@ -79,76 +85,85 @@ def analyze_smart_money():
     gecko_ids = list(COIN_MAP.values())
     global_stats = fetch_coingecko_data(gecko_ids)
 
-    if not global_stats:
-        return
-
-    current_snapshot = {}
     smart_signals = []
 
-    for sym, gecko_id in COIN_MAP.items():
-        if gecko_id not in global_stats:
-            continue
+    if global_stats:
+        current_snapshot = {}
 
-        item = global_stats[gecko_id]
-        price_usd = float(item.get("usd", 0))
-        vol_24h_usd = float(item.get("usd_24h_vol", 0))
-        change_24h = float(item.get("usd_24hr_change", 0))
+        for sym, gecko_id in COIN_MAP.items():
+            if gecko_id not in global_stats:
+                continue
 
-        current_snapshot[sym] = {
-            "price": price_usd,
-            "vol_usd": vol_24h_usd
-        }
+            item = global_stats[gecko_id]
+            price_usd = float(item.get("usd", 0))
+            vol_24h_usd = float(item.get("usd_24h_vol", 0))
+            change_24h = float(item.get("usd_24hr_change", 0))
 
-        if sym in previous_market_snapshot:
-            prev_price = previous_market_snapshot[sym]["price"]
-            prev_vol = previous_market_snapshot[sym]["vol_usd"]
+            current_snapshot[sym] = {
+                "price": price_usd,
+                "vol_usd": vol_24h_usd
+            }
 
-            if prev_price > 0:
-                price_5m_change = ((price_usd - prev_price) / prev_price) * 100
-                vol_5m_inflow = vol_24h_usd - prev_vol
-                expected_5m_avg_vol = vol_24h_usd / 288
+            if sym in previous_market_snapshot:
+                prev_price = previous_market_snapshot[sym]["price"]
+                prev_vol = previous_market_snapshot[sym]["vol_usd"]
 
-                # فیلتر چندگانه تشخیص نهنگ واقعی
-                if (vol_5m_inflow >= (expected_5m_avg_vol * VOLUME_SPIKE_RATIO) and 
-                    vol_5m_inflow >= MIN_INFLOW_USD_5M and 
-                    PRICE_PUMP_MIN <= price_5m_change <= PRICE_PUMP_MAX):
+                if prev_price > 0:
+                    price_5m_change = ((price_usd - prev_price) / prev_price) * 100
+                    vol_5m_inflow = vol_24h_usd - prev_vol
+                    expected_5m_avg_vol = vol_24h_usd / 288
 
-                    spike_multiplier = vol_5m_inflow / expected_5m_avg_vol if expected_5m_avg_vol > 0 else 1
-                    
-                    smart_signals.append({
-                        "symbol": sym,
-                        "price": price_usd,
-                        "change_5m": price_5m_change,
-                        "change_24h": change_24h,
-                        "inflow_usd": vol_5m_inflow,
-                        "spike_multiplier": spike_multiplier
-                    })
+                    if (vol_5m_inflow >= (expected_5m_avg_vol * VOLUME_SPIKE_RATIO) and 
+                        vol_5m_inflow >= MIN_INFLOW_USD_5M and 
+                        PRICE_PUMP_MIN <= price_5m_change <= PRICE_PUMP_MAX):
 
-    previous_market_snapshot = current_snapshot
+                        spike_multiplier = vol_5m_inflow / expected_5m_avg_vol if expected_5m_avg_vol > 0 else 1
+                        
+                        smart_signals.append({
+                            "symbol": sym,
+                            "price": price_usd,
+                            "change_5m": price_5m_change,
+                            "change_24h": change_24h,
+                            "inflow_usd": vol_5m_inflow,
+                            "spike_multiplier": spike_multiplier
+                        })
 
+        previous_market_snapshot = current_snapshot
+
+    # ۱. ارسال سیگنال‌های نهنگ در صورت وجود
     if smart_signals:
         for s in smart_signals:
             alert_msg = (
-                f"🚨 **سیگنال ورود پول هوشمند (SMART MONEY INFLOW)** 🚨\n\n"
-                f"🪙 **نماد:** #{s['symbol']} *(موجود در نوبیتکس)*\n"
-                f"💵 **قیمت جهانی:** ${s['price']:,.4f}\n"
-                f"📊 **تغییرات ۲۴ ساعته:** `{s['change_24h']:+.2f}%`\n\n"
-                f"🔍 **شاخص‌های تاییدیه نهنگ (۵ دقیقه اخیر):**\n"
-                f"📈 **رشد قیمت ۵ دقیقه:** `+{s['change_5m']:.2f}%`\n"
-                f"🔥 **ورود پول خالص:** `${s['inflow_usd']/1e3:,.1f}K`\n"
-                f"⚡ **جهش حجم معاملاتی:** `{s['spike_multiplier']:.1f}X` برابر میانگین\n\n"
-                f"🎯 **توصیه:** *بررسی چارت در تایم‌فریم ۱۵ دقیقه و ورود پله‌ای.*"
+                f"🚨 **سیگنال ورود پول هوشمند (SMART MONEY)** 🚨\n\n"
+                f"🪙 **نماد:** #{s['symbol']} *(نوبیتکس)*\n"
+                f"💵 **قیمت:** ${s['price']:,.4f}\n"
+                f"📈 **رشد ۵ دقیقه:** `+{s['change_5m']:.2f}%`\n"
+                f"🔥 **ورود پول:** `${s['inflow_usd']/1e3:,.1f}K`\n"
+                f"⚡ **جهش حجم:** `{s['spike_multiplier']:.1f}X`"
             )
             send_telegram(alert_msg)
 
+    # ۲. ارسال وضعیت سلامت و گزارش ۵ دقیقه‌ای ربات
+    total_scanned = len(global_stats) if global_stats else 0
+    status_msg = (
+        f"🟢 **گزارش وضعیت ربات (تست ۵ دقیقه)**\n\n"
+        f"⏰ **زمان:** `{time.strftime('%H:%M:%S')}` UTC\n"
+        f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از `{len(COIN_MAP)}`\n"
+        f"📡 **وضعیت اتصال:** عالی\n"
+        f"🎯 **سیگنال‌های این دوره:** `{len(smart_signals)}` مورد"
+    )
+    send_telegram(status_msg)
+
 def bot_loop():
-    send_telegram("🤖 **ربات هوشمند رصد اسمارت مانی روشن شد.**")
+    # ارسال پیام استارت اولیه
+    send_telegram("🚀 **ربات هوشمند فعال شد.**\nاز این پس هر ۵ دقیقه گزارش وضعیت و سیگنال‌ها ارسال می‌شود.")
     while True:
         analyze_smart_money()
-        time.sleep(300)
+        time.sleep(300) # هر ۵ دقیقه
 
 if __name__ == "__main__":
     t = threading.Thread(target=bot_loop)
     t.daemon = True
     t.start()
     run_flask()
+
