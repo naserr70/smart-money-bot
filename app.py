@@ -342,7 +342,7 @@ def analyze_smart_money():
     for s in inflow_signals:
         messages.append(
             f"🚨 **ورود پول هوشمند (SMART MONEY IN)** 🚨\n\n"
-            f"🪙 **نماد:** #{s['symbol']} *(موجود در نوبیتکس)*\n"
+            f"🪙 **نماد:** #{s['symbol']} *( )*\n"
             f"💵 **قیمت جهانی:** ${s['price']:,.4f}\n"
             f"📊 **تغییرات ۲۴ ساعته:** `{s['change_24h']:+.2f}%`\n\n"
             f"📈 **رشد قیمت ۵ دقیقه:** `+{s['change_5m']:.2f}%`\n"
@@ -371,7 +371,7 @@ def analyze_smart_money():
     if SEND_STATUS_REPORT:
         total_scanned = len(binance_stats) if binance_stats else 0
         status_msg = (
-            f"🟢 **گزارش رصد زنده مارکت** *(حذف خودکار پس از ۵ دقیقه)*\n\n"
+            f"🟢 **گزارش رصد زنده مارکت** **\n\n"
             f"⏰ **زمان (UTC):** `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
             f"🌐 **منبع داده:** `{data_source}`\n"
             f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از تمامی بازارهای نوبیتکس\n"
