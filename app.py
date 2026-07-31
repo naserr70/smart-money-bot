@@ -16,6 +16,31 @@ VOLUME_SPIKE_RATIO = 2.5        # حداقل ۲.۵ برابر شدن حجم مع
 PRICE_PUMP_MIN = 1.0            # حداقل ۱.۰٪ رشد قیمت صعودی
 PRICE_PUMP_MAX = 8.0            # سقف رشد ۵ دقیقه
 
+# 🗺️ لیست کامل و جامع تمام رمزارزهای بازار نوبیتکس (جفت‌ارزهای جهانی USDT)
+NOBITEX_SYMBOLS = [
+    # بیت‌کوین و شاخص‌ها
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
+    "TRXUSDT", "DOTUSDT", "LINKUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "UNIUSDT",
+    # لایه ۱ و لایه ۲
+    "APTUSDT", "SUIUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", "STXUSDT", "XMRUSDT", "FILUSDT",
+    "ARBUSDT", "OPUSDT", "MATICUSDT", "POLUSDT", "FTMUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT",
+    "STRKUSDT", "EGLDUSDT", "ALGOUSDT", "ATOMUSDT", "KASUSDT", "FLOWUSDT", "RONUSDT", "MANTRAUSDT",
+    # میم‌کوین‌ها و پروژه‌های تلگرامی
+    "PEPEUSDT", "FLOKIUSDT", "BONKUSDT", "WIFUSDT", "NOTUSDT", "DOGSUSDT", "HMSTRUSDT", "TONUSDT",
+    "MEMEUSDT", "PEOPLEUSDT", "BOMEUSDT", "NEIROUSDT", "CATSUSDT", "MAJORUSDT", "PENGUUSDT",
+    # اکوسیستم دیفای و هوش مصنوعی
+    "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CHZUSDT", "GALAUSDT",
+    "DYDXUSDT", "JUPUSDT", "PYTHUSDT", "PENDLEUSDT", "ENAUSDT", "ONDOUSDT", "OMUSDT", "RAYUSDT",
+    "POPCATUSDT", "FETUSDT", "ORDIUSDT", "1000SATSUSDT", "RENDERUSDT", "AGIXUSDT", "OCEANUSDT",
+    "WLDUSDT", "ARKMUSDT", "JTOUSDT", "BLURUSDT", "ENSUSDT", "CRVUSDT", "LDOUSDT", "MKRUSDT",
+    "SNXUSDT", "COMPUSDT", "1INCHUSDT", "CAKEUSDT", "SUSHIUSDT", "CVXUSDT", "RPLUSDT",
+    # سایر ارزها و زیرساخت‌ها
+    "HBARUSDT", "VETUSDT", "EGLDUSDT", "THETAUSDT", "XTZUSDT", "EOSUSDT", "IOTAUSDT", "NEOUSDT",
+    "KLAYUSDT", "MINAUSDT", "KAVAUSDT", "ASTRUSDT", "ANKRUSDT", "ROSEUSDT", "ZILUSDT", "IOTXUSDT",
+    "ONEUSDT", "GMTUSDT", "AUDIOUSDT", "JSTUSDT", "SUNUSDT", "CKBUSDT", "LPTUSDT", "WOOUSDT",
+    "HOTUSDT", "DENTUSDT", "RVNUSDT", "SPELLUSDT", "GLMRUSDT", "MOVRUSDT", "STRAXUSDT", "UMAUSDT"
+]
+
 previous_market_snapshot = {}
 
 def send_telegram(text):
@@ -32,25 +57,8 @@ def send_telegram(text):
         print(f"Error sending Telegram message: {e}")
         return False
 
-def get_all_nobitex_symbols():
-    """استخراج خودکار تمام نمادهای فعال از API نوبیتکس"""
-    symbols = set()
-    try:
-        res = requests.get("https://api.nobitex.ir/v2/orderbook/all", timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            for pair in data.keys():
-                # جداسازی پایه ارز (مثلاً btc-usdt یا btc-irt)
-                base = pair.split("-")[0].upper()
-                if base not in ["IRT", "USDT"]:
-                    symbols.add(f"{base}USDT")
-    except Exception as e:
-        print(f"⚠️ Error fetching Nobitex market list: {e}")
-    
-    return list(symbols)
-
-def fetch_binance_ticker_data(nobitex_symbols):
-    """دریافت داده‌های زنده جهانی از بایننس برای تمام ارزهای نوبیتکس"""
+def fetch_binance_ticker_data():
+    """دریافت داده‌های زنده جهانی از اندپکوینت‌های مستقیم بایننس"""
     endpoints = [
         "https://api1.binance.com/api/v3/ticker/24hr",
         "https://api2.binance.com/api/v3/ticker/24hr",
@@ -59,16 +67,16 @@ def fetch_binance_ticker_data(nobitex_symbols):
     ]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
     for url in endpoints:
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get(url, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                # تطبیق با کل ارزهای نوبیتکس
-                filtered = {item["symbol"]: item for item in data if item.get("symbol") in nobitex_symbols}
+                # فیلتر بر اساس لیست جامع نوبیتکس
+                filtered = {item["symbol"]: item for item in data if item.get("symbol") in NOBITEX_SYMBOLS}
                 if filtered:
                     return filtered
         except Exception as e:
@@ -79,15 +87,7 @@ def fetch_binance_ticker_data(nobitex_symbols):
 def analyze_smart_money():
     global previous_market_snapshot
     
-    # ۱. دریافت لیست زنده و کامل ارزهای نوبیتکس
-    nobitex_symbols = get_all_nobitex_symbols()
-    
-    if not nobitex_symbols:
-        print("⚠️ Could not fetch Nobitex symbols, using fallback scan.")
-        return
-
-    # ۲. اسکن مارکت جهانی برای تمام این ارزها
-    binance_stats = fetch_binance_ticker_data(nobitex_symbols)
+    binance_stats = fetch_binance_ticker_data()
     smart_signals = []
 
     if binance_stats:
@@ -132,7 +132,7 @@ def analyze_smart_money():
 
         previous_market_snapshot = current_snapshot
 
-    # ۳. ارسال سیگنال در صورت کشف نهنگ/اسمارت مانی
+    # ۱. ارسال سیگنال در صورت کشف نهنگ/اسمارت مانی
     if smart_signals:
         for s in smart_signals:
             alert_msg = (
@@ -148,13 +148,12 @@ def analyze_smart_money():
             )
             send_telegram(alert_msg)
 
-    # ۴. ارسال گزارش زنده ۵ دقیقه‌ای
+    # ۲. ارسال گزارش زنده ۵ دقیقه‌ای
     total_scanned = len(binance_stats) if binance_stats else 0
-    total_nobitex = len(nobitex_symbols)
     status_msg = (
         f"🟢 **گزارش رصد زنده مارکت**\n\n"
         f"⏰ **زمان:** `{time.strftime('%H:%M:%S')}` UTC\n"
-        f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از `{total_nobitex}` ارز نوبیتکس\n"
+        f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از بازار نوبیتکس\n"
         f"🎯 **سیگنال‌های نهنگ در این دور:** `{len(smart_signals)}` مورد\n"
         f"📡 **وضعیت سیستم:** فعال و ۲۴ ساعته"
     )
@@ -162,7 +161,7 @@ def analyze_smart_money():
 
 def bot_loop():
     time.sleep(3)
-    send_telegram("🚀 **موتور پویا فعال شد!**\nلیست تمام ارزهای نوبیتکس دریافت شد و مارکت جهانی به‌صورت کامل در حال رصد است.")
+    send_telegram("🚀 **سیستم هوشمند اسمارت مانی بدون وابستگی فعال شد.**\nتمامی ارزهای کلیدی نوبیتکس با سرعت بالا از شبکه جهانی بایننس رصد می‌شوند.")
     while True:
         analyze_smart_money()
         time.sleep(300)
@@ -176,7 +175,7 @@ start_bot_thread()
 
 @app.route('/')
 def health_check():
-    return "Smart Money Bot is Scanning ALL Nobitex Assets!", 200
+    return "Smart Money Bot is Alive & Running Fast!", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
