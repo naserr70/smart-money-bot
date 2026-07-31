@@ -16,22 +16,9 @@ VOLUME_SPIKE_RATIO = 2.5        # حداقل ۲.۵ برابر شدن حجم مع
 PRICE_PUMP_MIN = 1.0            # حداقل ۱.۰٪ رشد قیمت صعودی
 PRICE_PUMP_MAX = 8.0            # سقف رشد ۵ دقیقه
 
-# 🗺️ لیست ارزهای لیست‌شده در نوبیتکس (جفت‌ارزهای جهانی USDT)
-NOBITEX_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
-    "TRXUSDT", "DOTUSDT", "LINKUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "UNIUSDT",
-    "APTUSDT", "SUIUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", "STXUSDT", "XMRUSDT", "FILUSDT",
-    "ARBUSDT", "RENDERUSDT", "VETUSDT", "MKRUSDT", "HBARUSDT", "OPUSDT", "INJUSDT", "PEPEUSDT",
-    "FLOKIUSDT", "BONKUSDT", "WIFUSDT", "NOTUSDT", "DOGSUSDT", "HMSTRUSDT", "TONUSDT", "AAVEUSDT",
-    "GRTUSDT", "ALGOUSDT", "FTMUSDT", "RUNEUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CHZUSDT",
-    "GALAUSDT", "DYDXUSDT", "STRKUSDT", "TIAUSDT", "SEIUSDT", "JUPUSDT", "PYTHUSDT", "PENDLEUSDT",
-    "ENAUSDT", "ONDOUSDT", "OMUSDT", "RAYUSDT", "POPCATUSDT", "FETUSDT", "ORDIUSDT", "1000SATSUSDT"
-]
-
 previous_market_snapshot = {}
 
 def send_telegram(text):
-    """ارسال پیام هشدارهای ساختاریافته به تلگرام"""
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ Error: BOT_TOKEN or CHAT_ID is missing!")
         return False
@@ -45,23 +32,62 @@ def send_telegram(text):
         print(f"Error sending Telegram message: {e}")
         return False
 
-def fetch_binance_ticker_data():
-    """دریافت داده‌های زنده و بدون محدودیت از API صرافی بایننس"""
+def get_all_nobitex_symbols():
+    """استخراج خودکار تمام نمادهای فعال از API نوبیتکس"""
+    symbols = set()
     try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        res = requests.get(url, timeout=10)
+        res = requests.get("https://api.nobitex.ir/v2/orderbook/all", timeout=10)
         if res.status_code == 200:
             data = res.json()
-            # فیلتر کردن فقط برای ارزهای نوبیتکس
-            return {item["symbol"]: item for item in data if item["symbol"] in NOBITEX_SYMBOLS}
+            for pair in data.keys():
+                # جداسازی پایه ارز (مثلاً btc-usdt یا btc-irt)
+                base = pair.split("-")[0].upper()
+                if base not in ["IRT", "USDT"]:
+                    symbols.add(f"{base}USDT")
     except Exception as e:
-        print(f"Error fetching Binance data: {e}")
+        print(f"⚠️ Error fetching Nobitex market list: {e}")
+    
+    return list(symbols)
+
+def fetch_binance_ticker_data(nobitex_symbols):
+    """دریافت داده‌های زنده جهانی از بایننس برای تمام ارزهای نوبیتکس"""
+    endpoints = [
+        "https://api1.binance.com/api/v3/ticker/24hr",
+        "https://api2.binance.com/api/v3/ticker/24hr",
+        "https://api3.binance.com/api/v3/ticker/24hr",
+        "https://api.binance.com/api/v3/ticker/24hr"
+    ]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
+    for url in endpoints:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                # تطبیق با کل ارزهای نوبیتکس
+                filtered = {item["symbol"]: item for item in data if item.get("symbol") in nobitex_symbols}
+                if filtered:
+                    return filtered
+        except Exception as e:
+            print(f"⚠️ Endpoint {url} failed: {e}")
+            
     return {}
 
 def analyze_smart_money():
     global previous_market_snapshot
     
-    binance_stats = fetch_binance_ticker_data()
+    # ۱. دریافت لیست زنده و کامل ارزهای نوبیتکس
+    nobitex_symbols = get_all_nobitex_symbols()
+    
+    if not nobitex_symbols:
+        print("⚠️ Could not fetch Nobitex symbols, using fallback scan.")
+        return
+
+    # ۲. اسکن مارکت جهانی برای تمام این ارزها
+    binance_stats = fetch_binance_ticker_data(nobitex_symbols)
     smart_signals = []
 
     if binance_stats:
@@ -106,7 +132,7 @@ def analyze_smart_money():
 
         previous_market_snapshot = current_snapshot
 
-    # ۱. ارسال سیگنال در صورت کشف نهنگ/اسمارت مانی
+    # ۳. ارسال سیگنال در صورت کشف نهنگ/اسمارت مانی
     if smart_signals:
         for s in smart_signals:
             alert_msg = (
@@ -122,12 +148,13 @@ def analyze_smart_money():
             )
             send_telegram(alert_msg)
 
-    # ۲. ارسال گزارش زنده ۵ دقیقه‌ای
+    # ۴. ارسال گزارش زنده ۵ دقیقه‌ای
     total_scanned = len(binance_stats) if binance_stats else 0
+    total_nobitex = len(nobitex_symbols)
     status_msg = (
         f"🟢 **گزارش رصد زنده مارکت**\n\n"
         f"⏰ **زمان:** `{time.strftime('%H:%M:%S')}` UTC\n"
-        f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از `{len(NOBITEX_SYMBOLS)}`\n"
+        f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از `{total_nobitex}` ارز نوبیتکس\n"
         f"🎯 **سیگنال‌های نهنگ در این دور:** `{len(smart_signals)}` مورد\n"
         f"📡 **وضعیت سیستم:** فعال و ۲۴ ساعته"
     )
@@ -135,10 +162,10 @@ def analyze_smart_money():
 
 def bot_loop():
     time.sleep(3)
-    send_telegram("🚀 **سیستم تحلیل هوشمند اسمارت مانی (Binance Engine) فعال شد.**\nبازار بین‌المللی با سرعت و پایداری بالا در حال رصد است.")
+    send_telegram("🚀 **موتور پویا فعال شد!**\nلیست تمام ارزهای نوبیتکس دریافت شد و مارکت جهانی به‌صورت کامل در حال رصد است.")
     while True:
         analyze_smart_money()
-        time.sleep(300) # هر ۵ دقیقه یک‌بار
+        time.sleep(300)
 
 def start_bot_thread():
     t = threading.Thread(target=bot_loop)
@@ -149,7 +176,7 @@ start_bot_thread()
 
 @app.route('/')
 def health_check():
-    return "Smart Money Bot is Alive & Scanning Binance Data!", 200
+    return "Smart Money Bot is Scanning ALL Nobitex Assets!", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
