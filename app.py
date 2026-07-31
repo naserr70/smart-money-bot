@@ -1,8 +1,22 @@
 import os
 import time
 import threading
+import logging
+import statistics
+from collections import deque
+from datetime import datetime, timezone
+
 import requests
-from flask import Flask
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from flask import Flask, jsonify
+
+# ==================== لاگ‌گیری ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("smart_money_bot")
 
 app = Flask(__name__)
 
@@ -10,11 +24,15 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
-# ==================== فیلترهای ورود پول هوشمند (Smart Money) ====================
-MIN_INFLOW_USD_5M = 50_000      # حداقل ۵۰ هزار دلار ورود پول خالص در ۵ دقیقه
-VOLUME_SPIKE_RATIO = 2.5        # حداقل ۲.۵ برابر شدن حجم معاملاتی نسبت به میانگین
-PRICE_PUMP_MIN = 1.0            # حداقل ۱.۰٪ رشد قیمت صعودی
-PRICE_PUMP_MAX = 8.0            # سقف رشد ۵ دقیقه
+# ==================== تنظیمات (قابل تغییر با Environment Variables) ====================
+MIN_INFLOW_USD_5M = float(os.environ.get("MIN_INFLOW_USD_5M", 50_000))
+VOLUME_SPIKE_RATIO = float(os.environ.get("VOLUME_SPIKE_RATIO", 2.5))
+PRICE_PUMP_MIN = float(os.environ.get("PRICE_PUMP_MIN", 1.0))
+PRICE_PUMP_MAX = float(os.environ.get("PRICE_PUMP_MAX", 8.0))
+ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", 1800))  # ۳۰ دقیقه بین دو هشدار برای یک نماد
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 300))
+SEND_STATUS_REPORT = os.environ.get("SEND_STATUS_REPORT", "true").lower() == "true"
+HISTORY_WINDOW = int(os.environ.get("HISTORY_WINDOW", 12))  # تعداد دورهای قبلی برای میانگین حجم واقعی (۱۲ دور = ۱ ساعت)
 
 # 🗺️ لیست کامل و جامع ۲۴۰+ رمزارز بازار نوبیتکس (جفت‌ارزهای معادل USDT در بایننس)
 NOBITEX_SYMBOLS = [
@@ -54,21 +72,60 @@ NOBITEX_SYMBOLS = [
     "RADUSDT", "OXTUSDT", "BATUSDT", "ENJUSDT", "LRCUSDT", "SYSUSDT", "ZENUSDT", "QTUMUSDT"
 ]
 
+# ==================== وضعیت داخلی (state) ====================
 previous_market_snapshot = {}
+volume_history = {}          # symbol -> deque(maxlen=HISTORY_WINDOW) از inflowهای واقعی قبلی
+last_alert_time = {}         # symbol -> epoch زمان آخرین هشدار (برای کول‌داون)
+bot_state = {
+    "last_cycle_at": None,
+    "last_error": None,
+    "cycles_completed": 0,
+    "started_at": datetime.now(timezone.utc).isoformat(),
+}
+state_lock = threading.Lock()
+
+# ==================== HTTP Session با Retry ====================
+def build_session():
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    return session
+
+http_session = build_session()
+
 
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
-        print("❌ Error: BOT_TOKEN or CHAT_ID is missing!")
+        log.error("BOT_TOKEN یا CHAT_ID تنظیم نشده است.")
         return False
-        
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = http_session.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            log.warning(f"ارسال تلگرام ناموفق: {res.status_code} - {res.text[:200]}")
         return res.status_code == 200
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        log.error(f"خطا در ارسال پیام تلگرام: {e}")
         return False
+
+
+def send_telegram_chunked(messages, max_len=3500):
+    """چند پیام کوچک را در قالب کمترین تعداد پیام تلگرام (برای جلوگیری از flood) ارسال می‌کند."""
+    if not messages:
+        return
+    buffer = ""
+    for msg in messages:
+        if len(buffer) + len(msg) + 2 > max_len:
+            send_telegram(buffer)
+            buffer = msg
+        else:
+            buffer = f"{buffer}\n\n{msg}" if buffer else msg
+    if buffer:
+        send_telegram(buffer)
+
 
 def fetch_binance_ticker_data():
     """دریافت داده‌های زنده جهانی از اندپوینت‌های مستقیم بایننس"""
@@ -76,120 +133,195 @@ def fetch_binance_ticker_data():
         "https://api1.binance.com/api/v3/ticker/24hr",
         "https://api2.binance.com/api/v3/ticker/24hr",
         "https://api3.binance.com/api/v3/ticker/24hr",
-        "https://api.binance.com/api/v3/ticker/24hr"
+        "https://api.binance.com/api/v3/ticker/24hr",
     ]
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
 
     for url in endpoints:
         try:
-            res = requests.get(url, headers=headers, timeout=8)
+            res = http_session.get(url, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                # فیلتر مستقیم برای لیست کامل نوبیتکس
                 filtered = {item["symbol"]: item for item in data if item.get("symbol") in NOBITEX_SYMBOLS}
                 if filtered:
                     return filtered
         except Exception as e:
-            print(f"⚠️ Endpoint {url} failed: {e}")
-            
+            log.warning(f"اندپوینت {url} خطا داد: {e}")
+
     return {}
+
+
+def is_in_cooldown(symbol):
+    last = last_alert_time.get(symbol)
+    if last is None:
+        return False
+    return (time.time() - last) < ALERT_COOLDOWN_SEC
+
+
+def get_dynamic_baseline(symbol, fallback_avg):
+    """
+    به‌جای فرض توزیع یکنواخت حجم ۲۴ ساعته، از میانگین واقعی inflowهای قبلی همان نماد
+    استفاده می‌کند تا مبنای مقایسه دقیق‌تر و متناسب با رفتار خودِ آن کوین باشد.
+    """
+    hist = volume_history.get(symbol)
+    if hist and len(hist) >= 3:
+        return max(statistics.mean(hist), 1.0)
+    return max(fallback_avg, 1.0)
+
 
 def analyze_smart_money():
     global previous_market_snapshot
-    
+
     binance_stats = fetch_binance_ticker_data()
-    smart_signals = []
+    inflow_signals = []
+    outflow_signals = []
 
     if binance_stats:
         current_snapshot = {}
 
         for sym, item in binance_stats.items():
             clean_sym = sym.replace("USDT", "")
-            price_usd = float(item.get("lastPrice", 0))
-            vol_24h_usd = float(item.get("quoteVolume", 0))
-            change_24h = float(item.get("priceChangePercent", 0))
+            try:
+                price_usd = float(item.get("lastPrice", 0))
+                vol_24h_usd = float(item.get("quoteVolume", 0))
+                change_24h = float(item.get("priceChangePercent", 0))
+            except (TypeError, ValueError):
+                continue
 
-            current_snapshot[clean_sym] = {
-                "price": price_usd,
-                "vol_usd": vol_24h_usd
-            }
+            current_snapshot[clean_sym] = {"price": price_usd, "vol_usd": vol_24h_usd}
 
-            # بررسی و تحلیل ۵ دقیقه اخیر
-            if clean_sym in previous_market_snapshot:
+            if clean_sym in previous_market_snapshot and price_usd > 0:
                 prev_price = previous_market_snapshot[clean_sym]["price"]
                 prev_vol = previous_market_snapshot[clean_sym]["vol_usd"]
 
-                if prev_price > 0:
-                    price_5m_change = ((price_usd - prev_price) / prev_price) * 100
-                    vol_5m_inflow = vol_24h_usd - prev_vol
-                    expected_5m_avg_vol = vol_24h_usd / 288
+                if prev_price <= 0:
+                    continue
 
-                    # فیلتر چندگانه ورود نهنگ
-                    if (vol_5m_inflow >= (expected_5m_avg_vol * VOLUME_SPIKE_RATIO) and 
-                        vol_5m_inflow >= MIN_INFLOW_USD_5M and 
-                        PRICE_PUMP_MIN <= price_5m_change <= PRICE_PUMP_MAX):
+                price_5m_change = ((price_usd - prev_price) / prev_price) * 100
+                vol_5m_inflow = vol_24h_usd - prev_vol
+                fallback_avg_vol = vol_24h_usd / 288
 
-                        spike_multiplier = vol_5m_inflow / expected_5m_avg_vol if expected_5m_avg_vol > 0 else 1
-                        
-                        smart_signals.append({
-                            "symbol": clean_sym,
-                            "price": price_usd,
-                            "change_5m": price_5m_change,
-                            "change_24h": change_24h,
-                            "inflow_usd": vol_5m_inflow,
-                            "spike_multiplier": spike_multiplier
-                        })
+                # به‌روزرسانی تاریخچه‌ی حجم واقعی این نماد (فقط مقادیر مثبت معنادار)
+                if vol_5m_inflow > 0:
+                    hist = volume_history.setdefault(clean_sym, deque(maxlen=HISTORY_WINDOW))
+                    hist.append(vol_5m_inflow)
+
+                baseline_vol = get_dynamic_baseline(clean_sym, fallback_avg_vol)
+                spike_multiplier = (vol_5m_inflow / baseline_vol) if baseline_vol > 0 else 1
+
+                # فیلتر ورود پول هوشمند (Whale Inflow / Pump)
+                if (
+                    vol_5m_inflow >= (baseline_vol * VOLUME_SPIKE_RATIO)
+                    and vol_5m_inflow >= MIN_INFLOW_USD_5M
+                    and PRICE_PUMP_MIN <= price_5m_change <= PRICE_PUMP_MAX
+                    and not is_in_cooldown(clean_sym)
+                ):
+                    inflow_signals.append({
+                        "symbol": clean_sym, "price": price_usd, "change_5m": price_5m_change,
+                        "change_24h": change_24h, "inflow_usd": vol_5m_inflow,
+                        "spike_multiplier": spike_multiplier,
+                    })
+                    last_alert_time[clean_sym] = time.time()
+
+                # فیلتر خروج پول هوشمند (Whale Outflow / Dump) — همان شرایط ولی با افت قیمت
+                elif (
+                    vol_5m_inflow >= (baseline_vol * VOLUME_SPIKE_RATIO)
+                    and vol_5m_inflow >= MIN_INFLOW_USD_5M
+                    and -PRICE_PUMP_MAX <= price_5m_change <= -PRICE_PUMP_MIN
+                    and not is_in_cooldown(clean_sym)
+                ):
+                    outflow_signals.append({
+                        "symbol": clean_sym, "price": price_usd, "change_5m": price_5m_change,
+                        "change_24h": change_24h, "inflow_usd": vol_5m_inflow,
+                        "spike_multiplier": spike_multiplier,
+                    })
+                    last_alert_time[clean_sym] = time.time()
 
         previous_market_snapshot = current_snapshot
 
-    # ۱. ارسال سیگنال در صورت کشف نهنگ/اسمارت مانی
-    if smart_signals:
-        for s in smart_signals:
-            alert_msg = (
-                f"🚨 **سیگنال ورود پول هوشمند (SMART MONEY)** 🚨\n\n"
-                f"🪙 **نماد:** #{s['symbol']} *(موجود در نوبیتکس)*\n"
-                f"💵 **قیمت جهانی:** ${s['price']:,.4f}\n"
-                f"📊 **تغییرات ۲۴ ساعته:** `{s['change_24h']:+.2f}%`\n\n"
-                f"🔍 **شاخص‌های تاییدیه نهنگ (۵ دقیقه اخیر):**\n"
-                f"📈 **رشد قیمت ۵ دقیقه:** `+{s['change_5m']:.2f}%`\n"
-                f"🔥 **ورود پول خالص:** `${s['inflow_usd']/1e3:,.1f}K`\n"
-                f"⚡ **جهش حجم معاملاتی:** `{s['spike_multiplier']:.1f}X` برابر میانگین\n\n"
-                f"🎯 **توصیه:** *بررسی چارت در تایم‌فریم ۱۵ دقیقه و ورود پله‌ای.*"
-            )
-            send_telegram(alert_msg)
+    messages = []
 
-    # ۲. ارسال گزارش زنده ۵ دقیقه‌ای
-    total_scanned = len(binance_stats) if binance_stats else 0
-    status_msg = (
-        f"🟢 **گزارش رصد زنده مارکت**\n\n"
-        f"⏰ **زمان:** `{time.strftime('%H:%M:%S')}` UTC\n"
-        f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از بازار نوبیتکس\n"
-        f"🎯 **سیگنال‌های نهنگ در این دور:** `{len(smart_signals)}` مورد\n"
-        f"📡 **وضعیت سیستم:** فعال و ۲۴ ساعته"
-    )
-    send_telegram(status_msg)
+    for s in inflow_signals:
+        messages.append(
+            f"🚨 **ورود پول هوشمند (SMART MONEY IN)** 🚨\n\n"
+            f"🪙 **نماد:** #{s['symbol']} *(موجود در نوبیتکس)*\n"
+            f"💵 **قیمت جهانی:** ${s['price']:,.4f}\n"
+            f"📊 **تغییرات ۲۴ ساعته:** `{s['change_24h']:+.2f}%`\n\n"
+            f"📈 **رشد قیمت ۵ دقیقه:** `+{s['change_5m']:.2f}%`\n"
+            f"🔥 **ورود پول خالص:** `${s['inflow_usd']/1e3:,.1f}K`\n"
+            f"⚡ **جهش حجم معاملاتی:** `{s['spike_multiplier']:.1f}X` برابر میانگین واقعی\n\n"
+            f"🎯 **توصیه:** بررسی چارت در تایم‌فریم ۱۵ دقیقه و ورود پله‌ای."
+        )
+
+    for s in outflow_signals:
+        messages.append(
+            f"🔻 **خروج پول هوشمند (SMART MONEY OUT)** 🔻\n\n"
+            f"🪙 **نماد:** #{s['symbol']} *(موجود در نوبیتکس)*\n"
+            f"💵 **قیمت جهانی:** ${s['price']:,.4f}\n"
+            f"📊 **تغییرات ۲۴ ساعته:** `{s['change_24h']:+.2f}%`\n\n"
+            f"📉 **افت قیمت ۵ دقیقه:** `{s['change_5m']:.2f}%`\n"
+            f"🔥 **خروج پول خالص (تخمینی):** `${s['inflow_usd']/1e3:,.1f}K`\n"
+            f"⚡ **جهش حجم معاملاتی:** `{s['spike_multiplier']:.1f}X` برابر میانگین واقعی\n\n"
+            f"🎯 **توصیه:** احتمال توزیع/خروج نهنگ؛ احتیاط در نگهداری پوزیشن."
+        )
+
+    if messages:
+        send_telegram_chunked(messages)
+
+    if SEND_STATUS_REPORT:
+        total_scanned = len(binance_stats) if binance_stats else 0
+        status_msg = (
+            f"🟢 **گزارش رصد زنده مارکت**\n\n"
+            f"⏰ **زمان (UTC):** `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
+            f"🔍 **ارزهای آنالیز شده:** `{total_scanned}` از بازار نوبیتکس\n"
+            f"📥 **سیگنال ورود:** `{len(inflow_signals)}` مورد\n"
+            f"📤 **سیگنال خروج:** `{len(outflow_signals)}` مورد\n"
+            f"📡 **وضعیت سیستم:** فعال و ۲۴ ساعته"
+        )
+        send_telegram(status_msg)
+
+    with state_lock:
+        bot_state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
+        bot_state["cycles_completed"] += 1
+        bot_state["last_error"] = None
+
 
 def bot_loop():
     time.sleep(3)
-    send_telegram("🚀 **سیستم تحلیل هوشمند فوق‌پایدار فعال شد.**\nپوشش کامل بیش از ۲۰۰ ارز موجود در نوبیتکس از طریق سرورهای جهانی.")
+    send_telegram(
+        "🚀 **سیستم تحلیل هوشمند فوق‌پایدار فعال شد.**\n"
+        "پوشش کامل بیش از ۲۰۰ ارز موجود در نوبیتکس، تشخیص ورود و خروج نهنگ."
+    )
     while True:
-        analyze_smart_money()
-        time.sleep(300)
+        try:
+            analyze_smart_money()
+        except Exception as e:
+            log.exception("خطای بحرانی در چرخه تحلیل")
+            with state_lock:
+                bot_state["last_error"] = str(e)
+            # به کاربر هم اطلاع بده تا متوجه قطعی سکوت‌آمیز نشود
+            send_telegram(f"⚠️ خطا در چرخه تحلیل رخ داد: `{e}`\nسیستم به کار خود ادامه می‌دهد.")
+        time.sleep(SCAN_INTERVAL_SEC)
+
 
 def start_bot_thread():
-    t = threading.Thread(target=bot_loop)
-    t.daemon = True
+    t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
+
 
 start_bot_thread()
 
-@app.route('/')
+
+@app.route("/")
 def health_check():
     return "Smart Money Bot is Scanning Full Nobitex Asset List!", 200
 
+
+@app.route("/status")
+def status():
+    with state_lock:
+        return jsonify(bot_state)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
