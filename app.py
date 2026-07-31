@@ -143,7 +143,7 @@ def analyze_smart_money():
             )
             send_telegram(alert_msg)
 
-    # ۲. ارسال وضعیت سلامت و گزارش ۵ دقیقه‌ای ربات
+    # ۲. ارسال گزارش ۵ دقیقه‌ای
     total_scanned = len(global_stats) if global_stats else 0
     status_msg = (
         f"🟢 **گزارش وضعیت ربات (تست ۵ دقیقه)**\n\n"
@@ -155,8 +155,7 @@ def analyze_smart_money():
     send_telegram(status_msg)
 
 def bot_loop():
-    # ارسال پیام استارت اولیه
-    send_telegram("🚀 **ربات هوشمند فعال شد.**\nاز این پس هر ۵ دقیقه گزارش وضعیت و سیگنال‌ها ارسال می‌شود.")
+    send_telegram("🚀 **ربات هوشمند فعال شد.**\nاز این پس هر ۵ دقیقه گزارش وضعیت ارسال می‌شود.")
     while True:
         analyze_smart_money()
         time.sleep(300) # هر ۵ دقیقه
@@ -166,4 +165,3 @@ if __name__ == "__main__":
     t.daemon = True
     t.start()
     run_flask()
-
