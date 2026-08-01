@@ -33,10 +33,14 @@ from state import BotState
 
 log = logging.getLogger("smart_money_bot.exchange_flow")
 
-CHAIN_API_BASE = {
-    "ETH": "https://api.etherscan.io/api",
-    "BSC": "https://api.bscscan.com/api",
-}
+# Etherscan's legacy v1 API (separate api.etherscan.io / api.bscscan.com hosts
+# with per-chain keys) was fully deprecated on 2025-08-15. Etherscan API V2 is
+# a single unified endpoint for 50+ EVM chains, selected via a `chainid` query
+# param, and — per Etherscan's own docs — a single ETHERSCAN_API_KEY works
+# across all of them (BSCSCAN_API_KEY is kept only as an optional override in
+# case you're on a plan/setup that still needs a distinct key for BNB Chain).
+ETHERSCAN_V2_BASE = "https://api.etherscan.io/v2/api"
+CHAIN_ID = {"ETH": 1, "BSC": 56}
 
 
 class ExchangeFlowTracker:
@@ -45,9 +49,11 @@ class ExchangeFlowTracker:
         self.state = state
         self.session = session
         self.price_feed = PriceFeed(session, timeout=settings.http_timeout_sec)
+        # Prefer a chain-specific key if the user supplied one, otherwise fall
+        # back to the single unified Etherscan key.
         self._api_keys = {
             "ETH": settings.etherscan_api_key,
-            "BSC": settings.bscscan_api_key,
+            "BSC": settings.bscscan_api_key or settings.etherscan_api_key,
         }
 
     def is_enabled(self) -> bool:
@@ -70,12 +76,16 @@ class ExchangeFlowTracker:
     # ---------------- internal ----------------
 
     def _api_get(self, chain: str, params: dict) -> list:
-        base = CHAIN_API_BASE.get(chain)
-        if not base:
+        chain_id = CHAIN_ID.get(chain)
+        if chain_id is None:
             return []
+        params = {**params, "chainid": chain_id}
         try:
-            res = self.session.get(base, params=params, timeout=self.settings.http_timeout_sec)
+            res = self.session.get(ETHERSCAN_V2_BASE, params=params, timeout=self.settings.http_timeout_sec)
             payload = res.json()
+            if str(payload.get("status")) == "0" and "deprecated" in str(payload.get("result", "")).lower():
+                log.error("Etherscan API نسخه قدیمی شناسایی شد؛ لطفاً پیکربندی را بررسی کنید.")
+                return []
             result = payload.get("result")
             return result if isinstance(result, list) else []
         except (requests.RequestException, ValueError) as e:
