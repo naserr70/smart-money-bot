@@ -63,6 +63,12 @@ class MarketAnalyzer:
             if vol_inflow > 0:
                 self.state.push_volume_sample(symbol, vol_inflow)
 
+            # Compute the statistical anomaly score BEFORE pushing the
+            # current sample in, so it's measured against prior history,
+            # not against itself.
+            zscore = self.state.get_return_zscore(symbol, price_change) if self.settings.pump_zscore_enabled else None
+            self.state.push_price_return_sample(symbol, price_change)
+
             baseline_vol = self.state.get_baseline_volume(symbol, fallback_avg_vol)
             spike_multiplier = (vol_inflow / baseline_vol) if baseline_vol > 0 else 0
 
@@ -74,14 +80,19 @@ class MarketAnalyzer:
                 if self.state.is_in_cooldown(cooldown_key, self.settings.alert_cooldown_sec):
                     continue
 
-                if self.settings.price_pump_min <= price_change <= self.settings.price_pump_max:
+                is_static_pump = self.settings.price_pump_min <= price_change <= self.settings.price_pump_max
+                is_static_dump = -self.settings.price_pump_max <= price_change <= -self.settings.price_pump_min
+                is_statistical_pump = zscore is not None and zscore >= self.settings.pump_zscore_threshold
+                is_statistical_dump = zscore is not None and zscore <= -self.settings.pump_zscore_threshold
+
+                if is_static_pump or is_statistical_pump:
                     signals.append(MarketSignal(
                         symbol=symbol, price=price_usd, change_5m=price_change,
                         change_24h=change_24h, inflow_usd=vol_inflow,
                         spike_multiplier=spike_multiplier, direction=SignalDirection.INFLOW,
                     ))
                     self.state.mark_alerted(cooldown_key)
-                elif -self.settings.price_pump_max <= price_change <= -self.settings.price_pump_min:
+                elif is_static_dump or is_statistical_dump:
                     signals.append(MarketSignal(
                         symbol=symbol, price=price_usd, change_5m=price_change,
                         change_24h=change_24h, inflow_usd=vol_inflow,
