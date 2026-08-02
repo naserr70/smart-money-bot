@@ -24,12 +24,14 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 NATIVE_COINGECKO_IDS = {
     "ETH": "ethereum",
     "BSC": "binancecoin",
+    "TRON": "tron",
 }
 
 # Platform slug used by CoinGecko's token_price-by-contract endpoint.
 CHAIN_PLATFORM = {
     "ETH": "ethereum",
     "BSC": "binance-smart-chain",
+    "TRON": "tron",
 }
 
 # CoinGecko's free/demo tier is roughly ~30 calls/min per IP, shared across
@@ -42,7 +44,7 @@ RATE_LIMIT_COOLDOWN_SEC = 90   # after a 429, stop calling entirely for a while
 
 class PriceFeed:
     def __init__(self, session: requests.Session = None, timeout: int = 8, ttl_sec: int = DEFAULT_TTL_SEC):
-        # Deliberately NOT the shared retry-happy session — see module docstring.
+        # Deliberately NOT the shared retry-happy session â see module docstring.
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "SmartMoneyBot/2.0"})
         self.timeout = timeout
@@ -130,3 +132,52 @@ class PriceFeed:
             self._set_cached(cache_key, float(price))
             return float(price)
         return None
+
+    def get_token_prices_usd_batch(self, chain: str, contract_addresses: list) -> Dict[str, float]:
+        """Price several contracts on the same chain in as few CoinGecko
+        calls as possible: CoinGecko's token_price endpoint accepts a
+        comma-separated contract_addresses list in a single request, so
+        pricing e.g. 15 distinct tokens seen across a wallet watch-list costs
+        1 call instead of 15 â this is what keeps the exchange-flow tracker
+        from tripping CoinGecko's free-tier rate limit as the watch-list
+        grows. Returns {contract_address_lowercase: price_usd} for whatever
+        could be resolved (missing/uncached-and-unreachable ones are simply
+        absent from the result, exactly like get_token_price_usd's None)."""
+        platform = CHAIN_PLATFORM.get(chain)
+        if not platform:
+            return {}
+
+        result: Dict[str, float] = {}
+        to_fetch = []
+        seen = set()
+        for addr in contract_addresses:
+            addr = (addr or "").lower()
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+            cached = self._get_cached(f"token:{chain}:{addr}")
+            if cached is not None:
+                result[addr] = cached
+            else:
+                to_fetch.append(addr)
+
+        if not to_fetch:
+            return result
+
+        # CoinGecko's URL length limits mean very large batches should still
+        # be chunked; 50 contracts per call is comfortably safe.
+        for i in range(0, len(to_fetch), 50):
+            chunk = to_fetch[i:i + 50]
+            data = self._request(
+                f"{COINGECKO_BASE}/simple/token_price/{platform}",
+                {"contract_addresses": ",".join(chunk), "vs_currencies": "usd"},
+            )
+            if not data:
+                continue
+            for addr, info in data.items():
+                price = info.get("usd")
+                if price:
+                    self._set_cached(f"token:{chain}:{addr.lower()}", float(price))
+                    result[addr.lower()] = float(price)
+
+        return result
