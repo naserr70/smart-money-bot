@@ -30,6 +30,7 @@ class BotState:
 
         self.previous_market_snapshot: Dict[str, dict] = {}
         self.volume_history: Dict[str, deque] = {}
+        self.price_return_history: Dict[str, deque] = {}
         self.last_alert_time: Dict[str, float] = {}
         self.seen_tx_hashes: deque = deque(maxlen=5000)
 
@@ -70,6 +71,34 @@ class BotState:
         with self._lock:
             hist = self.volume_history.setdefault(symbol, deque(maxlen=self._history_window))
             hist.append(value)
+
+    def push_price_return_sample(self, symbol: str, pct_change: float) -> None:
+        with self._lock:
+            hist = self.price_return_history.setdefault(symbol, deque(maxlen=self._history_window))
+            hist.append(pct_change)
+
+    def get_return_zscore(self, symbol: str, current_pct_change: float) -> Optional[float]:
+        """How many standard deviations `current_pct_change` is from this
+        symbol's own recent per-cycle price-return distribution. Returns
+        None until there's enough history (min 5 samples) to make the
+        number meaningful — with too little history a z-score is noise, not
+        signal, so callers should treat None as "can't judge yet", not "0".
+
+        This lets a coin that normally barely moves get flagged on a much
+        smaller absolute % move than a coin that's always volatile, which a
+        single fixed PRICE_PUMP_MIN/MAX threshold across every asset can't
+        do. It's a fairly short rolling window (HISTORY_WINDOW cycles), so
+        treat it as a useful second signal alongside the static thresholds,
+        not a replacement for human judgement."""
+        with self._lock:
+            hist = list(self.price_return_history.get(symbol, ()))
+        if len(hist) < 5:
+            return None
+        mean = statistics.mean(hist)
+        stdev = statistics.pstdev(hist)
+        if stdev == 0:
+            return None
+        return (current_pct_change - mean) / stdev
 
     def swap_snapshot(self, new_snapshot: dict) -> dict:
         with self._lock:
