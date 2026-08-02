@@ -44,6 +44,14 @@ DEFAULT_EXCHANGE_WALLETS: Dict[str, Dict[str, str]] = {
         # Populate with verified BscScan-labelled addresses if you have a
         # BSCSCAN_API_KEY configured.
     },
+    "TRON": {
+        # Populate with verified Tronscan-labelled addresses (tronscan.org).
+        # Left empty deliberately â I could not verify a specific exchange's
+        # TRC20 hot-wallet address confidently enough to hardcode it here;
+        # guessing one would repeat exactly the SYS/SYN mistake this project
+        # already learned from. Add your own via EXCHANGE_WALLETS_JSON, e.g.:
+        #   {"TRON": {"T...verified_address...": "Some Exchange"}}
+    },
 }
 
 
@@ -61,6 +69,8 @@ class Settings:
     alert_cooldown_sec: int = field(default_factory=lambda: _env_int("ALERT_COOLDOWN_SEC", 1800))
     scan_interval_sec: int = field(default_factory=lambda: _env_int("SCAN_INTERVAL_SEC", 300))
     history_window: int = field(default_factory=lambda: _env_int("HISTORY_WINDOW", 12))
+    pump_zscore_enabled: bool = field(default_factory=lambda: _env_bool("PUMP_ZSCORE_ENABLED", True))
+    pump_zscore_threshold: float = field(default_factory=lambda: _env_float("PUMP_ZSCORE_THRESHOLD", 3.0))
 
     # --- Status / housekeeping ---
     send_status_report: bool = field(default_factory=lambda: _env_bool("SEND_STATUS_REPORT", True))
@@ -69,6 +79,7 @@ class Settings:
     # --- On-chain exchange-wallet flow tracking (independent whale signal) ---
     etherscan_api_key: str = field(default_factory=lambda: _env_str("ETHERSCAN_API_KEY"))
     bscscan_api_key: str = field(default_factory=lambda: _env_str("BSCSCAN_API_KEY"))
+    tron_api_key: str = field(default_factory=lambda: _env_str("TRON_API_KEY"))
     whale_min_usd: float = field(default_factory=lambda: _env_float("WHALE_MIN_USD", 500_000))
     whale_scan_interval_sec: int = field(default_factory=lambda: _env_int("WHALE_SCAN_INTERVAL_SEC", 120))
     whale_cooldown_sec: int = field(default_factory=lambda: _env_int("WHALE_COOLDOWN_SEC", 900))
