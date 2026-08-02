@@ -66,6 +66,7 @@ class ExchangeFlowSignal:
         explorer = {
             "ETH": "https://etherscan.io/tx/",
             "BSC": "https://bscscan.com/tx/",
+            "TRON": "https://tronscan.org/#/transaction/",
         }.get(self.chain, "")
         link = f"{explorer}{self.tx_hash}" if explorer else self.tx_hash
 
