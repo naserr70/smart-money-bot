@@ -12,6 +12,19 @@ class SignalDirection(Enum):
     OUTFLOW = "outflow"
 
 
+class TriggerType(Enum):
+    """Why a MarketSignal fired — used purely for labeling/wording, not logic.
+    STATIC: only the fixed PRICE_PUMP_MIN/MAX %% threshold was crossed.
+    STATISTICAL: only the z-score anomaly (relative to this coin's own recent
+    behavior) crossed PUMP_ZSCORE_THRESHOLD — this is the actual "پامپ"
+    detector; it fires on moves that are unusual FOR THAT COIN even if small
+    in absolute %%.
+    BOTH: both conditions were true at once (the strongest case)."""
+    STATIC = "static"
+    STATISTICAL = "statistical"
+    BOTH = "both"
+
+
 @dataclass
 class MarketSignal:
     """A CEX ticker-based signal: unusual 24h-volume-delta + price move over one poll cycle."""
@@ -23,18 +36,38 @@ class MarketSignal:
     inflow_usd: float
     spike_multiplier: float
     direction: SignalDirection
+    trigger: TriggerType = TriggerType.STATIC
+    zscore: float = None
 
     def to_telegram(self) -> str:
+        is_pump_labeled = self.trigger in (TriggerType.STATISTICAL, TriggerType.BOTH)
+
         if self.direction == SignalDirection.INFLOW:
-            header = "🚨 *ورود پول هوشمند (SMART MONEY IN)* 🚨"
+            if is_pump_labeled:
+                header = "🚀 *پامپ شناسایی شد (PUMP DETECTED)* 🚀"
+            else:
+                header = "🚨 *ورود پول هوشمند (SMART MONEY IN)* 🚨"
             price_line = f"📈 *رشد قیمت اخیر:* `+{self.change_5m:.2f}%`"
             flow_label = "ورود پول خالص"
             advice = "🎯 *توصیه:* بررسی چارت در تایم‌فریم ۱۵ دقیقه و ورود پله‌ای."
         else:
-            header = "🔻 *خروج پول هوشمند (SMART MONEY OUT)* 🔻"
+            if is_pump_labeled:
+                header = "💥 *دامپ ناگهانی شناسایی شد (SUDDEN DUMP DETECTED)* 💥"
+            else:
+                header = "🔻 *خروج پول هوشمند (SMART MONEY OUT)* 🔻"
             price_line = f"📉 *افت قیمت اخیر:* `{self.change_5m:.2f}%`"
             flow_label = "خروج پول خالص (تخمینی)"
             advice = "🎯 *توصیه:* احتمال توزیع/خروج نهنگ؛ احتیاط در نگهداری پوزیشن."
+
+        detection_line = ""
+        if self.trigger == TriggerType.STATIC:
+            detection_line = "🔎 *نوع تشخیص:* عبور از آستانه‌ی ثابت درصدی\n"
+        elif self.trigger == TriggerType.STATISTICAL:
+            z = f"{self.zscore:.1f}σ" if self.zscore is not None else "N/A"
+            detection_line = f"🔎 *نوع تشخیص:* ناهنجاری آماری نسبت به رفتار عادی خودِ این ارز (`{z}`)\n"
+        elif self.trigger == TriggerType.BOTH:
+            z = f"{self.zscore:.1f}σ" if self.zscore is not None else "N/A"
+            detection_line = f"🔎 *نوع تشخیص:* هم آستانه‌ی ثابت، هم ناهنجاری آماری (`{z}`)\n"
 
         return (
             f"{header}\n\n"
@@ -43,7 +76,8 @@ class MarketSignal:
             f"📊 *تغییرات ۲۴ ساعته:* `{self.change_24h:+.2f}%`\n\n"
             f"{price_line}\n"
             f"🔥 *{flow_label}:* `${self.inflow_usd/1e3:,.1f}K`\n"
-            f"⚡ *جهش حجم معاملاتی:* `{self.spike_multiplier:.1f}X` برابر میانگین واقعی\n\n"
+            f"⚡ *جهش حجم معاملاتی:* `{self.spike_multiplier:.1f}X` برابر میانگین واقعی\n"
+            f"{detection_line}\n"
             f"{advice}\n"
             f"_منبع: تیکر صرافی (Volume/Price Ticker Signal)_"
         )
