@@ -22,7 +22,7 @@ import requests
 
 from config import Settings
 from market_data import MarketDataProvider
-from signals import MarketSignal, SignalDirection
+from signals import MarketSignal, SignalDirection, TriggerType
 from state import BotState
 
 log = logging.getLogger("smart_money_bot.market_analyzer")
@@ -60,6 +60,13 @@ class MarketAnalyzer:
             vol_inflow = vol_24h_usd - prev["vol_usd"]
             fallback_avg_vol = vol_24h_usd / 288  # ~5min slice of a 24h rolling volume
 
+            # Baseline MUST be computed from history BEFORE this cycle's
+            # sample is added to it — otherwise a genuine spike inflates its
+            # own comparison baseline and can dodge the spike-ratio check
+            # (this was a real bug present since the original script).
+            baseline_vol = self.state.get_baseline_volume(symbol, fallback_avg_vol)
+            spike_multiplier = (vol_inflow / baseline_vol) if baseline_vol > 0 else 0
+
             if vol_inflow > 0:
                 self.state.push_volume_sample(symbol, vol_inflow)
 
@@ -69,36 +76,48 @@ class MarketAnalyzer:
             zscore = self.state.get_return_zscore(symbol, price_change) if self.settings.pump_zscore_enabled else None
             self.state.push_price_return_sample(symbol, price_change)
 
-            baseline_vol = self.state.get_baseline_volume(symbol, fallback_avg_vol)
-            spike_multiplier = (vol_inflow / baseline_vol) if baseline_vol > 0 else 0
-
             is_volume_spike = vol_inflow >= (baseline_vol * self.settings.volume_spike_ratio)
             is_significant = vol_inflow >= self.settings.min_inflow_usd_5m
 
-            if is_volume_spike and is_significant:
-                cooldown_key = f"market:{symbol}"
-                if self.state.is_in_cooldown(cooldown_key, self.settings.alert_cooldown_sec):
-                    continue
+            # Both paths require some real, meaningful volume behind the move
+            # (this is what keeps illiquid noise out) — but only the STATIC
+            # path additionally requires the full baseline-relative spike.
+            # Nesting the statistical path inside that same strict spike gate
+            # (the previous version's actual bug) meant it could almost never
+            # fire anything the static path wasn't already catching, since a
+            # real 2.5x volume spike is usually already a >1% price move too.
+            if not is_significant:
+                continue
 
-                is_static_pump = self.settings.price_pump_min <= price_change <= self.settings.price_pump_max
-                is_static_dump = -self.settings.price_pump_max <= price_change <= -self.settings.price_pump_min
-                is_statistical_pump = zscore is not None and zscore >= self.settings.pump_zscore_threshold
-                is_statistical_dump = zscore is not None and zscore <= -self.settings.pump_zscore_threshold
+            cooldown_key = f"market:{symbol}"
+            if self.state.is_in_cooldown(cooldown_key, self.settings.alert_cooldown_sec):
+                continue
 
-                if is_static_pump or is_statistical_pump:
-                    signals.append(MarketSignal(
-                        symbol=symbol, price=price_usd, change_5m=price_change,
-                        change_24h=change_24h, inflow_usd=vol_inflow,
-                        spike_multiplier=spike_multiplier, direction=SignalDirection.INFLOW,
-                    ))
-                    self.state.mark_alerted(cooldown_key)
-                elif is_static_dump or is_statistical_dump:
-                    signals.append(MarketSignal(
-                        symbol=symbol, price=price_usd, change_5m=price_change,
-                        change_24h=change_24h, inflow_usd=vol_inflow,
-                        spike_multiplier=spike_multiplier, direction=SignalDirection.OUTFLOW,
-                    ))
-                    self.state.mark_alerted(cooldown_key)
+            is_static_pump = is_volume_spike and (self.settings.price_pump_min <= price_change <= self.settings.price_pump_max)
+            is_static_dump = is_volume_spike and (-self.settings.price_pump_max <= price_change <= -self.settings.price_pump_min)
+            is_statistical_pump = zscore is not None and zscore >= self.settings.pump_zscore_threshold
+            is_statistical_dump = zscore is not None and zscore <= -self.settings.pump_zscore_threshold
+
+            if is_static_pump or is_statistical_pump:
+                trigger = TriggerType.BOTH if (is_static_pump and is_statistical_pump) else (
+                    TriggerType.STATISTICAL if is_statistical_pump else TriggerType.STATIC)
+                signals.append(MarketSignal(
+                    symbol=symbol, price=price_usd, change_5m=price_change,
+                    change_24h=change_24h, inflow_usd=vol_inflow,
+                    spike_multiplier=spike_multiplier, direction=SignalDirection.INFLOW,
+                    trigger=trigger, zscore=zscore,
+                ))
+                self.state.mark_alerted(cooldown_key)
+            elif is_static_dump or is_statistical_dump:
+                trigger = TriggerType.BOTH if (is_static_dump and is_statistical_dump) else (
+                    TriggerType.STATISTICAL if is_statistical_dump else TriggerType.STATIC)
+                signals.append(MarketSignal(
+                    symbol=symbol, price=price_usd, change_5m=price_change,
+                    change_24h=change_24h, inflow_usd=vol_inflow,
+                    spike_multiplier=spike_multiplier, direction=SignalDirection.OUTFLOW,
+                    trigger=trigger, zscore=zscore,
+                ))
+                self.state.mark_alerted(cooldown_key)
 
         self.state.swap_snapshot(current_snapshot)
         return signals, data_source, len(ticker_stats)
