@@ -125,7 +125,7 @@ class MarketAnalyzer:
     def build_status_message(self, data_source: str, symbols_scanned: int,
                               inflow_count: int, outflow_count: int) -> str:
         return (
-            f"🟢 *گزارش رصد زنده مارکت* _(حذف خودکار پس از {self.settings.auto_delete_delay_sec // 60} دقیقه)_\n\n"
+            f"🟢 *گزارش رصد زنده مارکت*
             f"⏰ *زمان (UTC):* `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
             f"🌐 *منبع داده:* `{data_source}`\n"
             f"🔍 *ارزهای آنالیز شده:* `{symbols_scanned}` از تمامی بازارهای نوبیتکس\n"
