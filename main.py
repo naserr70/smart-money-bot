@@ -76,7 +76,7 @@ def broadcast_targets():
 def market_loop():
     time.sleep(3)
     notifier.broadcast(
-        f"🚀 *سیستم تحلیل هوشمند فعال شد.*\n"
+        f"🚀 *سیستم تحلیل هوشمند فوق‌پایدار فعال شد.*\n"
         f"👨‍💻 *توسعه‌دهنده:* {settings.developer_name}\n"
         f"پوشش جامع تمام بازارهای ریالی و تتری نوبیتکس + ردیابی آن‌چین کیف‌پول صرافی‌ها.",
         broadcast_targets(),
@@ -177,6 +177,22 @@ def status():
     return jsonify(health)
 
 
+def build_admin_status_text() -> str:
+    health = state.snapshot_health()
+    lines = [
+        "📈 *وضعیت ربات*\n",
+        f"🕐 آخرین چرخه‌ی مارکت: `{health.get('last_market_cycle_at') or '-'}`",
+        f"🐋 آخرین چرخه‌ی نهنگ: `{health.get('last_whale_cycle_at') or '-'}`",
+        f"🔁 تعداد چرخه‌های مارکت: `{health.get('market_cycles_completed')}`",
+        f"🔁 تعداد چرخه‌های نهنگ: `{health.get('whale_cycles_completed')}`",
+        f"🐋 ماژول نهنگ فعال: `{'بله' if whale_tracker.is_enabled() else 'خیر'}`",
+        f"👥 کاربران مجاز فعال: `{len(access.active_chat_ids())}`",
+    ]
+    if health.get("last_error"):
+        lines.append(f"⚠️ آخرین خطا: `{health.get('last_error')}`")
+    return "\n".join(lines)
+
+
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
     # Telegram sends this header back exactly as registered via setWebhook's
@@ -190,7 +206,8 @@ def telegram_webhook():
 
     update = request.get_json(silent=True) or {}
     try:
-        bot_commands.handle_update(update, settings, access, notifier)
+        bot_commands.handle_update(update, settings, access, notifier,
+                                   admin_status_provider=build_admin_status_text)
     except Exception:
         log.exception("خطا در پردازش پیام ورودی تلگرام")
     return "ok", 200
