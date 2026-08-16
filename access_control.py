@@ -84,6 +84,28 @@ class AccessControl:
             return "نامحدود"
         return datetime.fromisoformat(expires_at).strftime("%Y-%m-%d %H:%M UTC")
 
+    def days_remaining(self, chat_id) -> Optional[float]:
+        """None means "unlimited / admin / not tracked with an expiry" —
+        callers should check is_authorized() first if they need to
+        distinguish "unlimited" from "no access at all"."""
+        chat_id = str(chat_id)
+        if self.is_admin(chat_id):
+            return None
+        with self._lock:
+            entry = self._users.get(chat_id)
+        if not entry:
+            return None
+        expires_at = entry.get("expires_at")
+        if expires_at is None:
+            return None
+        delta = datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)
+        return max(delta.total_seconds() / 86400, 0.0)
+
+    def get_entry(self, chat_id) -> Optional[dict]:
+        with self._lock:
+            entry = self._users.get(str(chat_id))
+            return dict(entry) if entry else None
+
     def grant(self, chat_id, days: Optional[float], label: str = "") -> None:
         """days=None means unlimited access. days=0 or negative effectively revokes."""
         chat_id = str(chat_id)
