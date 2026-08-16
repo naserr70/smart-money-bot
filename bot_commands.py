@@ -8,18 +8,26 @@ Menu (available to everyone once authorized):
   📊 اطلاعات من — shows role, join date, expiry, days remaining
 
 Admin-only menu items (admin = ADMIN_CHAT_ID / defaults to CHAT_ID):
-  👥 لیست کاربران   — list every user with access + expiry
+  👥 لیست کاربران   — list every active user + any unused invite passwords
   📈 وضعیت ربات     — bot health (last cycle times, errors, active users)
-  ➕ اعطای دسترسی   — grant a specific chat_id a specific number of days
-  ➖ حذف دسترسی     — revoke a user's access
+  ➕ اعطای دسترسی   — create a UNIQUE password for one person, with its own
+                       access duration, without needing to know their
+                       chat_id in advance. They redeem it themselves by
+                       sending that password to the bot.
+  ➖ حذف دسترسی     — revoke an already-authorized user's access (by chat_id)
 
-Old-style text commands (/grant, /revoke, /users) still work too, for
-anyone who prefers typing over tapping.
+Old-style text commands (/grant <chat_id> <days>, /revoke, /users) still
+work too, for anyone who prefers typing and already knows a chat_id.
 
-Multi-step admin flows (grant/revoke) track a small amount of per-admin
-in-memory "what are we waiting for" state in `_pending`. This is NOT
-persisted across restarts — if the service restarts mid-flow, the admin
-just taps the button again. That's an acceptable simplification here.
+Multi-step admin flows track a small amount of per-admin in-memory "what
+are we waiting for" state in `_pending`. This is NOT persisted across
+restarts — if the service restarts mid-flow, the admin just taps the
+button again.
+
+Every admin-gate check logs its outcome (chat_id + result) — if a button
+looks unresponsive, the Render logs will show exactly whether the request
+even arrived and what `is_admin` resolved to, which is almost always a
+mismatched ADMIN_CHAT_ID rather than a code bug.
 """
 import logging
 from typing import Callable, Dict, Optional
@@ -30,7 +38,7 @@ from telegram_notifier import TelegramNotifier
 
 log = logging.getLogger("smart_money_bot.bot_commands")
 
-# admin_chat_id -> {"action": str, "target": str|None}
+# admin_chat_id -> {"action": str, ...}
 _pending: Dict[str, dict] = {}
 
 CANCEL_WORDS = {"لغو", "cancel", "/cancel"}
@@ -56,10 +64,10 @@ def _cancel_markup() -> dict:
     return {"inline_keyboard": [[{"text": "❌ لغو", "callback_data": "cancel"}]]}
 
 
-def _days_choice_markup() -> dict:
+def _days_choice_markup(prefix: str) -> dict:
     return {"inline_keyboard": [
-        [{"text": "۷ روز", "callback_data": "grantdays:7"}, {"text": "۳۰ روز", "callback_data": "grantdays:30"}],
-        [{"text": "۹۰ روز", "callback_data": "grantdays:90"}, {"text": "نامحدود", "callback_data": "grantdays:unlimited"}],
+        [{"text": "۷ روز", "callback_data": f"{prefix}:7"}, {"text": "۳۰ روز", "callback_data": f"{prefix}:30"}],
+        [{"text": "۹۰ روز", "callback_data": f"{prefix}:90"}, {"text": "نامحدود", "callback_data": f"{prefix}:unlimited"}],
         [{"text": "❌ لغو", "callback_data": "cancel"}],
     ]}
 
@@ -94,13 +102,22 @@ def _info_text(chat_id: str, access: AccessControl) -> str:
 
 def _users_list_text(access: AccessControl) -> str:
     users = access.list_users()
-    if not users:
-        return "👥 *کاربران مجاز:*\n\nهیچ کاربری (به‌جز ادمین) دسترسی ندارد."
     lines = ["👥 *کاربران مجاز:*\n"]
-    for chat_id, entry in users.items():
-        expires_at = entry.get("expires_at") or "نامحدود"
-        label = entry.get("label") or ""
-        lines.append(f"`{chat_id}` {('(' + label + ')') if label else ''} — تا `{expires_at}`")
+    if not users:
+        lines.append("هیچ کاربری (به‌جز ادمین) دسترسی ندارد.")
+    else:
+        for chat_id, entry in users.items():
+            expires_at = entry.get("expires_at") or "نامحدود"
+            label = entry.get("label") or ""
+            lines.append(f"`{chat_id}` {('(' + label + ')') if label else ''} — تا `{expires_at}`")
+
+    invites = access.list_unused_invites()
+    if invites:
+        lines.append("\n🔑 *رمزهای ساخته‌شده و هنوز استفاده‌نشده:*\n")
+        for password, entry in invites.items():
+            days = entry.get("days")
+            days_text = "نامحدود" if days is None else f"{days} روز"
+            lines.append(f"`{password}` — {days_text}")
     return "\n".join(lines)
 
 
@@ -114,7 +131,8 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
 
     message = update.get("message") or update.get("edited_message")
     if not message:
-        return  # ignore other update types (reactions, etc.)
+        log.info(f"نوع آپدیت پشتیبانی‌نشده نادیده گرفته شد: {list(update.keys())}")
+        return
 
     chat = message.get("chat", {})
     raw_chat_id = chat.get("id")
@@ -127,6 +145,7 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
         return
 
     is_admin = access.is_admin(chat_id)
+    log.info(f"پیام از chat_id={chat_id} is_admin={is_admin} admin_chat_id_resolved={settings.admin_chat_id_resolved!r} text={text[:40]!r}")
     pending = _pending.get(chat_id)
 
     if text in CANCEL_WORDS and pending:
@@ -135,10 +154,10 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
         return
 
     if is_admin and pending:
-        if pending["action"] == "awaiting_grant_target":
-            pending["action"], pending["target"] = "awaiting_grant_days", text
-            notifier.send(f"⏳ برای `{text}` چند روز دسترسی می‌دهید؟", chat_id=chat_id,
-                          reply_markup=_days_choice_markup())
+        if pending["action"] == "awaiting_invite_password":
+            pending["action"], pending["password"] = "awaiting_invite_days", text
+            notifier.send(f"⏳ برای رمز `{text}` چند روز دسترسی می‌دهید؟", chat_id=chat_id,
+                          reply_markup=_days_choice_markup("invitedays"))
             return
         if pending["action"] == "awaiting_revoke_target":
             existed = access.revoke(text)
@@ -153,7 +172,7 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
                       reply_markup=_main_menu_markup(is_admin) if already else None)
         return
 
-    # Backward-compatible text commands, still admin-only.
+    # Backward-compatible text commands (direct chat_id-based grant), still admin-only.
     if is_admin and text.startswith("/grant"):
         _legacy_grant(text, chat_id, access, notifier)
         return
@@ -166,16 +185,14 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
 
     # ---------- password gate ----------
     if not access.is_authorized(chat_id):
-        if settings.bot_access_password and text == settings.bot_access_password:
+        found, days = access.consume_invite(text, chat_id)
+        if found:
+            access.grant(chat_id, days=days, label=chat.get("username", ""))
+            _notify_new_authorization(settings, access, notifier, chat_id)
+        elif settings.bot_access_password and text == settings.bot_access_password:
             access.grant(chat_id, days=settings.default_access_duration_days or None,
                          label=chat.get("username", ""))
-            notifier.send(
-                f"✅ *دسترسی تایید شد.*\n⏳ *انقضا:* `{access.expiry_text(chat_id)}`",
-                chat_id=chat_id, reply_markup=_main_menu_markup(access.is_admin(chat_id)),
-            )
-            admin_id = settings.admin_chat_id_resolved
-            if admin_id and admin_id != chat_id:
-                notifier.send(f"👤 کاربر جدید تایید شد: `{chat_id}`", chat_id=admin_id)
+            _notify_new_authorization(settings, access, notifier, chat_id)
         else:
             notifier.send("❌ رمز عبور اشتباه است.", chat_id=chat_id)
         if message_id:
@@ -184,6 +201,16 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
 
     # Authorized user sent free text with nothing pending — just show the menu.
     notifier.send("از منوی زیر استفاده کنید 👇", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
+
+
+def _notify_new_authorization(settings: Settings, access: AccessControl, notifier: TelegramNotifier, chat_id: str) -> None:
+    notifier.send(
+        f"✅ *دسترسی تایید شد.*\n⏳ *انقضا:* `{access.expiry_text(chat_id)}`",
+        chat_id=chat_id, reply_markup=_main_menu_markup(access.is_admin(chat_id)),
+    )
+    admin_id = settings.admin_chat_id_resolved
+    if admin_id and admin_id != chat_id:
+        notifier.send(f"👤 کاربر جدید تایید شد: `{chat_id}`", chat_id=admin_id)
 
 
 def _handle_callback_query(callback: dict, settings: Settings, access: AccessControl,
@@ -197,13 +224,16 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     notifier.answer_callback_query(callback_id)  # clears the button's loading spinner regardless
 
     if not chat_id or not message_id:
+        log.warning(f"callback_query بدون chat_id/message_id قابل استفاده نادیده گرفته شد: data={data!r}")
         return
 
     if not access.is_authorized(chat_id):
+        log.info(f"callback از chat_id غیرمجاز رد شد: {chat_id}")
         notifier.edit_message(chat_id, message_id, "🔒 دسترسی شما فعال نیست. لطفاً ابتدا رمز عبور را ارسال کنید.")
         return
 
     is_admin = access.is_admin(chat_id)
+    log.info(f"callback data={data!r} از chat_id={chat_id} is_admin={is_admin}")
 
     if data == "info":
         notifier.edit_message(chat_id, message_id, _info_text(chat_id, access), reply_markup=_back_markup())
@@ -219,6 +249,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         return
 
     if not is_admin:
+        log.info(f"دسترسی ادمین رد شد برای chat_id={chat_id} (admin_chat_id_resolved={settings.admin_chat_id_resolved!r})")
         notifier.edit_message(chat_id, message_id, "⛔ این بخش فقط برای ادمین است.", reply_markup=_back_markup())
         return
 
@@ -230,41 +261,45 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         text = admin_status_provider() if admin_status_provider else "در دسترس نیست."
         notifier.edit_message(chat_id, message_id, text, reply_markup=_back_markup())
         return
+
     if data == "admin_grant":
-        _pending[chat_id] = {"action": "awaiting_grant_target"}
-        notifier.edit_message(chat_id, message_id, "🆔 شناسه چت (chat_id) کاربر مورد نظر را در پیام بعدی ارسال کنید:",
-                              reply_markup=_cancel_markup())
+        _pending[chat_id] = {"action": "awaiting_invite_password"}
+        notifier.edit_message(
+            chat_id, message_id,
+            "🔑 یک رمز عبور دلخواه *منحصربه‌فرد* برای این کاربر بنویسید (مثلاً یک اسم+عدد):\n\n"
+            "این رمز را بعداً خودتان به همان شخص می‌دهید؛ او با ارسال همین رمز به ربات فعال می‌شود — "
+            "لازم نیست از قبل chat_id او را بدانید.",
+            reply_markup=_cancel_markup(),
+        )
         return
     if data == "admin_revoke":
         _pending[chat_id] = {"action": "awaiting_revoke_target"}
-        notifier.edit_message(chat_id, message_id, "🆔 شناسه چت کاربری که می‌خواهید حذفش کنید را ارسال کنید:",
+        notifier.edit_message(chat_id, message_id, "🆔 شناسه چت کاربری که می‌خواهید دسترسی‌اش را حذف کنید ارسال کنید:",
                               reply_markup=_cancel_markup())
         return
-    if data.startswith("grantdays:"):
+
+    if data.startswith("invitedays:"):
         pending = _pending.get(chat_id)
-        if not pending or pending.get("action") != "awaiting_grant_days":
+        if not pending or pending.get("action") != "awaiting_invite_days":
             notifier.edit_message(chat_id, message_id, "این عملیات منقضی شده؛ دوباره از منو تلاش کنید.",
                                   reply_markup=_main_menu_markup(is_admin))
             return
-        target = pending["target"]
+        password = pending["password"]
         days_str = data.split(":", 1)[1]
         days = None if days_str == "unlimited" else float(days_str)
-        access.grant(target, days=days)
+        access.create_invite(password, days=days)
         _pending.pop(chat_id, None)
+        days_text = "نامحدود" if days is None else f"{days:.0f} روز"
         notifier.edit_message(
             chat_id, message_id,
-            f"✅ دسترسی برای `{target}` تنظیم شد.\n⏳ انقضا: `{access.expiry_text(target)}`",
+            f"✅ رمز اختصاصی ساخته شد:\n\n🔑 رمز: `{password}`\n⏳ مدت: {days_text}\n\n"
+            f"این رمز را به کاربر مورد نظر بدهید تا با ارسال `/start` و سپس این رمز، دسترسی‌اش فعال شود.",
             reply_markup=_main_menu_markup(is_admin),
-        )
-        notifier.send(
-            f"🎉 دسترسی شما به ربات فعال شد.\n⏳ *انقضا:* `{access.expiry_text(target)}`\n\n"
-            f"برای مشاهده‌ی وضعیت خودتان دستور /start را بزنید.",
-            chat_id=target,
         )
         return
 
 
-# ==================== legacy text-command helpers ====================
+# ==================== legacy text-command helpers (direct chat_id grant) ====================
 
 def _legacy_grant(text: str, admin_chat_id: str, access: AccessControl, notifier: TelegramNotifier) -> None:
     parts = text.split()
