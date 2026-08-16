@@ -137,10 +137,13 @@ def register_telegram_webhook():
         log.warning("RENDER_EXTERNAL_URL یا BOT_TOKEN تنظیم نشده؛ webhook خودکار ثبت نشد.")
         return
     webhook_url = f"{base_url}/telegram/webhook"
+    payload = {"url": webhook_url}
+    if settings.telegram_webhook_secret:
+        payload["secret_token"] = settings.telegram_webhook_secret
     try:
         res = http_session.post(
             f"https://api.telegram.org/bot{settings.bot_token}/setWebhook",
-            json={"url": webhook_url, "secret_token": settings.telegram_webhook_secret or None},
+            json=payload,
             timeout=settings.http_timeout_sec,
         )
         if res.status_code == 200 and res.json().get("ok"):
