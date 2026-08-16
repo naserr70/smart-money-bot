@@ -102,3 +102,4 @@ class MarketDataProvider:
             except (TypeError, ValueError):
                 continue
         return result
+
