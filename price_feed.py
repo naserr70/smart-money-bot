@@ -1,15 +1,21 @@
 """
-Minimal USD price lookups via the free CoinGecko API, used only to convert
+Minimal USD price lookups via the CoinGecko API, used only to convert
 on-chain transfer amounts into USD for the exchange-flow whale signal.
 
 IMPORTANT: this module intentionally does NOT reuse the shared HTTP session
 that has an urllib3 Retry adapter mounted for status 429 (rate-limited).
 Retrying a 429 automatically just hammers CoinGecko's free tier harder and
-digs the hole deeper ("too many 429 error responses" after retries were
-exhausted). Instead: a plain session with no retries, a longer cache TTL so
-far fewer calls are needed in the first place, and a short local cooldown
-that's entered as soon as a 429 is seen so we back off completely for a
-while instead of retrying immediately.
+digs the hole deeper. Instead: a plain session with no retries, a longer
+cache TTL so far fewer calls are needed, and a local cooldown entered as
+soon as a 429 is seen.
+
+Without an API key, requests go through CoinGecko's fully anonymous public
+pool, which is rate-limited PER IP — and on shared-egress hosts (Render,
+Heroku, etc.) that pool can already be exhausted by other tenants before
+this app makes a single call. Setting COINGECKO_API_KEY (free "Demo" plan,
+no credit card, ~30 calls/min + 10k/month of YOUR OWN dedicated quota —
+sign up at coingecko.com/en/developers/dashboard) sends every request with
+the `x-cg-demo-api-key` header, using that dedicated quota instead.
 """
 import logging
 import time
@@ -34,19 +40,20 @@ CHAIN_PLATFORM = {
     "TRON": "tron",
 }
 
-# CoinGecko's free/demo tier is roughly ~30 calls/min per IP, shared across
-# every app on the same host (e.g. all Render free-tier instances can share
-# egress IPs). These defaults are deliberately conservative.
 DEFAULT_TTL_SEC = 300          # cache each price for 5 minutes
 MIN_CALL_INTERVAL_SEC = 2.0    # never call CoinGecko more than ~30/min
 RATE_LIMIT_COOLDOWN_SEC = 90   # after a 429, stop calling entirely for a while
 
 
 class PriceFeed:
-    def __init__(self, session: requests.Session = None, timeout: int = 8, ttl_sec: int = DEFAULT_TTL_SEC):
-        # Deliberately NOT the shared retry-happy session â see module docstring.
+    def __init__(self, session: requests.Session = None, timeout: int = 8,
+                 ttl_sec: int = DEFAULT_TTL_SEC, api_key: str = ""):
+        # Deliberately NOT the shared retry-happy session — see module docstring.
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "SmartMoneyBot/2.0"})
+        headers = {"User-Agent": "SmartMoneyBot/2.0"}
+        if api_key:
+            headers["x-cg-demo-api-key"] = api_key
+        self.session.headers.update(headers)
         self.timeout = timeout
         self.ttl_sec = ttl_sec
         self._cache: Dict[str, tuple] = {}  # key -> (price, fetched_at)
@@ -83,7 +90,7 @@ class PriceFeed:
                 )
                 return None
             if res.status_code != 200:
-                log.warning(f"CoinGecko HTTP {res.status_code} for {url}")
+                log.warning(f"CoinGecko HTTP {res.status_code} for {url} params={params} body={res.text[:300]}")
                 return None
             return res.json()
         except (requests.RequestException, ValueError) as e:
@@ -138,7 +145,7 @@ class PriceFeed:
         calls as possible: CoinGecko's token_price endpoint accepts a
         comma-separated contract_addresses list in a single request, so
         pricing e.g. 15 distinct tokens seen across a wallet watch-list costs
-        1 call instead of 15 â this is what keeps the exchange-flow tracker
+        1 call instead of 15 — this is what keeps the exchange-flow tracker
         from tripping CoinGecko's free-tier rate limit as the watch-list
         grows. Returns {contract_address_lowercase: price_usd} for whatever
         could be resolved (missing/uncached-and-unreachable ones are simply
