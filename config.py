@@ -64,7 +64,7 @@ class Settings:
     # --- Access control (password gate + per-user time-limited access) ---
     bot_access_password: str = field(default_factory=lambda: _env_str("BOT_ACCESS_PASSWORD"))
     admin_chat_id: str = field(default_factory=lambda: _env_str("ADMIN_CHAT_ID"))
-    developer_name: str = field(default_factory=lambda: _env_str("DEVELOPER_NAME", "ÙØ§ØµØ± Ø±ÙÙÛâÙ¾ÙØ±"))
+    developer_name: str = field(default_factory=lambda: _env_str("DEVELOPER_NAME", "ناصر رومی پور"))
     default_access_duration_days: float = field(default_factory=lambda: _env_float("DEFAULT_ACCESS_DURATION_DAYS", 30))
     auth_state_file_path: str = field(default_factory=lambda: _env_str("AUTH_STATE_FILE_PATH", "authorized_users.json"))
     telegram_webhook_secret: str = field(default_factory=lambda: _env_str("TELEGRAM_WEBHOOK_SECRET"))
