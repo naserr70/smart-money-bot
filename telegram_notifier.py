@@ -36,11 +36,13 @@ class TelegramNotifier:
     def is_configured(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
-    def send(self, text: str, chat_id: str = None) -> Optional[int]:
-        """Send to `chat_id`, or to the default/admin chat_id if omitted."""
+    def send(self, text: str, chat_id: str = None, reply_markup: dict = None) -> Optional[int]:
+        """Send to `chat_id`, or to the default/admin chat_id if omitted.
+        `reply_markup` is passed straight through to Telegram (e.g. an
+        {"inline_keyboard": [[...]]} dict for a menu of buttons)."""
         target = chat_id or self.chat_id
         if not self.bot_token or not target:
-            log.error("BOT_TOKEN ÛØ§ chat_id ØªÙØ¸ÛÙ ÙØ´Ø¯Ù Ø§Ø³ØªØ Ø§Ø±Ø³Ø§Ù Ù¾ÛØ§Ù ÙØºÙ Ø´Ø¯.")
+            log.error("BOT_TOKEN یا chat_id تنظیم نشده است؛ ارسال پیام لغو شد.")
             return None
         payload = {
             "chat_id": target,
@@ -48,14 +50,53 @@ class TelegramNotifier:
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         try:
             res = self.session.post(self._api_url("sendMessage"), json=payload, timeout=self.timeout)
             if res.status_code == 200:
                 return res.json().get("result", {}).get("message_id")
-            log.warning(f"ØªÙÚ¯Ø±Ø§Ù Ø®Ø·Ø§Û HTTP {res.status_code} Ø¨Ø±Ú¯Ø±Ø¯Ø§ÙØ¯ Ø¨Ø±Ø§Û chat_id={target}: {res.text[:200]}")
+            log.warning(f"تلگرام خطای HTTP {res.status_code} برگرداند برای chat_id={target}: {res.text[:200]}")
         except requests.RequestException as e:
-            log.error(f"Ø®Ø·Ø§ Ø¯Ø± Ø§Ø±Ø³Ø§Ù Ù¾ÛØ§Ù ØªÙÚ¯Ø±Ø§Ù Ø¨Ù {target}: {e}")
+            log.error(f"خطا در ارسال پیام تلگرام به {target}: {e}")
         return None
+
+    def edit_message(self, chat_id: str, message_id: int, text: str, reply_markup: dict = None) -> bool:
+        """Edit an existing message's text/keyboard in place — used for menu
+        navigation so pressing a button updates the same message instead of
+        spamming a new one each time."""
+        if not self.bot_token or not chat_id or not message_id:
+            return False
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        try:
+            res = self.session.post(self._api_url("editMessageText"), json=payload, timeout=self.timeout)
+            if res.status_code == 200:
+                return True
+            log.warning(f"ویرایش پیام تلگرام ناموفق بود: {res.text[:200]}")
+        except requests.RequestException as e:
+            log.error(f"خطا در ویرایش پیام تلگرام: {e}")
+        return False
+
+    def answer_callback_query(self, callback_query_id: str, text: str = None) -> None:
+        """Must be called for every button press, or Telegram shows an
+        infinite loading spinner on the button in the user's app."""
+        if not self.bot_token or not callback_query_id:
+            return
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        try:
+            self.session.post(self._api_url("answerCallbackQuery"), json=payload, timeout=self.timeout)
+        except requests.RequestException as e:
+            log.error(f"خطا در پاسخ به callback_query: {e}")
 
     def delete(self, message_id: int, chat_id: str = None) -> None:
         target = chat_id or self.chat_id
@@ -65,7 +106,7 @@ class TelegramNotifier:
         try:
             self.session.post(self._api_url("deleteMessage"), json=payload, timeout=self.timeout)
         except requests.RequestException as e:
-            log.error(f"Ø®Ø·Ø§ Ø¯Ø± Ø­Ø°Ù Ù¾ÛØ§Ù ØªÙÚ¯Ø±Ø§Ù: {e}")
+            log.error(f"خطا در حذف پیام تلگرام: {e}")
 
     def send_temporary(self, text: str, delay_sec: int, chat_id: str = None) -> None:
         """Send a message and schedule its deletion after `delay_sec` seconds (status reports)."""
