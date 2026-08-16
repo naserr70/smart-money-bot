@@ -27,10 +27,15 @@ class AccessControl:
     def __init__(self, state_file_path: str, admin_chat_id: str):
         self._lock = threading.RLock()
         self._state_file_path = state_file_path
+        self._invites_file_path = f"{state_file_path}.invites" if state_file_path else None
         self.admin_chat_id = str(admin_chat_id) if admin_chat_id else ""
         # chat_id(str) -> {"granted_at": iso, "expires_at": iso|None, "label": str}
         self._users: Dict[str, dict] = {}
+        # password(str) -> {"days": float|None, "created_at": iso, "label": str,
+        #                    "used_by": chat_id|None, "used_at": iso|None}
+        self._invites: Dict[str, dict] = {}
         self._load()
+        self._load_invites()
 
     def _load(self) -> None:
         if not self._state_file_path or not os.path.exists(self._state_file_path):
@@ -54,6 +59,29 @@ class AccessControl:
             os.replace(tmp_path, self._state_file_path)
         except OSError as e:
             log.warning(f"ذخیره‌ی لیست کاربران مجاز ناموفق بود: {e}")
+
+    def _load_invites(self) -> None:
+        if not self._invites_file_path or not os.path.exists(self._invites_file_path):
+            return
+        try:
+            with open(self._invites_file_path, "r", encoding="utf-8") as f:
+                self._invites = json.load(f)
+            log.info(f"{len(self._invites)} رمز دعوت از دیسک بازیابی شد.")
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning(f"بازیابی رمزهای دعوت ناموفق بود: {e}")
+
+    def _save_invites(self) -> None:
+        if not self._invites_file_path:
+            return
+        with self._lock:
+            payload = dict(self._invites)
+        tmp_path = f"{self._invites_file_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._invites_file_path)
+        except OSError as e:
+            log.warning(f"ذخیره‌ی رمزهای دعوت ناموفق بود: {e}")
 
     def is_admin(self, chat_id) -> bool:
         return bool(self.admin_chat_id) and str(chat_id) == self.admin_chat_id
@@ -144,3 +172,37 @@ class AccessControl:
     def list_users(self) -> Dict[str, dict]:
         with self._lock:
             return dict(self._users)
+
+    # ==================== per-user invite passwords ====================
+
+    def create_invite(self, password: str, days: Optional[float], label: str = "") -> None:
+        """Admin-defined, single-use password for one specific person. Set
+        days=None for unlimited access once redeemed."""
+        with self._lock:
+            self._invites[password] = {
+                "days": days,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "label": label,
+                "used_by": None,
+                "used_at": None,
+            }
+        self._save_invites()
+
+    def consume_invite(self, password: str, chat_id: str):
+        """Redeem a one-time invite password. Returns (found, days):
+        found=False means no such unused invite exists (wrong password, or
+        already used by someone else). found=True with days=None means
+        unlimited access was granted via this invite."""
+        with self._lock:
+            entry = self._invites.get(password)
+            if not entry or entry.get("used_by") is not None:
+                return False, None
+            entry["used_by"] = str(chat_id)
+            entry["used_at"] = datetime.now(timezone.utc).isoformat()
+            days = entry.get("days")
+        self._save_invites()
+        return True, days
+
+    def list_unused_invites(self) -> Dict[str, dict]:
+        with self._lock:
+            return {p: dict(e) for p, e in self._invites.items() if e.get("used_by") is None}
