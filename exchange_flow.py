@@ -67,7 +67,7 @@ class ExchangeFlowTracker:
         self.settings = settings
         self.state = state
         self.session = session
-        self.price_feed = PriceFeed(session, timeout=settings.http_timeout_sec)
+        self.price_feed = PriceFeed(session, timeout=settings.http_timeout_sec, api_key=settings.coingecko_api_key)
         self._evm_keys = {
             "ETH": settings.etherscan_api_key,
             "BSC": settings.bscscan_api_key or settings.etherscan_api_key,
