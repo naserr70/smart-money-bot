@@ -2,9 +2,17 @@
 Typed signal objects. Keeping message formatting on the dataclass itself
 (rather than scattered f-strings in the analyzer) makes both easier to test
 and to change independently.
+
+Messages use Telegram's HTML parse_mode (not Markdown) — Markdown's legacy
+parser breaks ("can't parse entities") on unescaped '_', '*', '`' in any
+interpolated text, which realistically shows up in token symbols from
+external APIs, exchange labels, etc. Any non-literal text here goes through
+formatting.esc() before being placed inside a tag.
 """
 from dataclasses import dataclass
 from enum import Enum
+
+from formatting import esc
 
 
 class SignalDirection(Enum):
@@ -44,42 +52,42 @@ class MarketSignal:
 
         if self.direction == SignalDirection.INFLOW:
             if is_pump_labeled:
-                header = "🚀 *پامپ شناسایی شد (PUMP DETECTED)* 🚀"
+                header = "🚀 <b>پامپ شناسایی شد (PUMP DETECTED)</b> 🚀"
             else:
-                header = "🚨 *ورود پول هوشمند (SMART MONEY IN)* 🚨"
-            price_line = f"📈 *رشد قیمت اخیر:* `+{self.change_5m:.2f}%`"
+                header = "🚨 <b>ورود پول هوشمند (SMART MONEY IN)</b> 🚨"
+            price_line = f"📈 <b>رشد قیمت اخیر:</b> <code>+{self.change_5m:.2f}%</code>"
             flow_label = "ورود پول خالص"
-            advice = "🎯 *توصیه:* بررسی چارت در تایم‌فریم ۱۵ دقیقه و ورود پله‌ای."
+            advice = "🎯 <b>توصیه:</b> بررسی چارت در تایم‌فریم ۱۵ دقیقه و ورود پله‌ای."
         else:
             if is_pump_labeled:
-                header = "💥 *دامپ ناگهانی شناسایی شد (SUDDEN DUMP DETECTED)* 💥"
+                header = "💥 <b>دامپ ناگهانی شناسایی شد (SUDDEN DUMP DETECTED)</b> 💥"
             else:
-                header = "🔻 *خروج پول هوشمند (SMART MONEY OUT)* 🔻"
-            price_line = f"📉 *افت قیمت اخیر:* `{self.change_5m:.2f}%`"
+                header = "🔻 <b>خروج پول هوشمند (SMART MONEY OUT)</b> 🔻"
+            price_line = f"📉 <b>افت قیمت اخیر:</b> <code>{self.change_5m:.2f}%</code>"
             flow_label = "خروج پول خالص (تخمینی)"
-            advice = "🎯 *توصیه:* احتمال توزیع/خروج نهنگ؛ احتیاط در نگهداری پوزیشن."
+            advice = "🎯 <b>توصیه:</b> احتمال توزیع/خروج نهنگ؛ احتیاط در نگهداری پوزیشن."
 
         detection_line = ""
         if self.trigger == TriggerType.STATIC:
-            detection_line = "🔎 *نوع تشخیص:* عبور از آستانه‌ی ثابت درصدی\n"
+            detection_line = "🔎 <b>نوع تشخیص:</b> عبور از آستانه‌ی ثابت درصدی\n"
         elif self.trigger == TriggerType.STATISTICAL:
             z = f"{self.zscore:.1f}σ" if self.zscore is not None else "N/A"
-            detection_line = f"🔎 *نوع تشخیص:* ناهنجاری آماری نسبت به رفتار عادی خودِ این ارز (`{z}`)\n"
+            detection_line = f"🔎 <b>نوع تشخیص:</b> ناهنجاری آماری نسبت به رفتار عادی خودِ این ارز (<code>{esc(z)}</code>)\n"
         elif self.trigger == TriggerType.BOTH:
             z = f"{self.zscore:.1f}σ" if self.zscore is not None else "N/A"
-            detection_line = f"🔎 *نوع تشخیص:* هم آستانه‌ی ثابت، هم ناهنجاری آماری (`{z}`)\n"
+            detection_line = f"🔎 <b>نوع تشخیص:</b> هم آستانه‌ی ثابت، هم ناهنجاری آماری (<code>{esc(z)}</code>)\n"
 
         return (
             f"{header}\n\n"
-            f"🪙 *نماد:* #{self.symbol} _(موجود در نوبیتکس)_\n"
-            f"💵 *قیمت جهانی:* ${self.price:,.4f}\n"
-            f"📊 *تغییرات ۲۴ ساعته:* `{self.change_24h:+.2f}%`\n\n"
+            f"🪙 <b>نماد:</b> #{esc(self.symbol)} <i>(موجود در نوبیتکس)</i>\n"
+            f"💵 <b>قیمت جهانی:</b> ${self.price:,.4f}\n"
+            f"📊 <b>تغییرات ۲۴ ساعته:</b> <code>{self.change_24h:+.2f}%</code>\n\n"
             f"{price_line}\n"
-            f"🔥 *{flow_label}:* `${self.inflow_usd/1e3:,.1f}K`\n"
-            f"⚡ *جهش حجم معاملاتی:* `{self.spike_multiplier:.1f}X` برابر میانگین واقعی\n"
+            f"🔥 <b>{esc(flow_label)}:</b> <code>${self.inflow_usd/1e3:,.1f}K</code>\n"
+            f"⚡ <b>جهش حجم معاملاتی:</b> <code>{self.spike_multiplier:.1f}X</code> برابر میانگین واقعی\n"
             f"{detection_line}\n"
             f"{advice}\n"
-            f"_منبع: تیکر صرافی (Volume/Price Ticker Signal)_"
+            f"<i>منبع: تیکر صرافی (Volume/Price Ticker Signal)</i>"
         )
 
 
@@ -105,20 +113,20 @@ class ExchangeFlowSignal:
         link = f"{explorer}{self.tx_hash}" if explorer else self.tx_hash
 
         if self.direction == SignalDirection.INFLOW:
-            header = "📥 *واریز نهنگ به صرافی (EXCHANGE INFLOW)* 📥"
-            advice = "🎯 *توصیه:* احتمال افزایش فشار فروش؛ دارایی در حال واریز به کیف‌پول صرافی است."
+            header = "📥 <b>واریز نهنگ به صرافی (EXCHANGE INFLOW)</b> 📥"
+            advice = "🎯 <b>توصیه:</b> احتمال افزایش فشار فروش؛ دارایی در حال واریز به کیف‌پول صرافی است."
         else:
-            header = "📤 *برداشت نهنگ از صرافی (EXCHANGE OUTFLOW)* 📤"
-            advice = "🎯 *توصیه:* احتمال کاهش عرضه در بازار؛ دارایی در حال خروج به کیف شخصی/کلد استوریج است."
+            header = "📤 <b>برداشت نهنگ از صرافی (EXCHANGE OUTFLOW)</b> 📤"
+            advice = "🎯 <b>توصیه:</b> احتمال کاهش عرضه در بازار؛ دارایی در حال خروج به کیف شخصی/کلد استوریج است."
 
         return (
             f"{header}\n\n"
-            f"⛓ *شبکه:* `{self.chain}`\n"
-            f"🪙 *دارایی:* #{self.token_symbol}\n"
-            f"🏦 *صرافی:* {self.exchange_name}\n"
-            f"📦 *مقدار:* `{self.amount_native:,.4f} {self.token_symbol}`\n"
-            f"💰 *ارزش تراکنش:* ${self.amount_usd:,.0f}\n"
-            f"🔗 [مشاهده تراکنش]({link})\n\n"
+            f"⛓ <b>شبکه:</b> <code>{esc(self.chain)}</code>\n"
+            f"🪙 <b>دارایی:</b> #{esc(self.token_symbol)}\n"
+            f"🏦 <b>صرافی:</b> {esc(self.exchange_name)}\n"
+            f"📦 <b>مقدار:</b> <code>{self.amount_native:,.4f} {esc(self.token_symbol)}</code>\n"
+            f"💰 <b>ارزش تراکنش:</b> ${self.amount_usd:,.0f}\n"
+            f'🔗 <a href="{esc(link)}">مشاهده تراکنش</a>\n\n'
             f"{advice}\n"
-            f"_منبع: تحلیل آن‌چین کیف‌پول‌های شناخته‌شده صرافی (On-chain Wallet Signal)_"
+            f"<i>منبع: تحلیل آن‌چین کیف‌پول‌های شناخته‌شده صرافی (On-chain Wallet Signal)</i>"
         )
