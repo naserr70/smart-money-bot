@@ -47,7 +47,7 @@ class TelegramNotifier:
         payload = {
             "chat_id": target,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         if reply_markup:
@@ -71,7 +71,7 @@ class TelegramNotifier:
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         if reply_markup is not None:
