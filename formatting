@@ -19,3 +19,4 @@ def esc(value) -> str:
     string you wrote yourself — passwords, usernames, labels, symbols/token
     names from external APIs, chat_ids typed by an admin, etc."""
     return html.escape(str(value), quote=False)
+
