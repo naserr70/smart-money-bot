@@ -41,6 +41,7 @@ from typing import Callable, Dict, Optional
 from access_control import AccessControl
 from config import Settings
 from formatting import esc
+from signals import MarketSignal, SignalDirection, TriggerType
 from telegram_notifier import TelegramNotifier
 
 log = logging.getLogger("smart_money_bot.bot_commands")
@@ -60,7 +61,8 @@ def _main_menu_markup(is_admin: bool) -> dict:
                      {"text": "📈 وضعیت ربات", "callback_data": "admin_status"}])
         rows.append([{"text": "➕ اعطای دسترسی", "callback_data": "admin_grant"},
                      {"text": "➖ حذف دسترسی", "callback_data": "admin_revoke"}])
-        rows.append([{"text": "📤 تست ارسال به همه", "callback_data": "admin_testsend"}])
+        rows.append([{"text": "📤 تست ارسال به همه", "callback_data": "admin_testsend"},
+                     {"text": "🧪 تست سیگنال", "callback_data": "admin_testsignal"}])
     return {"inline_keyboard": rows}
 
 
@@ -163,6 +165,34 @@ def _test_broadcast_text(settings: Settings, access: AccessControl, notifier: Te
     else:
         lines.append("✅ به همه با موفقیت ارسال شد.")
     return "\n".join(lines)
+
+
+def _send_test_signal(settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
+    """Builds a fake-but-realistic MarketSignal and pushes it through
+    to_telegram() + broadcast_chunked — the EXACT same two functions a real
+    market signal goes through in main.py's market_loop. This is what
+    proves (or disproves) that the full signal pipeline reaches everyone,
+    as opposed to just plain text messages (which _test_broadcast_text
+    already confirmed). If this arrives for everyone but real signals
+    still don't, the remaining explanation is simply that no real
+    volume/price/whale event has crossed the configured thresholds yet —
+    not a delivery problem."""
+    fake_signal = MarketSignal(
+        symbol="TEST", price=1.2345, change_5m=5.0, change_24h=12.3,
+        inflow_usd=123456.0, spike_multiplier=4.2,
+        direction=SignalDirection.INFLOW, trigger=TriggerType.STATIC, zscore=None,
+    )
+    targets = _broadcast_targets(settings, access)
+    if not targets:
+        return "هیچ گیرنده‌ی فعالی پیدا نشد."
+    notifier.broadcast_chunked([fake_signal.to_telegram()], targets)
+    recipients = "\n".join(f"• <code>{esc(t)}</code>" for t in targets)
+    return (
+        f"🧪 یک سیگنال آزمایشی، دقیقاً از همون کدی که سیگنال‌های واقعی رد می‌شن، "
+        f"به {len(targets)} گیرنده فرستاده شد:\n\n{recipients}\n\n"
+        f"اگه این پیام تستی («TEST») رو همه‌ی این افراد توی تلگرام دیدن ولی سیگنال واقعی نمی‌بینن، "
+        f"یعنی مشکل ارسال نیست — فقط هنوز هیچ سیگنال واقعی‌ای (پامپ/نهنگ) از وقتی این کاربر اضافه شده رخ نداده."
+    )
 
 
 # ==================== top-level dispatch ====================
@@ -308,6 +338,11 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     if data == "admin_testsend":
         notifier.edit_message(chat_id, message_id, "⏳ در حال ارسال پیام تست به همه...")
         result_text = _test_broadcast_text(settings, access, notifier)
+        notifier.edit_message(chat_id, message_id, result_text, reply_markup=_back_markup())
+        return
+    if data == "admin_testsignal":
+        notifier.edit_message(chat_id, message_id, "⏳ در حال ارسال سیگنال تستی...")
+        result_text = _send_test_signal(settings, access, notifier)
         notifier.edit_message(chat_id, message_id, result_text, reply_markup=_back_markup())
         return
 
