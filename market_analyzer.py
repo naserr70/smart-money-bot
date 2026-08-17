@@ -21,6 +21,7 @@ from typing import List, Tuple
 import requests
 
 from config import Settings
+from formatting import esc
 from market_data import MarketDataProvider
 from signals import MarketSignal, SignalDirection, TriggerType
 from state import BotState
@@ -125,12 +126,11 @@ class MarketAnalyzer:
     def build_status_message(self, data_source: str, symbols_scanned: int,
                               inflow_count: int, outflow_count: int) -> str:
         return (
-            f"🟢 *گزارش رصد زنده مارکت* \n\n"
-            f"⏰ *زمان (UTC):* `{datetime.now(timezone.utc).strftime('%H:%M:%S')}`\n"
-            f"🌐 *منبع داده:* `{data_source}`\n"
-            f"🔍 *ارزهای آنالیز شده:* `{symbols_scanned}` از تمامی بازارهای نوبیتکس\n"
-            f"📥 *سیگنال ورود (تیکر):* `{inflow_count}` مورد\n"
-            f"📤 *سیگنال خروج (تیکر):* `{outflow_count}` مورد\n"
-            f"📡 *وضعیت سیستم:* فعال و ۲۴ ساعته"
+            f"🟢 <b>گزارش رصد زنده مارکت</b> <i>(حذف خودکار پس از {self.settings.auto_delete_delay_sec // 60} دقیقه)</i>\n\n"
+            f"⏰ <b>زمان (UTC):</b> <code>{datetime.now(timezone.utc).strftime('%H:%M:%S')}</code>\n"
+            f"🌐 <b>منبع داده:</b> <code>{esc(data_source)}</code>\n"
+            f"🔍 <b>ارزهای آنالیز شده:</b> <code>{symbols_scanned}</code> از تمامی بازارهای نوبیتکس\n"
+            f"📥 <b>سیگنال ورود (تیکر):</b> <code>{inflow_count}</code> مورد\n"
+            f"📤 <b>سیگنال خروج (تیکر):</b> <code>{outflow_count}</code> مورد\n"
+            f"📡 <b>وضعیت سیستم:</b> فعال و ۲۴ ساعته"
         )
-
