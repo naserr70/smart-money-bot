@@ -31,6 +31,7 @@ import bot_commands
 from access_control import AccessControl
 from config import settings
 from exchange_flow import ExchangeFlowTracker
+from formatting import esc
 from market_analyzer import MarketAnalyzer
 from state import BotState
 from telegram_notifier import TelegramNotifier
@@ -76,8 +77,8 @@ def broadcast_targets():
 def market_loop():
     time.sleep(3)
     notifier.broadcast(
-        f"🚀 *سیستم تحلیل هوشمند فوق‌پایدار فعال شد.*\n"
-        f"👨‍💻 *توسعه‌دهنده:* {settings.developer_name}\n"
+        f"🚀 <b>سیستم تحلیل هوشمند فوق‌پایدار فعال شد.</b>\n"
+        f"👨‍💻 <b>توسعه‌دهنده:</b> {esc(settings.developer_name)}\n"
         f"پوشش جامع تمام بازارهای ریالی و تتری نوبیتکس + ردیابی آن‌چین کیف‌پول صرافی‌ها.",
         broadcast_targets(),
     )
@@ -100,7 +101,7 @@ def market_loop():
             state.record_market_cycle(error=str(e))
             # Technical error messages go to the admin only, not every user.
             notifier.send_temporary(
-                f"⚠️ خطا در چرخه تحلیل مارکت رخ داد: `{e}`\nسیستم به کار خود ادامه می‌دهد.",
+                f"⚠️ خطا در چرخه تحلیل مارکت رخ داد: <code>{esc(e)}</code>\nسیستم به کار خود ادامه می‌دهد.",
                 settings.auto_delete_delay_sec,
                 chat_id=settings.admin_chat_id_resolved,
             )
@@ -159,6 +160,27 @@ def start_background_threads():
         log.warning(problem)
 
     register_telegram_webhook()
+
+    # Render's default (disk-less) web services wipe local files on every
+    # deploy/restart — this is the #1 cause of "a user I granted access to
+    # stopped getting signals": authorized_users.json got reset to empty.
+    # Surface that immediately instead of it silently going unnoticed.
+    if not access.list_users():
+        log.warning(
+            "لیست کاربران مجاز خالیه. اگه قبلاً کسی رو گرنت کرده بودید و الان نیست، "
+            "احتمالاً دیسک موقتی Render با ری‌استارت/دیپلوی پاک شده — از منو دوباره گرنتش کنید. "
+            "برای دائمی موندنش، یک Persistent Disk روی Render اضافه کنید و "
+            "STATE_FILE_PATH / AUTH_STATE_FILE_PATH رو به مسیر همون دیسک اشاره بدید."
+        )
+        admin_id = settings.admin_chat_id_resolved
+        if admin_id:
+            notifier.send(
+                "⚠️ لیست کاربران مجاز الان خالیه (به‌جز ادمین).\n\n"
+                "اگه قبلاً کسی رو با «اعطای دسترسی» اضافه کرده بودید و الان دیگه سیگنال دریافت نمی‌کنه، "
+                "علتش احتمالاً پاک شدن دیسک موقتی Render موقع دیپلوی جدیده — لطفاً از منو دوباره اضافه‌اش کنید.",
+                chat_id=admin_id,
+            )
+
     threading.Thread(target=market_loop, daemon=True, name="market-loop").start()
     threading.Thread(target=whale_loop, daemon=True, name="whale-loop").start()
     state.start_autosave(settings.state_save_interval_sec)
@@ -183,16 +205,16 @@ def status():
 def build_admin_status_text() -> str:
     health = state.snapshot_health()
     lines = [
-        "📈 *وضعیت ربات*\n",
-        f"🕐 آخرین چرخه‌ی مارکت: `{health.get('last_market_cycle_at') or '-'}`",
-        f"🐋 آخرین چرخه‌ی نهنگ: `{health.get('last_whale_cycle_at') or '-'}`",
-        f"🔁 تعداد چرخه‌های مارکت: `{health.get('market_cycles_completed')}`",
-        f"🔁 تعداد چرخه‌های نهنگ: `{health.get('whale_cycles_completed')}`",
-        f"🐋 ماژول نهنگ فعال: `{'بله' if whale_tracker.is_enabled() else 'خیر'}`",
-        f"👥 کاربران مجاز فعال: `{len(access.active_chat_ids())}`",
+        "📈 <b>وضعیت ربات</b>\n",
+        f"🕐 آخرین چرخه‌ی مارکت: <code>{esc(health.get('last_market_cycle_at') or '-')}</code>",
+        f"🐋 آخرین چرخه‌ی نهنگ: <code>{esc(health.get('last_whale_cycle_at') or '-')}</code>",
+        f"🔁 تعداد چرخه‌های مارکت: <code>{health.get('market_cycles_completed')}</code>",
+        f"🔁 تعداد چرخه‌های نهنگ: <code>{health.get('whale_cycles_completed')}</code>",
+        f"🐋 ماژول نهنگ فعال: <code>{'بله' if whale_tracker.is_enabled() else 'خیر'}</code>",
+        f"👥 کاربران مجاز فعال: <code>{len(access.active_chat_ids())}</code>",
     ]
     if health.get("last_error"):
-        lines.append(f"⚠️ آخرین خطا: `{health.get('last_error')}`")
+        lines.append(f"⚠️ آخرین خطا: <code>{esc(health.get('last_error'))}</code>")
     return "\n".join(lines)
 
 
