@@ -19,6 +19,12 @@ Admin-only menu items (admin = ADMIN_CHAT_ID / defaults to CHAT_ID):
 Old-style text commands (/grant <chat_id> <days>, /revoke, /users) still
 work too, for anyone who prefers typing and already knows a chat_id.
 
+Messages use Telegram's HTML parse_mode — every non-literal string (a
+password the admin typed, a Telegram username, a chat_id string, etc.) goes
+through formatting.esc() before being interpolated, so a value containing
+'<' or '&' can't break message parsing the way unescaped Markdown
+characters used to ("can't parse entities").
+
 Multi-step admin flows track a small amount of per-admin in-memory "what
 are we waiting for" state in `_pending`. This is NOT persisted across
 restarts — if the service restarts mid-flow, the admin just taps the
@@ -34,6 +40,7 @@ from typing import Callable, Dict, Optional
 
 from access_control import AccessControl
 from config import Settings
+from formatting import esc
 from telegram_notifier import TelegramNotifier
 
 log = logging.getLogger("smart_money_bot.bot_commands")
@@ -73,7 +80,7 @@ def _days_choice_markup(prefix: str) -> dict:
 
 
 def _welcome_text(settings: Settings, already_authorized: bool, expiry_text: str = "") -> str:
-    header = f"🤖 *ربات رصد اسمارت مانی نوبیتکس*\n👨‍💻 *توسعه‌دهنده:* {settings.developer_name}\n\n"
+    header = f"🤖 <b>ربات رصد اسمارت مانی نوبیتکس</b>\n👨‍💻 <b>توسعه‌دهنده:</b> {esc(settings.developer_name)}\n\n"
     if already_authorized:
         return header + "از منوی زیر استفاده کنید 👇"
     return header + "🔒 برای استفاده از ربات، لطفاً رمز عبور را ارسال کنید:"
@@ -91,33 +98,34 @@ def _info_text(chat_id: str, access: AccessControl) -> str:
         days_left = access.days_remaining(chat_id)
         days_left_text = "نامحدود" if days_left is None else f"{days_left:.1f} روز"
     return (
-        f"📊 *اطلاعات شما*\n\n"
-        f"🆔 *شناسه چت:* `{chat_id}`\n"
-        f"🎖 *نقش:* {role}\n"
-        f"📅 *تاریخ عضویت:* `{joined}`\n"
-        f"⏳ *تاریخ انقضا:* `{expiry}`\n"
-        f"🗓 *روزهای باقی‌مانده:* `{days_left_text}`"
+        f"📊 <b>اطلاعات شما</b>\n\n"
+        f"🆔 <b>شناسه چت:</b> <code>{esc(chat_id)}</code>\n"
+        f"🎖 <b>نقش:</b> {role}\n"
+        f"📅 <b>تاریخ عضویت:</b> <code>{esc(joined)}</code>\n"
+        f"⏳ <b>تاریخ انقضا:</b> <code>{esc(expiry)}</code>\n"
+        f"🗓 <b>روزهای باقی‌مانده:</b> <code>{esc(days_left_text)}</code>"
     )
 
 
 def _users_list_text(access: AccessControl) -> str:
     users = access.list_users()
-    lines = ["👥 *کاربران مجاز:*\n"]
+    lines = ["👥 <b>کاربران مجاز:</b>\n"]
     if not users:
         lines.append("هیچ کاربری (به‌جز ادمین) دسترسی ندارد.")
     else:
         for chat_id, entry in users.items():
             expires_at = entry.get("expires_at") or "نامحدود"
             label = entry.get("label") or ""
-            lines.append(f"`{chat_id}` {('(' + label + ')') if label else ''} — تا `{expires_at}`")
+            label_part = f" ({esc(label)})" if label else ""
+            lines.append(f"<code>{esc(chat_id)}</code>{label_part} — تا <code>{esc(expires_at)}</code>")
 
     invites = access.list_unused_invites()
     if invites:
-        lines.append("\n🔑 *رمزهای ساخته‌شده و هنوز استفاده‌نشده:*\n")
+        lines.append("\n🔑 <b>رمزهای ساخته‌شده و هنوز استفاده‌نشده:</b>\n")
         for password, entry in invites.items():
             days = entry.get("days")
             days_text = "نامحدود" if days is None else f"{days} روز"
-            lines.append(f"`{password}` — {days_text}")
+            lines.append(f"<code>{esc(password)}</code> — {esc(days_text)}")
     return "\n".join(lines)
 
 
@@ -156,7 +164,7 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
     if is_admin and pending:
         if pending["action"] == "awaiting_invite_password":
             pending["action"], pending["password"] = "awaiting_invite_days", text
-            notifier.send(f"⏳ برای رمز `{text}` چند روز دسترسی می‌دهید؟", chat_id=chat_id,
+            notifier.send(f"⏳ برای رمز <code>{esc(text)}</code> چند روز دسترسی می‌دهید؟", chat_id=chat_id,
                           reply_markup=_days_choice_markup("invitedays"))
             return
         if pending["action"] == "awaiting_revoke_target":
@@ -205,12 +213,12 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
 
 def _notify_new_authorization(settings: Settings, access: AccessControl, notifier: TelegramNotifier, chat_id: str) -> None:
     notifier.send(
-        f"✅ *دسترسی تایید شد.*\n⏳ *انقضا:* `{access.expiry_text(chat_id)}`",
+        f"✅ <b>دسترسی تایید شد.</b>\n⏳ <b>انقضا:</b> <code>{esc(access.expiry_text(chat_id))}</code>",
         chat_id=chat_id, reply_markup=_main_menu_markup(access.is_admin(chat_id)),
     )
     admin_id = settings.admin_chat_id_resolved
     if admin_id and admin_id != chat_id:
-        notifier.send(f"👤 کاربر جدید تایید شد: `{chat_id}`", chat_id=admin_id)
+        notifier.send(f"👤 کاربر جدید تایید شد: <code>{esc(chat_id)}</code>", chat_id=admin_id)
 
 
 def _handle_callback_query(callback: dict, settings: Settings, access: AccessControl,
@@ -266,7 +274,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         _pending[chat_id] = {"action": "awaiting_invite_password"}
         notifier.edit_message(
             chat_id, message_id,
-            "🔑 یک رمز عبور دلخواه *منحصربه‌فرد* برای این کاربر بنویسید (مثلاً یک اسم+عدد):\n\n"
+            "🔑 یک رمز عبور دلخواه <b>منحصربه‌فرد</b> برای این کاربر بنویسید (مثلاً یک اسم+عدد):\n\n"
             "این رمز را بعداً خودتان به همان شخص می‌دهید؛ او با ارسال همین رمز به ربات فعال می‌شود — "
             "لازم نیست از قبل chat_id او را بدانید.",
             reply_markup=_cancel_markup(),
@@ -292,8 +300,8 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         days_text = "نامحدود" if days is None else f"{days:.0f} روز"
         notifier.edit_message(
             chat_id, message_id,
-            f"✅ رمز اختصاصی ساخته شد:\n\n🔑 رمز: `{password}`\n⏳ مدت: {days_text}\n\n"
-            f"این رمز را به کاربر مورد نظر بدهید تا با ارسال `/start` و سپس این رمز، دسترسی‌اش فعال شود.",
+            f"✅ رمز اختصاصی ساخته شد:\n\n🔑 رمز: <code>{esc(password)}</code>\n⏳ مدت: {esc(days_text)}\n\n"
+            f"این رمز را به کاربر مورد نظر بدهید تا با ارسال /start و سپس این رمز، دسترسی‌اش فعال شود.",
             reply_markup=_main_menu_markup(is_admin),
         )
         return
@@ -304,7 +312,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
 def _legacy_grant(text: str, admin_chat_id: str, access: AccessControl, notifier: TelegramNotifier) -> None:
     parts = text.split()
     if len(parts) < 3:
-        notifier.send("فرمت درست: `/grant <chat_id> <روز یا unlimited>`", chat_id=admin_chat_id)
+        notifier.send("فرمت درست: /grant &lt;chat_id&gt; &lt;روز یا unlimited&gt;", chat_id=admin_chat_id)
         return
     target_chat_id, duration_str = parts[1], parts[2]
     days = None
@@ -312,18 +320,18 @@ def _legacy_grant(text: str, admin_chat_id: str, access: AccessControl, notifier
         try:
             days = float(duration_str)
         except ValueError:
-            notifier.send("مقدار روز باید عدد باشد یا `unlimited`.", chat_id=admin_chat_id)
+            notifier.send("مقدار روز باید عدد باشد یا unlimited.", chat_id=admin_chat_id)
             return
     access.grant(target_chat_id, days=days)
-    notifier.send(f"✅ دسترسی برای `{target_chat_id}` تنظیم شد. انقضا: `{access.expiry_text(target_chat_id)}`",
+    notifier.send(f"✅ دسترسی برای <code>{esc(target_chat_id)}</code> تنظیم شد. انقضا: <code>{esc(access.expiry_text(target_chat_id))}</code>",
                   chat_id=admin_chat_id, reply_markup=_main_menu_markup(True))
-    notifier.send(f"🎉 دسترسی شما فعال شد.\n⏳ *انقضا:* `{access.expiry_text(target_chat_id)}`", chat_id=target_chat_id)
+    notifier.send(f"🎉 دسترسی شما فعال شد.\n⏳ <b>انقضا:</b> <code>{esc(access.expiry_text(target_chat_id))}</code>", chat_id=target_chat_id)
 
 
 def _legacy_revoke(text: str, admin_chat_id: str, access: AccessControl, notifier: TelegramNotifier) -> None:
     parts = text.split()
     if len(parts) < 2:
-        notifier.send("فرمت درست: `/revoke <chat_id>`", chat_id=admin_chat_id)
+        notifier.send("فرمت درست: /revoke &lt;chat_id&gt;", chat_id=admin_chat_id)
         return
     existed = access.revoke(parts[1])
     notifier.send("✅ دسترسی حذف شد." if existed else "این کاربر از قبل دسترسی نداشت.",
