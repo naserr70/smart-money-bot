@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -38,6 +39,15 @@ from telegram_notifier import TelegramNotifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("smart_money_bot")
+
+# A fresh random ID every time this Python process starts. If /status (or
+# the admin menu's وضعیت ربات) shows a DIFFERENT instance_id between two
+# requests hitting the same URL, that proves Render is routing across more
+# than one running instance — each with its own separate in-memory/disk
+# state — which is the #1 explanation for "grant works here, real signals
+# come from somewhere else that never saw the grant."
+INSTANCE_ID = uuid.uuid4().hex[:8]
+log.info(f"این پردازش با instance_id={INSTANCE_ID} استارت شد.")
 
 app = Flask(__name__)
 
@@ -86,6 +96,7 @@ def market_loop():
         try:
             signals, data_source, scanned = market_analyzer.run_cycle()
             targets = broadcast_targets()
+            log.info(f"چرخه‌ی مارکت: {len(signals)} سیگنال، گیرنده‌ها={targets}")
             if signals:
                 notifier.broadcast_chunked([s.to_telegram() for s in signals], targets)
 
@@ -199,6 +210,7 @@ def status():
     health = state.snapshot_health()
     health["whale_tracker_enabled"] = whale_tracker.is_enabled()
     health["authorized_users_count"] = len(access.active_chat_ids())
+    health["instance_id"] = INSTANCE_ID
     return jsonify(health)
 
 
@@ -206,6 +218,7 @@ def build_admin_status_text() -> str:
     health = state.snapshot_health()
     lines = [
         "📈 <b>وضعیت ربات</b>\n",
+        f"🆔 instance_id: <code>{esc(INSTANCE_ID)}</code>",
         f"🕐 آخرین چرخه‌ی مارکت: <code>{esc(health.get('last_market_cycle_at') or '-')}</code>",
         f"🐋 آخرین چرخه‌ی نهنگ: <code>{esc(health.get('last_whale_cycle_at') or '-')}</code>",
         f"🔁 تعداد چرخه‌های مارکت: <code>{health.get('market_cycles_completed')}</code>",
