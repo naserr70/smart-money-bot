@@ -15,6 +15,10 @@ Admin-only menu items (admin = ADMIN_CHAT_ID / defaults to CHAT_ID):
                        chat_id in advance. They redeem it themselves by
                        sending that password to the bot.
   ➖ حذف دسترسی     — revoke an already-authorized user's access (by chat_id)
+  📢 ارسال پیام به همه — admin types any message, it's sent to every active
+                       user right now (also doubles as a delivery test)
+  🧪 تست سیگنال      — pushes a fake signal through the exact same
+                       to_telegram()+broadcast_chunked path real signals use
 
 Old-style text commands (/grant <chat_id> <days>, /revoke, /users) still
 work too, for anyone who prefers typing and already knows a chat_id.
@@ -61,7 +65,7 @@ def _main_menu_markup(is_admin: bool) -> dict:
                      {"text": "📈 وضعیت ربات", "callback_data": "admin_status"}])
         rows.append([{"text": "➕ اعطای دسترسی", "callback_data": "admin_grant"},
                      {"text": "➖ حذف دسترسی", "callback_data": "admin_revoke"}])
-        rows.append([{"text": "📤 تست ارسال به همه", "callback_data": "admin_testsend"},
+        rows.append([{"text": "📢 ارسال پیام به همه", "callback_data": "admin_testsend"},
                      {"text": "🧪 تست سیگنال", "callback_data": "admin_testsignal"}])
     return {"inline_keyboard": rows}
 
@@ -138,26 +142,22 @@ def _broadcast_targets(settings: Settings, access: AccessControl):
     return list(dict.fromkeys(t for t in targets if t))
 
 
-def _test_broadcast_text(settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
-    """Sends a real test message to every currently-active target RIGHT NOW
-    (instead of waiting for a real market/whale signal) and reports exactly
-    which chat_ids succeeded and which failed — this is the fastest way to
-    confirm whether "signals aren't reaching someone" is a delivery problem
-    (e.g. they blocked the bot, or never actually messaged it) versus a
-    logic problem (they're not in the authorized list at all)."""
+def _broadcast_custom_message(text: str, settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
+    """Sends an admin-authored message to every currently-active target
+    RIGHT NOW and reports exactly which chat_ids succeeded and which
+    failed — this doubles as a delivery diagnostic (like the old fixed
+    test message did) while also being an actual announcement tool."""
     targets = _broadcast_targets(settings, access)
     if not targets:
-        return "📤 هیچ گیرنده‌ی فعالی (حتی ادمین) پیدا نشد — چیزی برای تست نیست."
+        return "📤 هیچ گیرنده‌ی فعالی (حتی ادمین) پیدا نشد — چیزی برای ارسال نیست."
 
+    message_text = f"📢 <b>پیام از ادمین:</b>\n\n{esc(text)}"
     ok, failed = [], []
     for target in targets:
-        msg_id = notifier.send(
-            "🧪 <b>پیام تست broadcast</b>\n\nاگر این پیام را می‌بینید، ارسال گروهی برای شما درست کار می‌کند.",
-            chat_id=target,
-        )
+        msg_id = notifier.send(message_text, chat_id=target)
         (ok if msg_id else failed).append(target)
 
-    lines = [f"📤 <b>نتیجه‌ی تست ارسال</b> ({len(ok)}/{len(targets)} موفق):\n"]
+    lines = [f"📤 <b>نتیجه‌ی ارسال</b> ({len(ok)}/{len(targets)} موفق):\n"]
     if failed:
         lines.append("❌ <b>ناموفق برای:</b> " + ", ".join(f"<code>{esc(t)}</code>" for t in failed))
         lines.append("\nدلیل دقیق هرکدوم رو توی لاگ Render، دنبال همین chat_id بگرد (خط «تلگرام خطای HTTP ...»). "
@@ -238,6 +238,11 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
             _pending.pop(chat_id, None)
             notifier.send("✅ دسترسی حذف شد." if existed else "این کاربر از قبل دسترسی نداشت.",
                           chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
+            return
+        if pending["action"] == "awaiting_broadcast_message":
+            _pending.pop(chat_id, None)
+            result_text = _broadcast_custom_message(text, settings, access, notifier)
+            notifier.send(result_text, chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
             return
 
     if text in ("/start", "/menu"):
@@ -336,9 +341,12 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         notifier.edit_message(chat_id, message_id, text, reply_markup=_back_markup())
         return
     if data == "admin_testsend":
-        notifier.edit_message(chat_id, message_id, "⏳ در حال ارسال پیام تست به همه...")
-        result_text = _test_broadcast_text(settings, access, notifier)
-        notifier.edit_message(chat_id, message_id, result_text, reply_markup=_back_markup())
+        _pending[chat_id] = {"action": "awaiting_broadcast_message"}
+        notifier.edit_message(
+            chat_id, message_id,
+            "📝 پیامی که می‌خواهید برای همه‌ی کاربران فعال ارسال شود را بنویسید:",
+            reply_markup=_cancel_markup(),
+        )
         return
     if data == "admin_testsignal":
         notifier.edit_message(chat_id, message_id, "⏳ در حال ارسال سیگنال تستی...")
