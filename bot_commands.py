@@ -60,6 +60,7 @@ def _main_menu_markup(is_admin: bool) -> dict:
                      {"text": "📈 وضعیت ربات", "callback_data": "admin_status"}])
         rows.append([{"text": "➕ اعطای دسترسی", "callback_data": "admin_grant"},
                      {"text": "➖ حذف دسترسی", "callback_data": "admin_revoke"}])
+        rows.append([{"text": "📤 تست ارسال به همه", "callback_data": "admin_testsend"}])
     return {"inline_keyboard": rows}
 
 
@@ -126,6 +127,41 @@ def _users_list_text(access: AccessControl) -> str:
             days = entry.get("days")
             days_text = "نامحدود" if days is None else f"{days} روز"
             lines.append(f"<code>{esc(password)}</code> — {esc(days_text)}")
+    return "\n".join(lines)
+
+
+def _broadcast_targets(settings: Settings, access: AccessControl):
+    admin_id = settings.admin_chat_id_resolved
+    targets = ([admin_id] if admin_id else []) + access.active_chat_ids()
+    return list(dict.fromkeys(t for t in targets if t))
+
+
+def _test_broadcast_text(settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
+    """Sends a real test message to every currently-active target RIGHT NOW
+    (instead of waiting for a real market/whale signal) and reports exactly
+    which chat_ids succeeded and which failed — this is the fastest way to
+    confirm whether "signals aren't reaching someone" is a delivery problem
+    (e.g. they blocked the bot, or never actually messaged it) versus a
+    logic problem (they're not in the authorized list at all)."""
+    targets = _broadcast_targets(settings, access)
+    if not targets:
+        return "📤 هیچ گیرنده‌ی فعالی (حتی ادمین) پیدا نشد — چیزی برای تست نیست."
+
+    ok, failed = [], []
+    for target in targets:
+        msg_id = notifier.send(
+            "🧪 <b>پیام تست broadcast</b>\n\nاگر این پیام را می‌بینید، ارسال گروهی برای شما درست کار می‌کند.",
+            chat_id=target,
+        )
+        (ok if msg_id else failed).append(target)
+
+    lines = [f"📤 <b>نتیجه‌ی تست ارسال</b> ({len(ok)}/{len(targets)} موفق):\n"]
+    if failed:
+        lines.append("❌ <b>ناموفق برای:</b> " + ", ".join(f"<code>{esc(t)}</code>" for t in failed))
+        lines.append("\nدلیل دقیق هرکدوم رو توی لاگ Render، دنبال همین chat_id بگرد (خط «تلگرام خطای HTTP ...»). "
+                     "علت رایج: آن کاربر هرگز مستقیماً با ربات /start نزده، یا ربات را بلاک کرده.")
+    else:
+        lines.append("✅ به همه با موفقیت ارسال شد.")
     return "\n".join(lines)
 
 
@@ -268,6 +304,11 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     if data == "admin_status":
         text = admin_status_provider() if admin_status_provider else "در دسترس نیست."
         notifier.edit_message(chat_id, message_id, text, reply_markup=_back_markup())
+        return
+    if data == "admin_testsend":
+        notifier.edit_message(chat_id, message_id, "⏳ در حال ارسال پیام تست به همه...")
+        result_text = _test_broadcast_text(settings, access, notifier)
+        notifier.edit_message(chat_id, message_id, result_text, reply_markup=_back_markup())
         return
 
     if data == "admin_grant":
