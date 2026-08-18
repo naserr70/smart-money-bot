@@ -33,7 +33,7 @@ def _env_bool(key: str, default: bool) -> bool:
 
 # Verified, publicly-labelled exchange hot-wallet addresses (Etherscan public
 # tags). These are public blockchain addresses, not credentials. You can (and
-# should) extend/replace this list via the EXCHANGE_WALLETS_JSON env var â
+# should) extend/replace this list via the EXCHANGE_WALLETS_JSON env var —
 # always double-check any address on etherscan.io/bscscan.com before trusting it.
 DEFAULT_EXCHANGE_WALLETS: Dict[str, Dict[str, str]] = {
     "ETH": {
@@ -46,7 +46,7 @@ DEFAULT_EXCHANGE_WALLETS: Dict[str, Dict[str, str]] = {
     },
     "TRON": {
         # Populate with verified Tronscan-labelled addresses (tronscan.org).
-        # Left empty deliberately â I could not verify a specific exchange's
+        # Left empty deliberately — I could not verify a specific exchange's
         # TRC20 hot-wallet address confidently enough to hardcode it here;
         # guessing one would repeat exactly the SYS/SYN mistake this project
         # already learned from. Add your own via EXCHANGE_WALLETS_JSON, e.g.:
@@ -64,9 +64,11 @@ class Settings:
     # --- Access control (password gate + per-user time-limited access) ---
     bot_access_password: str = field(default_factory=lambda: _env_str("BOT_ACCESS_PASSWORD"))
     admin_chat_id: str = field(default_factory=lambda: _env_str("ADMIN_CHAT_ID"))
-    developer_name: str = field(default_factory=lambda: _env_str("DEVELOPER_NAME", "ناصر رومی پور"))
+    developer_name: str = field(default_factory=lambda: _env_str("DEVELOPER_NAME", "ناصر رومی‌پور"))
     default_access_duration_days: float = field(default_factory=lambda: _env_float("DEFAULT_ACCESS_DURATION_DAYS", 30))
     auth_state_file_path: str = field(default_factory=lambda: _env_str("AUTH_STATE_FILE_PATH", "authorized_users.json"))
+    github_gist_id: str = field(default_factory=lambda: _env_str("GITHUB_GIST_ID"))
+    github_gist_token: str = field(default_factory=lambda: _env_str("GITHUB_GIST_TOKEN"))
     telegram_webhook_secret: str = field(default_factory=lambda: _env_str("TELEGRAM_WEBHOOK_SECRET"))
 
     # --- CEX ticker-based smart-money detection ---
@@ -107,7 +109,7 @@ class Settings:
     @property
     def admin_chat_id_resolved(self) -> str:
         """The admin identity: explicit ADMIN_CHAT_ID if set, otherwise falls
-        back to CHAT_ID (keeps single-user setups simple â no extra env var
+        back to CHAT_ID (keeps single-user setups simple — no extra env var
         needed unless you want the admin to be a different chat than the
         original default recipient)."""
         return self.admin_chat_id or self.chat_id
@@ -116,29 +118,34 @@ class Settings:
         """Return a list of human-readable configuration problems (non-fatal warnings included)."""
         problems = []
         if not self.bot_token:
-            problems.append("BOT_TOKEN ØªÙØ¸ÛÙ ÙØ´Ø¯Ù Ø§Ø³Øª â Ø§Ø±Ø³Ø§Ù Ù¾ÛØ§Ù ØºÛØ±ÙÙÚ©Ù Ø®ÙØ§ÙØ¯ Ø¨ÙØ¯.")
+            problems.append("BOT_TOKEN تنظیم نشده است — ارسال پیام غیرممکن خواهد بود.")
         if not self.chat_id:
-            problems.append("CHAT_ID ØªÙØ¸ÛÙ ÙØ´Ø¯Ù Ø§Ø³Øª â Ø§Ø±Ø³Ø§Ù Ù¾ÛØ§Ù ØºÛØ±ÙÙÚ©Ù Ø®ÙØ§ÙØ¯ Ø¨ÙØ¯.")
+            problems.append("CHAT_ID تنظیم نشده است — ارسال پیام غیرممکن خواهد بود.")
         if not self.bot_access_password:
             problems.append(
-                "BOT_ACCESS_PASSWORD ØªÙØ¸ÛÙ ÙØ´Ø¯Ù â ÙØ± Ú©Ø³Û Ú©Ù chat_id Ø±Ø¨Ø§Øª Ø±Ø§ Ù¾ÛØ¯Ø§ Ú©ÙØ¯ ÙÛâØªÙØ§ÙØ¯ Ø¨Ø¯ÙÙ Ø±ÙØ² Ø¯Ø±Ø®ÙØ§Ø³Øª Ø¯Ø³ØªØ±Ø³Û Ø¨Ø¯ÙØ¯."
+                "BOT_ACCESS_PASSWORD تنظیم نشده — هر کسی که chat_id ربات را پیدا کند می‌تواند بدون رمز درخواست دسترسی بدهد."
             )
         if not self.telegram_webhook_secret:
             problems.append(
-                "TELEGRAM_WEBHOOK_SECRET ØªÙØ¸ÛÙ ÙØ´Ø¯Ù â ÙØ¨ÙÙÚ© Ø¨Ø¯ÙÙ Ø§ÛÙ ÙÙØ¯Ø§Ø± ÙØ§Ø¨Ù Ø¬Ø¹Ù Ø§Ø³ØªØ ÛÚ© Ø±Ø´ØªÙâÛ ØªØµØ§Ø¯ÙÛ ØªÙØ¸ÛÙ Ú©ÙÛØ¯."
+                "TELEGRAM_WEBHOOK_SECRET تنظیم نشده — وبهوک بدون این مقدار قابل جعل است؛ یک رشته‌ی تصادفی تنظیم کنید."
+            )
+        if not (self.github_gist_id and self.github_gist_token):
+            problems.append(
+                "GITHUB_GIST_ID/GITHUB_GIST_TOKEN تنظیم نشده — لیست کاربران مجاز فقط روی دیسک موقتی نگه داشته می‌شود "
+                "و با هر ری‌استارت سرویس روی Render (حتی خودکار) از بین می‌رود."
             )
         if self.price_pump_min >= self.price_pump_max:
-            problems.append("PRICE_PUMP_MIN Ø¨Ø§ÛØ¯ Ú©ÙÚÚ©ØªØ± Ø§Ø² PRICE_PUMP_MAX Ø¨Ø§Ø´Ø¯.")
+            problems.append("PRICE_PUMP_MIN باید کوچکتر از PRICE_PUMP_MAX باشد.")
         if self.scan_interval_sec <= 0:
-            problems.append("SCAN_INTERVAL_SEC Ø¨Ø§ÛØ¯ ÙØ«Ø¨Øª Ø¨Ø§Ø´Ø¯.")
+            problems.append("SCAN_INTERVAL_SEC باید مثبت باشد.")
         if not self.etherscan_api_key:
             problems.append(
-                "ETHERSCAN_API_KEY ØªÙØ¸ÛÙ ÙØ´Ø¯Ù â ÙØ§ÚÙÙ Ø±Ø¯ÛØ§Ø¨Û ÙÙØª/ØµØ±Ø§ÙÛ (Exchange Flow) ØºÛØ±ÙØ¹Ø§Ù ÙÛâÙØ§ÙØ¯."
+                "ETHERSCAN_API_KEY تنظیم نشده — ماژول ردیابی ولت/صرافی (Exchange Flow) غیرفعال می‌ماند."
             )
         if not self.coingecko_api_key:
             problems.append(
-                "COINGECKO_API_KEY ØªÙØ¸ÛÙ ÙØ´Ø¯Ù â Ø±ÙÛ IPÙØ§Û ÙØ´ØªØ±Ú© (ÙØ«Ù Render) ÙÛÙØªâÚ¯Ø°Ø§Ø±Û Ø¢ÙâÚÛÙ ÙÙÚ©Ù Ø§Ø³Øª "
-                "Ø¯Ø§Ø¦ÙØ§Ù rate-limit Ø¨Ø®ÙØ±Ø¯. ÛÚ© Ú©ÙÛØ¯ Demo Ø±Ø§ÛÚ¯Ø§Ù Ø§Ø² coingecko.com/en/developers/dashboard Ø¨Ú¯ÛØ±ÛØ¯."
+                "COINGECKO_API_KEY تنظیم نشده — روی IPهای مشترک (مثل Render) قیمت‌گذاری آن‌چین ممکن است "
+                "دائماً rate-limit بخورد. یک کلید Demo رایگان از coingecko.com/en/developers/dashboard بگیرید."
             )
         return problems
 
