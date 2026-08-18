@@ -67,7 +67,11 @@ def build_http_session() -> requests.Session:
 
 http_session = build_http_session()
 state = BotState(history_window=settings.history_window, state_file_path=settings.state_file_path)
-access = AccessControl(settings.auth_state_file_path, settings.admin_chat_id_resolved)
+access = AccessControl(
+    settings.auth_state_file_path, settings.admin_chat_id_resolved,
+    gist_id=settings.github_gist_id, gist_token=settings.github_gist_token,
+    http_session=http_session,
+)
 notifier = TelegramNotifier(
     settings.bot_token, settings.chat_id,
     timeout=settings.http_timeout_sec, max_retries=settings.http_max_retries,
@@ -219,6 +223,7 @@ def build_admin_status_text() -> str:
     lines = [
         "📈 <b>وضعیت ربات</b>\n",
         f"🆔 instance_id: <code>{esc(INSTANCE_ID)}</code>",
+        f"💾 حافظه‌ی دائمی (JSONBin): <code>{'فعال' if access.is_remote_enabled() else 'غیرفعال — ری‌استارت‌ها کاربرها را پاک می‌کند'}</code>",
         f"🕐 آخرین چرخه‌ی مارکت: <code>{esc(health.get('last_market_cycle_at') or '-')}</code>",
         f"🐋 آخرین چرخه‌ی نهنگ: <code>{esc(health.get('last_whale_cycle_at') or '-')}</code>",
         f"🔁 تعداد چرخه‌های مارکت: <code>{health.get('market_cycles_completed')}</code>",
