@@ -91,7 +91,7 @@ def broadcast_targets():
 def market_loop():
     time.sleep(3)
     notifier.broadcast(
-        f"🚀 <b>سیستم تحلیل هوشمند فوق‌پایدار فعال شد.</b>\n"
+        f"🚀 <b>سیستم تحلیل هوشمند فعال شد.</b>\n"
         f"👨‍💻 <b>توسعه‌دهنده:</b> {esc(settings.developer_name)}\n"
         f"پوشش جامع تمام بازارهای ریالی و تتری نوبیتکس + ردیابی آن‌چین کیف‌پول صرافی‌ها.",
         broadcast_targets(),
