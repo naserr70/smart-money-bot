@@ -11,12 +11,10 @@ Signal logic
    Price movement and volume anomaly evaluated against the long
    CLOSED-candle history, up to 864 candles.
 
-3. Binance is preferred for the current analysis cycle.
-4. KuCoin is fallback for the current analysis cycle.
-5. Binance and KuCoin histories are NEVER mixed.
+3. Active analysis priority:
+   Binance → Bybit → KuCoin
 
-The currently active exchange only controls which exchange's data is
-analyzed. It never controls or overwrites the other exchange's history.
+4. Histories are NEVER mixed across exchanges.
 """
 
 import logging
@@ -30,6 +28,7 @@ from candle_store import (
     CandleStore,
     SMART_MONEY_BASELINE_CANDLES,
     PUMP_HISTORY_CANDLES,
+    VALID_SOURCES,
 )
 from config import Settings
 from formatting import esc
@@ -44,7 +43,6 @@ from state import BotState
 
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
-# How many recent candles to fetch each cycle for the rolling update.
 LIVE_UPDATE_LIMIT = 5
 
 
@@ -68,13 +66,7 @@ class MarketAnalyzer:
 
         self.candle_store = candle_store
 
-        # Track last closed open_time we already evaluated for signals,
-        # so we only fire once per newly closed candle.
         self._last_signaled_open_time: Dict[str, int] = {}
-
-    # =========================================================
-    # MAIN CYCLE
-    # =========================================================
 
     def run_cycle(
         self,
@@ -83,69 +75,49 @@ class MarketAnalyzer:
         log.info("MARKET FETCH START")
 
         try:
-            binance_tickers, kucoin_tickers = (
+            binance_tickers, bybit_tickers, kucoin_tickers = (
                 self.provider.fetch_all_sources()
             )
         except Exception:
             log.exception("MARKET TICKER FETCH FAILED")
             return [], "none", 0
 
-        # -----------------------------------------------------
-        # Maintain BOTH histories independently.
-        # -----------------------------------------------------
+        sources_tickers = {
+            "binance": binance_tickers,
+            "bybit": bybit_tickers,
+            "kucoin": kucoin_tickers,
+        }
 
-        self._maintain_history(
-            source="binance",
-            tickers=binance_tickers,
-        )
+        for source, tickers in sources_tickers.items():
+            self._maintain_history(source=source, tickers=tickers)
 
-        self._maintain_history(
-            source="kucoin",
-            tickers=kucoin_tickers,
-        )
+        for source, tickers in sources_tickers.items():
+            self._live_update_candles(source=source, tickers=tickers)
 
-        # -----------------------------------------------------
-        # Live rolling update: fetch a few recent candles and
-        # push them into the store so history advances.
-        # -----------------------------------------------------
-
-        self._live_update_candles(
-            source="binance",
-            tickers=binance_tickers,
-        )
-
-        self._live_update_candles(
-            source="kucoin",
-            tickers=kucoin_tickers,
-        )
-
-        # -----------------------------------------------------
-        # Select source for CURRENT ANALYSIS ONLY.
-        # -----------------------------------------------------
-
+        # Priority: Binance → Bybit → KuCoin
         if binance_tickers:
             active_source = "binance"
             ticker_stats = binance_tickers
-
-            log.info(
-                "ACTIVE MARKET SOURCE | Binance PRIMARY"
+            log.info("ACTIVE MARKET SOURCE | Binance PRIMARY")
+        elif bybit_tickers:
+            active_source = "bybit"
+            ticker_stats = bybit_tickers
+            log.warning(
+                "ACTIVE MARKET SOURCE | Bybit FALLBACK | "
+                "Binance unavailable"
             )
-
         elif kucoin_tickers:
             active_source = "kucoin"
             ticker_stats = kucoin_tickers
-
             log.warning(
                 "ACTIVE MARKET SOURCE | KuCoin FALLBACK | "
-                "Binance unavailable"
+                "Binance and Bybit unavailable"
             )
-
         else:
             log.error(
                 "ACTIVE MARKET SOURCE FAILED | "
-                "Binance and KuCoin unavailable"
+                "Binance, Bybit and KuCoin unavailable"
             )
-
             return [], "none", 0
 
         log.info(
@@ -188,17 +160,13 @@ class MarketAnalyzer:
             len(ticker_stats),
         )
 
-    # =========================================================
-    # HISTORY MAINTENANCE (bootstrap)
-    # =========================================================
-
     def _maintain_history(
         self,
         source: str,
         tickers: Dict[str, dict],
     ) -> None:
 
-        if source not in {"binance", "kucoin"}:
+        if source not in VALID_SOURCES:
             raise ValueError(
                 f"Unsupported market source: {source}"
             )
@@ -241,21 +209,14 @@ class MarketAnalyzer:
                 if current_count >= PUMP_HISTORY_CANDLES:
                     continue
 
-                # Enough for smart-money baseline; live updates
-                # will continue to grow the window.
                 if current_count >= SMART_MONEY_BASELINE_CANDLES:
                     continue
 
-                if source == "binance":
-                    candles = self.provider.fetch_binance_candles(
-                        symbol=symbol,
-                        limit=PUMP_HISTORY_CANDLES,
-                    )
-                else:
-                    candles = self.provider.fetch_kucoin_candles(
-                        symbol=symbol,
-                        limit=PUMP_HISTORY_CANDLES,
-                    )
+                candles = self.provider.fetch_candles(
+                    source=source,
+                    symbol=symbol,
+                    limit=PUMP_HISTORY_CANDLES,
+                )
 
                 if not candles:
                     log.warning(
@@ -294,10 +255,6 @@ class MarketAnalyzer:
                     symbol,
                 )
 
-    # =========================================================
-    # LIVE CANDLE UPDATE (rolling window)
-    # =========================================================
-
     def _live_update_candles(
         self,
         source: str,
@@ -313,20 +270,14 @@ class MarketAnalyzer:
         for symbol in tickers:
 
             try:
-                # Ensure local history is loaded before updating.
                 if self.candle_store.count(source, symbol) == 0:
                     self.candle_store.load(source, symbol)
 
-                if source == "binance":
-                    candles = self.provider.fetch_binance_candles(
-                        symbol=symbol,
-                        limit=LIVE_UPDATE_LIMIT,
-                    )
-                else:
-                    candles = self.provider.fetch_kucoin_candles(
-                        symbol=symbol,
-                        limit=LIVE_UPDATE_LIMIT,
-                    )
+                candles = self.provider.fetch_candles(
+                    source=source,
+                    symbol=symbol,
+                    limit=LIVE_UPDATE_LIMIT,
+                )
 
                 if not candles:
                     continue
@@ -353,10 +304,6 @@ class MarketAnalyzer:
             updated,
             closed_total,
         )
-
-    # =========================================================
-    # SYMBOL ANALYSIS
-    # =========================================================
 
     def _analyze_symbol(
         self,
@@ -390,8 +337,6 @@ class MarketAnalyzer:
 
         current_candle = history[-1]
 
-        # Only evaluate a candle once (when it first becomes the
-        # newest closed candle).
         signal_key = f"{source}:{symbol}"
         last_ot = self._last_signaled_open_time.get(signal_key)
 
@@ -452,7 +397,6 @@ class MarketAnalyzer:
             current_volume / baseline
         )
 
-        # Estimated additional volume (net inflow approximation).
         estimated_inflow = max(
             0.0,
             current_volume - baseline,
@@ -583,8 +527,6 @@ class MarketAnalyzer:
             or statistical_dump
         ):
 
-            # Still mark as processed so we don't re-evaluate
-            # the same closed candle every cycle.
             self._last_signaled_open_time[signal_key] = (
                 current_candle.open_time
             )
@@ -725,10 +667,6 @@ class MarketAnalyzer:
 
         return signal
 
-    # =========================================================
-    # STATUS
-    # =========================================================
-
     def build_status_message(
         self,
         data_source: str,
@@ -739,6 +677,7 @@ class MarketAnalyzer:
 
         source_label = {
             "binance": "Binance",
+            "bybit": "Bybit",
             "kucoin": "KuCoin",
             "none": "هیچ‌کدام",
         }.get(
