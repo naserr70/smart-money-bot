@@ -1,8 +1,8 @@
 """
 Typed market and exchange-flow signal objects.
 
-Telegram messages intentionally contain only user-facing trading
-information. Internal source/debug information is NOT displayed.
+Telegram output intentionally exposes only user-facing information.
+Internal exchange/source/debug information is never displayed.
 """
 
 from dataclasses import dataclass
@@ -35,20 +35,19 @@ class MarketSignal:
     direction: SignalDirection
 
     trigger: TriggerType = TriggerType.STATIC
-
     zscore: Optional[float] = None
 
-    # Internal only. Never displayed in Telegram.
+    # Internal only.
     source: str = ""
 
     def to_telegram(self) -> str:
 
-        is_pump = (
+        is_inflow = (
             self.direction
             == SignalDirection.INFLOW
         )
 
-        is_pump_labeled = (
+        is_statistical = (
             self.trigger
             in (
                 TriggerType.STATISTICAL,
@@ -56,17 +55,14 @@ class MarketSignal:
             )
         )
 
-        if is_pump:
+        if is_inflow:
 
-            if is_pump_labeled:
-
+            if is_statistical:
                 header = (
                     "🚀 <b>پامپ شناسایی شد "
                     "(PUMP DETECTED)</b> 🚀"
                 )
-
             else:
-
                 header = (
                     "🚨 <b>ورود پول هوشمند "
                     "(SMART MONEY IN)</b> 🚨"
@@ -87,15 +83,12 @@ class MarketSignal:
 
         else:
 
-            if is_pump_labeled:
-
+            if is_statistical:
                 header = (
                     "💥 <b>دامپ ناگهانی شناسایی شد "
                     "(SUDDEN DUMP DETECTED)</b> 💥"
                 )
-
             else:
-
                 header = (
                     "🔻 <b>خروج پول هوشمند "
                     "(SMART MONEY OUT)</b> 🔻"
@@ -114,12 +107,6 @@ class MarketSignal:
                 "احتیاط در نگهداری پوزیشن."
             )
 
-        # Do NOT expose z-score.
-        #
-        # Do NOT expose exchange source.
-        #
-        # Do NOT expose internal detection methodology.
-
         return (
             f"{header}\n\n"
             f"🪙 <b>نماد:</b> "
@@ -134,7 +121,7 @@ class MarketSignal:
             f"<code>${self.inflow_usd / 1e3:,.1f}K</code>\n"
             f"⚡ <b>جهش حجم معاملاتی:</b> "
             f"<code>{self.spike_multiplier:.1f}X</code> "
-            f"برابر میانگین ۴ ساعت گذشته\n\n"
+            "برابر میانگین ۴ ساعت گذشته\n\n"
             f"{advice}"
         )
 
@@ -198,6 +185,8 @@ class ExchangeFlowSignal:
                 "دارایی در حال خروج به کیف شخصی/کلد است."
             )
 
+        safe_link = esc(link)
+
         return (
             f"{header}\n\n"
             f"⛓ <b>شبکه:</b> "
@@ -211,7 +200,7 @@ class ExchangeFlowSignal:
             f"{esc(self.token_symbol)}</code>\n"
             f"💰 <b>ارزش تراکنش:</b> "
             f"${self.amount_usd:,.0f}\n"
-            f'🔗 <a href="{esc(link)}">'
-            f"مشاهده تراکنش</a>\n\n"
+            f'🔗 <a href="{safe_link}">'
+            "مشاهده تراکنش</a>\n\n"
             f"{advice}"
         )
