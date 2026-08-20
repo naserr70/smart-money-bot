@@ -1,20 +1,15 @@
 """
 Typed signal objects.
 
-MarketSignal represents CEX ticker-based signals.
+MarketSignal:
+    CEX 5m closed-candle signal.
 
-The signal contains:
-  * actual current price
-  * current-cycle price change
-  * 24h price change
-  * calculated volume inflow/outflow
-  * volume spike multiplier
-  * signal direction
-  * detection method
-  * optional statistical z-score
+Volume logic:
+    current closed candle volume compared against the
+    simple arithmetic mean of the previous 48 closed candles.
 
-The analyzer is responsible for the actual detection logic.
-This module only represents and formats the result.
+Pump / dump:
+    static price threshold + optional 72h statistical anomaly.
 """
 
 from dataclasses import dataclass
@@ -30,20 +25,6 @@ class SignalDirection(Enum):
 
 
 class TriggerType(Enum):
-    """
-    Why a MarketSignal fired.
-
-    STATIC:
-        Fixed percentage + volume-spike conditions.
-
-    STATISTICAL:
-        Price movement is statistically abnormal compared with
-        the symbol's long-term 72-hour behavior.
-
-    BOTH:
-        Both detection systems agree.
-    """
-
     STATIC = "static"
     STATISTICAL = "statistical"
     BOTH = "both"
@@ -51,48 +32,30 @@ class TriggerType(Enum):
 
 @dataclass
 class MarketSignal:
-    """
-    CEX ticker-based smart-money signal.
-
-    Volume:
-        Calculated from the change in quote volume between two
-        market snapshots.
-
-    Smart-money baseline:
-        48 historical 5-minute candles = 4 hours.
-
-    Pump/Dump statistical baseline:
-        864 historical 5-minute candles = 72 hours.
-    """
 
     symbol: str
 
     price: float
 
-    # Current scan-cycle price movement.
     change_5m: float
 
-    # Exchange-reported 24h price movement.
     change_24h: float
 
-    # Current volume delta / estimated money flow.
     inflow_usd: float
 
-    # Current flow relative to historical baseline.
     spike_multiplier: float
 
     direction: SignalDirection
 
     trigger: TriggerType = TriggerType.STATIC
 
-    # Price anomaly relative to 72h history.
     zscore: Optional[float] = None
 
-    # Number of historical candles used for volume comparison.
-    volume_baseline_candles: int = 48
+    baseline_volume_usd: float = 0.0
 
-    # Number of historical candles used for statistical pump/dump detection.
-    price_baseline_candles: int = 864
+    current_candle_volume_usd: float = 0.0
+
+    baseline_candles: int = 48
 
     def to_telegram(self) -> str:
 
@@ -104,71 +67,74 @@ class MarketSignal:
             )
         )
 
-        # --------------------------------------------------------------
-        # Direction
-        # --------------------------------------------------------------
-
         if self.direction == SignalDirection.INFLOW:
 
             if is_pump_labeled:
+
                 header = (
                     "🚀 <b>پامپ شناسایی شد "
                     "(PUMP DETECTED)</b> 🚀"
                 )
+
             else:
+
                 header = (
                     "🚨 <b>ورود پول هوشمند "
                     "(SMART MONEY IN)</b> 🚨"
                 )
 
             price_line = (
-                f"📈 <b>رشد قیمت اخیر:</b> "
+                "📈 <b>رشد قیمت کندل ۵ دقیقه‌ای:</b> "
                 f"<code>+{self.change_5m:.2f}%</code>"
             )
 
-            flow_label = "ورود پول خالص"
+            flow_label = (
+                "ورود پول / حجم معامله‌شده"
+            )
 
             advice = (
-                "🎯 <b>توصیه:</b> بررسی چارت در تایم‌فریم "
-                "۱۵ دقیقه و ورود پله‌ای."
+                "🎯 <b>توصیه:</b> بررسی چارت در "
+                "تایم‌فریم ۱۵ دقیقه و ورود پله‌ای."
             )
 
         else:
 
             if is_pump_labeled:
+
                 header = (
                     "💥 <b>دامپ ناگهانی شناسایی شد "
                     "(SUDDEN DUMP DETECTED)</b> 💥"
                 )
+
             else:
+
                 header = (
                     "🔻 <b>خروج پول هوشمند "
                     "(SMART MONEY OUT)</b> 🔻"
                 )
 
             price_line = (
-                f"📉 <b>افت قیمت اخیر:</b> "
+                "📉 <b>افت قیمت کندل ۵ دقیقه‌ای:</b> "
                 f"<code>{self.change_5m:.2f}%</code>"
             )
 
-            flow_label = "خروج پول خالص (تخمینی)"
-
-            advice = (
-                "🎯 <b>توصیه:</b> احتمال توزیع/خروج نهنگ؛ "
-                "احتیاط در نگهداری پوزیشن."
+            flow_label = (
+                "خروج پول / حجم معامله‌شده"
             )
 
-        # --------------------------------------------------------------
-        # Detection information
-        # --------------------------------------------------------------
+            advice = (
+                "🎯 <b>توصیه:</b> احتمال توزیع/خروج؛ "
+                "احتیاط در نگهداری پوزیشن."
+            )
 
         detection_line = ""
 
         if self.trigger == TriggerType.STATIC:
 
             detection_line = (
-                "🔎 <b>نوع تشخیص:</b> عبور از آستانه ثابت "
-                "درصدی + جهش حجم\n"
+                "🔎 <b>نوع تشخیص:</b> "
+                "جهش حجم نسبت به میانگین "
+                f"{self.baseline_candles} کندل قبلی\n"
             )
 
         elif self.trigger == TriggerType.STATISTICAL:
@@ -180,8 +146,8 @@ class MarketSignal:
             )
 
             detection_line = (
-                "🔎 <b>نوع تشخیص:</b> ناهنجاری آماری قیمت "
-                "نسبت به رفتار ۷۲ ساعت اخیر "
+                "🔎 <b>نوع تشخیص:</b> "
+                "ناهنجاری آماری نسبت به رفتار ۷۲ ساعت اخیر "
                 f"(<code>{esc(z)}</code>)\n"
             )
 
@@ -194,14 +160,19 @@ class MarketSignal:
             )
 
             detection_line = (
-                "🔎 <b>نوع تشخیص:</b> هم آستانه ثابت و هم "
-                "ناهنجاری آماری "
+                "🔎 <b>نوع تشخیص:</b> "
+                "جهش حجم + ناهنجاری آماری "
                 f"(<code>{esc(z)}</code>)\n"
             )
 
-        # --------------------------------------------------------------
-        # Final message
-        # --------------------------------------------------------------
+        baseline_line = ""
+
+        if self.baseline_volume_usd > 0:
+
+            baseline_line = (
+                "📏 <b>میانگین حجم ۴۸ کندل قبلی:</b> "
+                f"<code>${self.baseline_volume_usd / 1e3:,.1f}K</code>\n"
+            )
 
         return (
             f"{header}\n\n"
@@ -211,7 +182,7 @@ class MarketSignal:
             f"<i>(موجود در نوبیتکس)</i>\n"
 
             f"💵 <b>قیمت جهانی:</b> "
-            f"${self.price:,.4f}\n"
+            f"${self.price:,.8f}\n"
 
             f"📊 <b>تغییرات ۲۴ ساعته:</b> "
             f"<code>{self.change_24h:+.2f}%</code>\n\n"
@@ -221,42 +192,27 @@ class MarketSignal:
             f"🔥 <b>{esc(flow_label)}:</b> "
             f"<code>${self.inflow_usd / 1e3:,.1f}K</code>\n"
 
+            f"📊 <b>حجم کندل بسته‌شده:</b> "
+            f"<code>${self.current_candle_volume_usd / 1e3:,.1f}K</code>\n"
+
+            f"{baseline_line}"
+
             f"⚡ <b>جهش حجم معاملاتی:</b> "
-            f"<code>{self.spike_multiplier:.1f}X</code> "
-            f"برابر میانگین "
-            f"{self.volume_baseline_candles} کندل گذشته\n"
-
-            f"📚 <b>دوره بررسی حجم:</b> "
-            f"<code>"
-            f"{self.volume_baseline_candles * 5 / 60:.1f}"
-            f" ساعت"
-            f"</code>\n"
-
-            f"📈 <b>دوره بررسی پامپ/دامپ:</b> "
-            f"<code>"
-            f"{self.price_baseline_candles * 5 / 60:.0f}"
-            f" ساعت"
-            f"</code>\n"
+            f"<code>{self.spike_multiplier:.2f}X</code> "
+            f"نسبت به میانگین\n"
 
             f"{detection_line}\n"
 
             f"{advice}\n"
 
-            f"<i>"
-            f"منبع: تیکر صرافی "
-            f"(Volume/Price Ticker Signal)"
+            f"<i>منبع: "
+            f"5m Closed Candle Volume/Price Signal"
             f"</i>"
         )
 
 
 @dataclass
 class ExchangeFlowSignal:
-    """
-    On-chain signal:
-    large transfer into/out of a known exchange wallet.
-
-    This signal is completely independent from MarketSignal.
-    """
 
     chain: str
 
@@ -275,9 +231,15 @@ class ExchangeFlowSignal:
     def to_telegram(self) -> str:
 
         explorer = {
-            "ETH": "https://etherscan.io/tx/",
-            "BSC": "https://bscscan.com/tx/",
-            "TRON": "https://tronscan.org/#/transaction/",
+            "ETH": (
+                "https://etherscan.io/tx/"
+            ),
+            "BSC": (
+                "https://bscscan.com/tx/"
+            ),
+            "TRON": (
+                "https://tronscan.org/#/transaction/"
+            ),
         }.get(
             self.chain,
             "",
@@ -289,10 +251,6 @@ class ExchangeFlowSignal:
             else self.tx_hash
         )
 
-        # --------------------------------------------------------------
-        # Direction
-        # --------------------------------------------------------------
-
         if self.direction == SignalDirection.INFLOW:
 
             header = (
@@ -301,8 +259,8 @@ class ExchangeFlowSignal:
             )
 
             advice = (
-                "🎯 <b>توصیه:</b> احتمال افزایش فشار فروش؛ "
-                "دارایی در حال واریز به کیف‌پول صرافی است."
+                "🎯 <b>توصیه:</b> احتمال افزایش "
+                "فشار فروش؛ دارایی به کیف‌پول صرافی وارد شده."
             )
 
         else:
@@ -313,13 +271,9 @@ class ExchangeFlowSignal:
             )
 
             advice = (
-                "🎯 <b>توصیه:</b> احتمال کاهش عرضه در بازار؛ "
-                "دارایی در حال خروج به کیف شخصی/کلد استوریج است."
+                "🎯 <b>توصیه:</b> احتمال کاهش عرضه؛ "
+                "دارایی از صرافی خارج شده."
             )
-
-        # --------------------------------------------------------------
-        # Final message
-        # --------------------------------------------------------------
 
         return (
             f"{header}\n\n"
@@ -334,22 +288,17 @@ class ExchangeFlowSignal:
             f"{esc(self.exchange_name)}\n"
 
             f"📦 <b>مقدار:</b> "
-            f"<code>"
-            f"{self.amount_native:,.4f} "
-            f"{esc(self.token_symbol)}"
-            f"</code>\n"
+            f"<code>{self.amount_native:,.4f} "
+            f"{esc(self.token_symbol)}</code>\n"
 
             f"💰 <b>ارزش تراکنش:</b> "
             f"${self.amount_usd:,.0f}\n"
 
             f'🔗 <a href="{esc(link)}">'
-            f"مشاهده تراکنش"
-            f"</a>\n\n"
+            f"مشاهده تراکنش</a>\n\n"
 
             f"{advice}\n"
 
-            f"<i>"
-            f"منبع: تحلیل آن‌چین کیف‌پول‌های شناخته‌شده "
-            f"صرافی (On-chain Wallet Signal)"
-            f"</i>"
+            f"<i>منبع: تحلیل آن‌چین کیف‌پول‌های "
+            f"شناخته‌شده صرافی</i>"
         )
