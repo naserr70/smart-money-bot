@@ -35,9 +35,9 @@ The two sources are completely isolated.
 
 GitHub persistence
 ------------------
-If configured, local dirty candle files are saved every cycle.
-Full GitHub Trees-based backup is available via github_candle_backup.py
-when GITHUB_TOKEN / GITHUB_REPO (or GITHUB_CANDLE_*) are set.
+Local dirty candle files are saved every cycle.
+When GITHUB_TOKEN + GITHUB_REPO are set, GitHubCandleBackup
+periodically uploads changed files in a single Trees API commit.
 """
 
 import logging
@@ -57,6 +57,7 @@ from candle_store import CandleStore
 from config import settings
 from exchange_flow import ExchangeFlowTracker
 from formatting import esc
+from github_candle_backup import GitHubCandleBackup
 from market_analyzer import MarketAnalyzer
 from state import BotState
 from telegram_notifier import TelegramNotifier
@@ -196,6 +197,33 @@ log.info(
 
 
 # ============================================================
+# GitHub candle backup (Trees API, single-commit batches)
+# ============================================================
+
+github_backup = GitHubCandleBackup(
+    session=http_session,
+    repo=settings.github_repo,
+    token=settings.github_token,
+    branch=settings.github_branch,
+    root_path=settings.github_candle_path,
+    timeout=settings.github_http_timeout_sec,
+    max_retries=settings.github_max_retries,
+)
+
+if github_backup.is_configured():
+    log.info(
+        "GITHUB CANDLE BACKUP CONFIGURED | repo=%s branch=%s",
+        settings.github_repo,
+        settings.github_branch,
+    )
+else:
+    log.warning(
+        "GITHUB CANDLE BACKUP DISABLED | "
+        "set GITHUB_TOKEN and GITHUB_REPO to enable"
+    )
+
+
+# ============================================================
 # Market analyzer
 # ============================================================
 
@@ -248,19 +276,83 @@ def broadcast_targets():
     )
 
 
+def queue_dirty_to_github() -> int:
+    """
+    After local save, queue dirty (just-saved) payloads to GitHub backup.
+
+    Returns number of files newly queued.
+    """
+
+    if not github_backup.is_configured():
+        return 0
+
+    queued = 0
+
+    for source in ("binance", "kucoin"):
+        # Symbols that were dirty before save_dirty cleared them are gone;
+        # re-scan in-memory closed histories and queue any that differ.
+        # Practical approach: queue every symbol that currently has history
+        # and let the backup module hash-dedupe unchanged content.
+        try:
+            with candle_store._lock:
+                symbols = list(
+                    candle_store._closed.get(source, {}).keys()
+                )
+        except Exception:
+            symbols = []
+
+        for symbol in symbols:
+            try:
+                payload = candle_store.to_payload(source, symbol)
+                if github_backup.queue(source, symbol, payload):
+                    queued += 1
+            except Exception:
+                log.exception(
+                    "GITHUB QUEUE FAILED | source=%s symbol=%s",
+                    source,
+                    symbol,
+                )
+
+    return queued
+
+
 def save_candle_store():
-    """Best-effort local persistence of dirty candle files."""
+    """Best-effort local persistence + optional GitHub queue."""
 
     try:
         candle_store.save_dirty()
     except Exception:
         log.exception("CANDLE STORE SAVE FAILED")
+        return
+
+    try:
+        queued = queue_dirty_to_github()
+        if queued:
+            log.info(
+                "GITHUB QUEUE | newly_queued=%s pending=%s",
+                queued,
+                github_backup.pending_count(),
+            )
+    except Exception:
+        log.exception("GITHUB QUEUE STEP FAILED")
 
 
 def start_candle_store():
-    """CandleStore does not require a background thread for local saves."""
+    """Start GitHub backup background loop when configured."""
 
-    log.info("CANDLE STORE BACKGROUND WORKER NOT REQUIRED")
+    if github_backup.is_configured():
+        try:
+            github_backup.start_background_loop(
+                interval_sec=settings.github_candle_sync_interval_sec
+            )
+            log.info(
+                "GITHUB CANDLE BACKUP LOOP STARTED | interval=%ss",
+                settings.github_candle_sync_interval_sec,
+            )
+        except Exception:
+            log.exception("GITHUB CANDLE BACKUP LOOP START FAILED")
+    else:
+        log.info("CANDLE STORE BACKGROUND WORKER NOT REQUIRED")
 
 
 # ============================================================
@@ -702,12 +794,15 @@ def status():
 
     try:
 
+        backup_status = github_backup.status()
+
         health["candle_store"] = {
             "root_path": settings.candle_store_path,
             "max_candles": settings.history_candle_limit,
             "github_enabled": (
                 settings.github_candle_store_enabled
             ),
+            "github_backup": backup_status,
         }
 
     except Exception:
@@ -729,6 +824,11 @@ def build_admin_status_text() -> str:
 
     gist_active = bool(
         settings.github_gist_id and settings.github_gist_token
+    )
+
+    backup_ok = (
+        github_backup.is_configured()
+        and github_backup.status().get("last_backup_ok")
     )
 
     lines = [
@@ -782,6 +882,11 @@ def build_admin_status_text() -> str:
         (
             f"☁️ پشتیبان GitHub کندل: "
             f"<code>{'فعال' if settings.github_candle_store_enabled else 'غیرفعال'}</code>"
+        ),
+
+        (
+            f"☁️ آخرین بک‌آپ: "
+            f"<code>{'موفق' if backup_ok else '—'}</code>"
         ),
 
         (
@@ -869,6 +974,12 @@ def shutdown_persistence():
         save_candle_store()
     except Exception:
         log.exception("FINAL CANDLE STORE SAVE FAILED")
+
+    try:
+        if github_backup.is_configured():
+            github_backup.backup()
+    except Exception:
+        log.exception("FINAL GITHUB BACKUP FAILED")
 
     try:
         state.save()

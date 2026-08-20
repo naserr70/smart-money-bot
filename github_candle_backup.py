@@ -33,17 +33,22 @@ its commit, GitHub can reject the branch update with:
 This implementation detects that condition, refreshes the branch HEAD,
 rebuilds the tree/commit, and retries automatically.
 
-Environment variables:
+Environment variables (primary):
+
+    GITHUB_TOKEN
+    GITHUB_REPO
+
+Also accepted for backward compatibility:
 
     GITHUB_CANDLE_REPO
     GITHUB_GIST_TOKEN
 
 Optional:
 
-    GITHUB_CANDLE_BRANCH=main
-    GITHUB_CANDLE_PATH=market_history
-    GITHUB_CANDLE_BACKUP_INTERVAL_SEC=300
-    GITHUB_CANDLE_MAX_RETRIES=5
+    GITHUB_BRANCH / GITHUB_CANDLE_BRANCH = main
+    GITHUB_CANDLE_PATH = market_history
+    GITHUB_CANDLE_SYNC_INTERVAL_SEC / GITHUB_CANDLE_BACKUP_INTERVAL_SEC = 300
+    GITHUB_MAX_RETRIES / GITHUB_CANDLE_MAX_RETRIES = 5
 """
 
 import base64
@@ -53,7 +58,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 import requests
 
@@ -72,6 +77,14 @@ VALID_SOURCES = {
     SOURCE_BINANCE,
     SOURCE_KUCOIN,
 }
+
+
+def _first_env(*keys: str, default: str = "") -> str:
+    for key in keys:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return default
 
 
 class GitHubCandleBackup:
@@ -97,54 +110,48 @@ class GitHubCandleBackup:
         self.session = session
 
         self.repo = (
-            repo
-            or os.environ.get(
-                "GITHUB_CANDLE_REPO",
-                "",
-            ).strip()
+            (repo or "").strip()
+            or _first_env("GITHUB_REPO", "GITHUB_CANDLE_REPO")
         )
 
         self.token = (
-            token
-            or os.environ.get(
-                "GITHUB_GIST_TOKEN",
-                "",
-            ).strip()
+            (token or "").strip()
+            or _first_env("GITHUB_TOKEN", "GITHUB_GIST_TOKEN")
         )
 
         self.branch = (
-            branch
-            or os.environ.get(
+            (branch or "").strip()
+            or _first_env(
+                "GITHUB_BRANCH",
                 "GITHUB_CANDLE_BRANCH",
-                DEFAULT_BRANCH,
-            ).strip()
+                default=DEFAULT_BRANCH,
+            )
             or DEFAULT_BRANCH
         )
 
         self.root_path = (
-            root_path
-            or os.environ.get(
+            (root_path or "").strip()
+            or _first_env(
                 "GITHUB_CANDLE_PATH",
-                DEFAULT_ROOT_PATH,
-            ).strip()
+                default=DEFAULT_ROOT_PATH,
+            )
             or DEFAULT_ROOT_PATH
         ).strip("/")
 
-        self.timeout = max(
-            5,
-            int(timeout),
-        )
+        self.timeout = max(5, int(timeout))
 
-        self.max_retries = max(
-            1,
-            int(
-                max_retries
-                or os.environ.get(
-                    "GITHUB_CANDLE_MAX_RETRIES",
-                    DEFAULT_MAX_RETRIES,
-                )
-            ),
-        )
+        if max_retries is not None:
+            self.max_retries = max(1, int(max_retries))
+        else:
+            raw = _first_env(
+                "GITHUB_MAX_RETRIES",
+                "GITHUB_CANDLE_MAX_RETRIES",
+                default=str(DEFAULT_MAX_RETRIES),
+            )
+            try:
+                self.max_retries = max(1, int(raw))
+            except (TypeError, ValueError):
+                self.max_retries = DEFAULT_MAX_RETRIES
 
         self.api_base = "https://api.github.com"
 
@@ -167,10 +174,7 @@ class GitHubCandleBackup:
     # =========================================================
 
     def is_configured(self) -> bool:
-        return bool(
-            self.repo
-            and self.token
-        )
+        return bool(self.repo and self.token)
 
     def status(self) -> dict:
         with self._lock:
@@ -693,7 +697,7 @@ class GitHubCandleBackup:
 
             log.warning(
                 "GITHUB CANDLE BACKUP SKIPPED | "
-                "GITHUB_CANDLE_REPO or GITHUB_GIST_TOKEN missing"
+                "GITHUB_TOKEN / GITHUB_REPO missing"
             )
 
             return False
@@ -752,10 +756,6 @@ class GitHubCandleBackup:
                     self.max_retries,
                 )
 
-                # ---------------------------------------------
-                # 1. Read the CURRENT branch HEAD.
-                # ---------------------------------------------
-
                 branch = self._get_branch()
 
                 if not branch:
@@ -796,10 +796,6 @@ class GitHubCandleBackup:
                     parent_sha[:12],
                 )
 
-                # ---------------------------------------------
-                # 2. Get current tree.
-                # ---------------------------------------------
-
                 base_tree_sha = (
                     self._get_commit_tree_sha(
                         parent_sha
@@ -814,10 +810,6 @@ class GitHubCandleBackup:
 
                     continue
 
-                # ---------------------------------------------
-                # 3. Build tree from CURRENT HEAD.
-                # ---------------------------------------------
-
                 tree_sha = self._create_tree(
                     base_tree_sha,
                     files,
@@ -830,10 +822,6 @@ class GitHubCandleBackup:
                     )
 
                     continue
-
-                # ---------------------------------------------
-                # 4. Create commit whose parent is CURRENT HEAD.
-                # ---------------------------------------------
 
                 commit_sha = self._create_commit(
                     tree_sha,
@@ -855,10 +843,6 @@ class GitHubCandleBackup:
                     parent_sha[:12],
                 )
 
-                # ---------------------------------------------
-                # 5. Atomically move branch.
-                # ---------------------------------------------
-
                 success, conflict = (
                     self._update_branch(
                         commit_sha,
@@ -870,12 +854,6 @@ class GitHubCandleBackup:
 
                     with self._lock:
 
-                        # Only remove the exact files that were
-                        # included in this commit.
-                        #
-                        # If a newer candle arrived while backup
-                        # was running, its newer content remains
-                        # in _pending and will be uploaded next time.
                         for path, content in files.items():
 
                             if (
@@ -903,10 +881,6 @@ class GitHubCandleBackup:
 
                     return True
 
-                # ---------------------------------------------
-                # 6. Branch changed.
-                # ---------------------------------------------
-
                 if conflict:
 
                     log.warning(
@@ -924,7 +898,6 @@ class GitHubCandleBackup:
 
                     continue
 
-                # Other branch update error.
                 self._sleep_retry(
                     attempt
                 )
@@ -951,7 +924,6 @@ class GitHubCandleBackup:
         conflict: bool = False,
     ) -> None:
 
-        # Conflicts should be retried fairly quickly.
         if conflict:
 
             delay = min(
@@ -1222,27 +1194,5 @@ def build_github_candle_backup(
 
     return GitHubCandleBackup(
         session=session,
-        repo=os.environ.get(
-            "GITHUB_CANDLE_REPO",
-            "",
-        ).strip(),
-        token=os.environ.get(
-            "GITHUB_GIST_TOKEN",
-            "",
-        ).strip(),
-        branch=os.environ.get(
-            "GITHUB_CANDLE_BRANCH",
-            DEFAULT_BRANCH,
-        ).strip(),
-        root_path=os.environ.get(
-            "GITHUB_CANDLE_PATH",
-            DEFAULT_ROOT_PATH,
-        ).strip(),
         timeout=timeout,
-        max_retries=int(
-            os.environ.get(
-                "GITHUB_CANDLE_MAX_RETRIES",
-                DEFAULT_MAX_RETRIES,
-            )
-        ),
     )
