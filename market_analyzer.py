@@ -118,27 +118,12 @@ class MarketAnalyzer:
         self._last_signaled_open_time: Dict[str, int] = {}
         self._startup_bootstrap_done = False
 
-    # =========================================================
-    # STARTUP BOOTSTRAP (864 candles + GitHub restore)
-    # =========================================================
-
     def bootstrap_histories(
         self,
         github_backup=None,
         symbols: Optional[List[str]] = None,
         target_count: int = PUMP_HISTORY_CANDLES,
     ) -> dict:
-        """
-        Ensure each live exchange has up to `target_count` (864) closed
-        candles per listed symbol.
-
-        Order per symbol:
-          1) local load
-          2) GitHub restore (if configured)
-          3) download from exchange API
-
-        Returns summary counters.
-        """
 
         if self._startup_bootstrap_done:
             log.info("STARTUP BOOTSTRAP SKIPPED | already completed")
@@ -187,7 +172,6 @@ class MarketAnalyzer:
                 stats["sources"][source] = {"symbols": 0, "seeded": 0}
                 continue
 
-            # Only symbols that actually trade on this exchange.
             symbols_for_source = [
                 s for s in symbol_list if s in tickers
             ]
@@ -203,7 +187,6 @@ class MarketAnalyzer:
             for symbol in symbols_for_source:
 
                 try:
-                    # 1) local
                     self.candle_store.load(source, symbol)
                     count = self.candle_store.count(source, symbol)
 
@@ -215,7 +198,6 @@ class MarketAnalyzer:
                     if count > 0:
                         stats["local_ok"] += 1
 
-                    # 2) GitHub restore
                     if (
                         count < target_count
                         and github_backup is not None
@@ -261,7 +243,6 @@ class MarketAnalyzer:
                     if count >= target_count:
                         continue
 
-                    # 3) Exchange API download
                     candles = self.provider.fetch_candles(
                         source=source,
                         symbol=symbol,
@@ -295,7 +276,6 @@ class MarketAnalyzer:
                         self.candle_store.count(source, symbol),
                     )
 
-                    # Mild pacing to reduce rate-limit risk.
                     time.sleep(0.05)
 
                 except Exception:
@@ -952,6 +932,7 @@ class MarketAnalyzer:
             trigger=trigger,
             zscore=zscore,
             source=source,
+            path=path,
         )
 
         self.state.mark_alerted(
@@ -1009,16 +990,10 @@ class MarketAnalyzer:
         ).strftime("%H:%M:%S")
 
         return (
-            "🟢 <b>گزارش رصد زنده مارکت</b>\n\n"
-            f"⏰ <b>زمان (UTC):</b> "
-            f"<code>{now_utc}</code>\n"
-            f"🌐 <b>منبع فعال:</b> "
-            f"<code>{esc(source_label)}</code>\n"
-            f"🔍 <b>ارزهای آنالیز شده:</b> "
-            f"<code>{symbols_scanned}</code>\n"
-            f"📥 <b>سیگنال ورود:</b> "
-            f"<code>{inflow_count}</code>\n"
-            f"📤 <b>سیگنال خروج:</b> "
-            f"<code>{outflow_count}</code>\n"
-            "📡 <b>وضعیت:</b> فعال"
+            "📡 <b>وضعیت رصد</b>\n\n"
+            f"⏰ <code>{now_utc}</code> UTC\n"
+            f"🌐 منبع: <code>{esc(source_label)}</code>\n"
+            f"🔍 نمادها: <code>{symbols_scanned}</code>\n"
+            f"🟢 ورود: <code>{inflow_count}</code>  "
+            f"🔴 خروج: <code>{outflow_count}</code>"
         )
