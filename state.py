@@ -1,8 +1,14 @@
 """
 Thread-safe bot state.
 
-Market candle history is delegated to CandleStore.
-Cooldowns and transaction dedupe remain here.
+Candle history belongs exclusively to CandleStore and is injected into
+the market analyzer.
+
+BotState stores:
+- cooldowns
+- transaction dedupe
+- health
+- lightweight persistent state
 """
 
 import json
@@ -14,7 +20,6 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from candle_store import CandleStore
 
 log = logging.getLogger("smart_money_bot.state")
 
@@ -27,22 +32,32 @@ class BotState:
         state_file_path: Optional[str] = None,
         candle_store_path: str = "market_history",
     ):
+        # candle_store_path is retained for backward compatibility.
+        # Candle history is NO LONGER created here.
+        del candle_store_path
+
         self._lock = threading.RLock()
 
-        self._history_window = history_window
-        self._state_file_path = state_file_path
+        self._history_window = int(
+            history_window
+        )
 
-        self.previous_market_snapshot: Dict[str, dict] = {}
+        self._state_file_path = (
+            state_file_path
+        )
 
-        self.last_alert_time: Dict[str, float] = {}
+        self.previous_market_snapshot: Dict[
+            str,
+            dict,
+        ] = {}
+
+        self.last_alert_time: Dict[
+            str,
+            float,
+        ] = {}
 
         self.seen_tx_hashes = deque(
             maxlen=5000
-        )
-
-        self.candles = CandleStore(
-            root_path=candle_store_path,
-            max_candles=864,
         )
 
         self.health = {
@@ -51,14 +66,18 @@ class BotState:
             "last_error": None,
             "market_cycles_completed": 0,
             "whale_cycles_completed": 0,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
         }
+
+        self._autosave_started = False
 
         self._load()
 
-    # ---------------------------------------------------------
-    # cooldown
-    # ---------------------------------------------------------
+    # =========================================================
+    # COOLDOWN
+    # =========================================================
 
     def is_in_cooldown(
         self,
@@ -66,45 +85,71 @@ class BotState:
         cooldown_sec: int,
     ) -> bool:
 
+        if cooldown_sec <= 0:
+            return False
+
         with self._lock:
             last = self.last_alert_time.get(key)
 
         if last is None:
             return False
 
-        return (time.time() - last) < cooldown_sec
+        return (
+            time.time() - last
+        ) < cooldown_sec
 
-    def mark_alerted(self, key: str) -> None:
+    def mark_alerted(
+        self,
+        key: str,
+    ) -> None:
+
         with self._lock:
-            self.last_alert_time[key] = time.time()
+            self.last_alert_time[key] = (
+                time.time()
+            )
 
-    # ---------------------------------------------------------
-    # snapshots
-    # ---------------------------------------------------------
+    # =========================================================
+    # SNAPSHOTS
+    # =========================================================
 
-    def swap_snapshot(self, new_snapshot: dict) -> dict:
+    def swap_snapshot(
+        self,
+        new_snapshot: dict,
+    ) -> dict:
+
         with self._lock:
             old = self.previous_market_snapshot
-            self.previous_market_snapshot = new_snapshot
+            self.previous_market_snapshot = (
+                new_snapshot
+            )
             return old
 
-    # ---------------------------------------------------------
-    # transactions
-    # ---------------------------------------------------------
+    # =========================================================
+    # TRANSACTIONS
+    # =========================================================
 
-    def is_new_tx(self, tx_hash: str) -> bool:
+    def is_new_tx(
+        self,
+        tx_hash: str,
+    ) -> bool:
+
+        if not tx_hash:
+            return False
 
         with self._lock:
+
             if tx_hash in self.seen_tx_hashes:
                 return False
 
-            self.seen_tx_hashes.append(tx_hash)
+            self.seen_tx_hashes.append(
+                tx_hash
+            )
 
             return True
 
-    # ---------------------------------------------------------
-    # health
-    # ---------------------------------------------------------
+    # =========================================================
+    # HEALTH
+    # =========================================================
 
     def record_market_cycle(
         self,
@@ -112,12 +157,20 @@ class BotState:
     ) -> None:
 
         with self._lock:
-            self.health["last_market_cycle_at"] = (
-                datetime.now(timezone.utc).isoformat()
-            )
 
-            self.health["market_cycles_completed"] += 1
-            self.health["last_error"] = error
+            self.health[
+                "last_market_cycle_at"
+            ] = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            self.health[
+                "market_cycles_completed"
+            ] += 1
+
+            self.health[
+                "last_error"
+            ] = error
 
     def record_whale_cycle(
         self,
@@ -125,64 +178,109 @@ class BotState:
     ) -> None:
 
         with self._lock:
-            self.health["last_whale_cycle_at"] = (
-                datetime.now(timezone.utc).isoformat()
-            )
 
-            self.health["whale_cycles_completed"] += 1
+            self.health[
+                "last_whale_cycle_at"
+            ] = datetime.now(
+                timezone.utc
+            ).isoformat()
 
-            if error:
-                self.health["last_error"] = error
+            self.health[
+                "whale_cycles_completed"
+            ] += 1
+
+            if error is not None:
+                self.health[
+                    "last_error"
+                ] = error
 
     def snapshot_health(self) -> dict:
-        with self._lock:
-            return dict(self.health)
 
-    # ---------------------------------------------------------
-    # persistence
-    # ---------------------------------------------------------
+        with self._lock:
+            return dict(
+                self.health
+            )
+
+    # =========================================================
+    # PERSISTENCE
+    # =========================================================
 
     def _load(self) -> None:
 
-        if (
-            not self._state_file_path
-            or not os.path.exists(self._state_file_path)
-        ):
+        path = self._state_file_path
+
+        if not path or not os.path.exists(path):
             return
 
         try:
+
             with open(
-                self._state_file_path,
+                path,
                 "r",
                 encoding="utf-8",
-            ) as f:
-                data = json.load(f)
+            ) as file:
+
+                data = json.load(file)
+
+            if not isinstance(data, dict):
+                return
 
             with self._lock:
-                self.last_alert_time = data.get(
+
+                loaded_alerts = data.get(
                     "last_alert_time",
                     {},
                 )
 
+                self.last_alert_time = (
+                    loaded_alerts
+                    if isinstance(
+                        loaded_alerts,
+                        dict,
+                    )
+                    else {}
+                )
+
+                loaded_hashes = data.get(
+                    "seen_tx_hashes",
+                    [],
+                )
+
+                if not isinstance(
+                    loaded_hashes,
+                    list,
+                ):
+                    loaded_hashes = []
+
                 self.seen_tx_hashes = deque(
-                    data.get("seen_tx_hashes", []),
+                    loaded_hashes,
                     maxlen=5000,
                 )
 
-        except (OSError, json.JSONDecodeError) as e:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            TypeError,
+        ) as exc:
+
             log.warning(
-                "بازیابی state ناموفق بود: %s",
-                e,
+                "STATE LOAD FAILED | error=%s",
+                exc,
             )
 
     def save(self) -> None:
 
-        if not self._state_file_path:
+        path = self._state_file_path
+
+        if not path:
             return
 
         with self._lock:
+
             payload = {
-                "last_alert_time": self.last_alert_time,
+                "last_alert_time": dict(
+                    self.last_alert_time
+                ),
                 "seen_tx_hashes": list(
                     self.seen_tx_hashes
                 ),
@@ -191,56 +289,91 @@ class BotState:
                 ).isoformat(),
             }
 
-        tmp_path = f"{self._state_file_path}.tmp"
+        directory = os.path.dirname(
+            os.path.abspath(path)
+        )
 
         try:
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
+
+            tmp_path = (
+                f"{path}.tmp"
+            )
+
             with open(
                 tmp_path,
                 "w",
                 encoding="utf-8",
-            ) as f:
+            ) as file:
+
                 json.dump(
                     payload,
-                    f,
+                    file,
                     ensure_ascii=False,
+                    indent=2,
+                )
+
+                file.flush()
+                os.fsync(
+                    file.fileno()
                 )
 
             os.replace(
                 tmp_path,
-                self._state_file_path,
+                path,
             )
 
-        except OSError as e:
+        except OSError as exc:
+
             log.warning(
-                "ذخیره state ناموفق بود: %s",
-                e,
+                "STATE SAVE FAILED | error=%s",
+                exc,
             )
 
-    def save_market_history(self) -> None:
-        self.candles.save_dirty()
+    # =========================================================
+    # AUTOSAVE
+    # =========================================================
 
     def start_autosave(
         self,
         interval_sec: int,
     ) -> None:
 
+        interval_sec = int(
+            interval_sec
+        )
+
         if interval_sec <= 0:
             return
 
+        with self._lock:
+
+            if self._autosave_started:
+                return
+
+            self._autosave_started = True
+
         def _loop():
+
             while True:
-                time.sleep(interval_sec)
+
+                time.sleep(
+                    interval_sec
+                )
 
                 try:
                     self.save()
-                    self.save_market_history()
 
                 except Exception:
                     log.exception(
-                        "خطا در autosave"
+                        "STATE AUTOSAVE FAILED"
                     )
 
         threading.Thread(
             target=_loop,
             daemon=True,
+            name="state-autosave",
         ).start()
