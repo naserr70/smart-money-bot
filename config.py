@@ -78,7 +78,15 @@ class Settings:
     price_pump_max: float = field(default_factory=lambda: _env_float("PRICE_PUMP_MAX", 8.0))
     alert_cooldown_sec: int = field(default_factory=lambda: _env_int("ALERT_COOLDOWN_SEC", 1800))
     scan_interval_sec: int = field(default_factory=lambda: _env_int("SCAN_INTERVAL_SEC", 300))
-    history_window: int = field(default_factory=lambda: _env_int("HISTORY_WINDOW", 12))
+    # 36 candles = 3 hours of 5-min data. 12 (1 hour) was too thin — the
+    # standard error of a 12-sample mean is noticeably larger, so the
+    # baseline itself could jump around from 1-2 unusual candles. 36 cuts
+    # that noise by ~40% while still being responsive enough to track real
+    # shifts in a coin's typical volume within a few hours. Still a purely
+    # trailing window though — it doesn't know "this hour is normally
+    # quieter" the way a same-hour-across-days average would; that's a
+    # separate, bigger feature if you want full time-of-day awareness.
+    history_window: int = field(default_factory=lambda: _env_int("HISTORY_WINDOW", 36))
     pump_zscore_enabled: bool = field(default_factory=lambda: _env_bool("PUMP_ZSCORE_ENABLED", True))
     pump_zscore_threshold: float = field(default_factory=lambda: _env_float("PUMP_ZSCORE_THRESHOLD", 3.0))
 
