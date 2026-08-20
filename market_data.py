@@ -1,17 +1,17 @@
 """
-Independent Binance / KuCoin market data provider.
+Independent Binance / Bybit / KuCoin market data provider.
 
 Rules
 -----
-- Binance and KuCoin are completely independent.
+- Each exchange is completely independent.
 - No history is copied between exchanges.
 - Each exchange maintains its own candle history.
-- MarketAnalyzer chooses Binance for the current analysis cycle
-  when available, otherwise KuCoin.
+- Analysis priority for the active cycle:
+    Binance → Bybit → KuCoin
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import requests
 
@@ -34,6 +34,9 @@ BINANCE_KLINES_ENDPOINTS = (
     "https://api3.binance.com/api/v3/klines",
     "https://api.binance.com/api/v3/klines",
 )
+
+BYBIT_TICKER_ENDPOINT = "https://api.bybit.com/v5/market/tickers"
+BYBIT_KLINES_ENDPOINT = "https://api.bybit.com/v5/market/kline"
 
 KUCOIN_TICKER_ENDPOINT = (
     "https://api.kucoin.com/api/v1/market/allTickers"
@@ -156,6 +159,102 @@ class MarketDataProvider:
         )
 
         return {}
+
+    def fetch_bybit(self) -> Dict[str, dict]:
+        """
+        Bybit v5 spot tickers (public, no auth).
+
+        price24hPcnt is a ratio (e.g. 0.05 = +5%).
+        turnover24h is quote volume in USDT for spot.
+        """
+
+        log.info("BYBIT TICKER FETCH START")
+
+        try:
+            response = self.session.get(
+                BYBIT_TICKER_ENDPOINT,
+                params={"category": "spot"},
+                timeout=self.timeout + 2,
+            )
+
+            if response.status_code != 200:
+                log.warning(
+                    "BYBIT TICKER HTTP ERROR | status=%s",
+                    response.status_code,
+                )
+                return {}
+
+            try:
+                payload = response.json()
+            except ValueError:
+                log.warning("BYBIT TICKER INVALID JSON")
+                return {}
+
+            if not isinstance(payload, dict):
+                return {}
+
+            if int(payload.get("retCode", -1)) != 0:
+                log.warning(
+                    "BYBIT TICKER API ERROR | retCode=%s retMsg=%s",
+                    payload.get("retCode"),
+                    payload.get("retMsg"),
+                )
+                return {}
+
+            result_block = payload.get("result") or {}
+            tickers = result_block.get("list") or []
+
+            if not isinstance(tickers, list):
+                return {}
+
+            result: Dict[str, dict] = {}
+
+            for item in tickers:
+
+                if not isinstance(item, dict):
+                    continue
+
+                symbol = str(item.get("symbol", "")).upper()
+
+                if symbol not in TARGET_SYMBOLS:
+                    continue
+
+                try:
+                    canonical = resolve_alias(symbol)
+
+                    # price24hPcnt is decimal ratio → percent
+                    pct = float(item.get("price24hPcnt", 0.0)) * 100.0
+
+                    result[canonical] = {
+                        "lastPrice": float(item["lastPrice"]),
+                        "quoteVolume": float(
+                            item.get("turnover24h")
+                            or item.get("turnover24H")
+                            or 0.0
+                        ),
+                        "priceChangePercent": pct,
+                    }
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+            log.info(
+                "BYBIT TICKER OK | symbols=%s",
+                len(result),
+            )
+
+            return result
+
+        except requests.RequestException as exc:
+            log.error(
+                "BYBIT TICKER FAILED | error=%s",
+                exc,
+            )
+            return {}
 
     def fetch_kucoin(self) -> Dict[str, dict]:
 
@@ -328,6 +427,94 @@ class MarketDataProvider:
 
         return None
 
+    def fetch_bybit_klines(
+        self,
+        symbol: str,
+        limit: int = 864,
+    ) -> Optional[list]:
+        """
+        Bybit v5 kline (spot).
+
+        Response list is newest-first:
+        [startTime, open, high, low, close, volume, turnover]
+        """
+
+        limit = max(1, min(int(limit), 1000))
+
+        params = {
+            "category": "spot",
+            "symbol": symbol,
+            "interval": "5",
+            "limit": limit,
+        }
+
+        try:
+            response = self.session.get(
+                BYBIT_KLINES_ENDPOINT,
+                params=params,
+                timeout=self.timeout + 2,
+            )
+
+            if response.status_code != 200:
+                log.warning(
+                    "BYBIT HISTORY HTTP ERROR | "
+                    "symbol=%s status=%s",
+                    symbol,
+                    response.status_code,
+                )
+                return None
+
+            try:
+                payload = response.json()
+            except ValueError:
+                log.warning(
+                    "BYBIT HISTORY INVALID JSON | symbol=%s",
+                    symbol,
+                )
+                return None
+
+            if not isinstance(payload, dict):
+                return None
+
+            if int(payload.get("retCode", -1)) != 0:
+                log.warning(
+                    "BYBIT HISTORY API ERROR | "
+                    "symbol=%s retCode=%s retMsg=%s",
+                    symbol,
+                    payload.get("retCode"),
+                    payload.get("retMsg"),
+                )
+                return None
+
+            result_block = payload.get("result") or {}
+            raw = result_block.get("list") or []
+
+            if not isinstance(raw, list):
+                return None
+
+            # Newest-first → oldest-first
+            raw = list(reversed(raw))
+            raw = raw[-limit:]
+
+            log.info(
+                "BYBIT HISTORY OK | "
+                "symbol=%s candles=%s/%s",
+                symbol,
+                len(raw),
+                limit,
+            )
+
+            return raw
+
+        except requests.RequestException as exc:
+            log.warning(
+                "BYBIT HISTORY ERROR | "
+                "symbol=%s error=%s",
+                symbol,
+                exc,
+            )
+            return None
+
     def fetch_kucoin_klines(
         self,
         symbol: str,
@@ -441,6 +628,37 @@ class MarketDataProvider:
 
         return candles
 
+    def fetch_bybit_candles(
+        self,
+        symbol: str,
+        limit: int = 864,
+    ):
+        from candle_store import Candle
+
+        raw = self.fetch_bybit_klines(
+            symbol,
+            limit,
+        )
+
+        if not raw:
+            return []
+
+        candles = []
+
+        for row in raw:
+            try:
+                candles.append(
+                    Candle.from_bybit(row)
+                )
+            except (
+                IndexError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        return candles
+
     def fetch_kucoin_candles(
         self,
         symbol: str,
@@ -472,8 +690,25 @@ class MarketDataProvider:
 
         return candles
 
+    def fetch_candles(
+        self,
+        source: str,
+        symbol: str,
+        limit: int = 864,
+    ):
+        source = source.lower().strip()
+
+        if source == "binance":
+            return self.fetch_binance_candles(symbol, limit)
+        if source == "bybit":
+            return self.fetch_bybit_candles(symbol, limit)
+        if source == "kucoin":
+            return self.fetch_kucoin_candles(symbol, limit)
+
+        raise ValueError(f"Unsupported market source: {source}")
+
     # =========================================================
-    # BOTH SOURCES
+    # ALL SOURCES
     # =========================================================
 
     def fetch_all_sources(
@@ -481,21 +716,22 @@ class MarketDataProvider:
     ) -> Tuple[
         Dict[str, dict],
         Dict[str, dict],
+        Dict[str, dict],
     ]:
-
-        # Fetch both independently.
-        #
-        # A failure in Binance does not prevent KuCoin from being
-        # queried, and vice versa.
+        """
+        Returns (binance, bybit, kucoin) tickers independently.
+        """
 
         binance = self.fetch_binance()
+        bybit = self.fetch_bybit()
         kucoin = self.fetch_kucoin()
 
         log.info(
             "MARKET SOURCES | "
-            "binance_symbols=%s | kucoin_symbols=%s",
+            "binance=%s | bybit=%s | kucoin=%s",
             len(binance),
+            len(bybit),
             len(kucoin),
         )
 
-        return binance, kucoin
+        return binance, bybit, kucoin
