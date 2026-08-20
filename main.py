@@ -727,6 +727,10 @@ def build_admin_status_text() -> str:
 
     health = state.snapshot_health()
 
+    gist_active = bool(
+        settings.github_gist_id and settings.github_gist_token
+    )
+
     lines = [
         "📈 <b>وضعیت ربات</b>\n",
 
@@ -737,7 +741,7 @@ def build_admin_status_text() -> str:
 
         (
             f"💾 حافظه کاربران: "
-            f"<code>{'فعال' if access.is_remote_enabled() else 'غیرفعال'}</code>"
+            f"<code>{'فعال (Gist)' if gist_active else 'محلی'}</code>"
         ),
 
         (
@@ -784,7 +788,8 @@ def build_admin_status_text() -> str:
             f"📊 سقف تاریخچه: "
             f"<code>{settings.history_candle_limit} کندل 5m</code>"
         ),
-    ]n
+    ]
+
     if health.get("last_error"):
 
         lines.append(
