@@ -1,10 +1,9 @@
 """
-Centralized configuration for Smart Money Bot.
+Centralized, validated configuration for the Smart Money Bot.
 """
 
 import json
 import os
-
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -13,6 +12,7 @@ def _env_str(
     key: str,
     default: str = "",
 ) -> str:
+
     return os.environ.get(
         key,
         default,
@@ -23,6 +23,7 @@ def _env_float(
     key: str,
     default: float,
 ) -> float:
+
     try:
         return float(
             os.environ.get(
@@ -41,6 +42,7 @@ def _env_int(
     key: str,
     default: int,
 ) -> int:
+
     try:
         return int(
             os.environ.get(
@@ -59,68 +61,46 @@ def _env_bool(
     key: str,
     default: bool,
 ) -> bool:
-    return _env_str(
-        key,
-        str(default),
-    ).lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+
+    return (
+        _env_str(
+            key,
+            str(default),
+        ).lower()
+        in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
     )
 
 
-DEFAULT_EXCHANGE_WALLETS = {
+DEFAULT_EXCHANGE_WALLETS: Dict[
+    str,
+    Dict[str, str],
+] = {
+
     "ETH": {
         "0x28c6c06298d514db089934071355e5743bf21d60":
             "Binance 14",
+
         "0xf977814e90da44bfa03b6295a0616a897441acec":
             "Binance Hot Wallet 20",
     },
+
     "BSC": {},
+
     "TRON": {},
 }
-
-
-def _load_exchange_wallets():
-    raw = os.environ.get(
-        "EXCHANGE_WALLETS_JSON",
-        "",
-    ).strip()
-
-    if not raw:
-        return DEFAULT_EXCHANGE_WALLETS
-
-    try:
-        parsed = json.loads(raw)
-
-        merged = {
-            chain: dict(addrs)
-            for chain, addrs
-            in DEFAULT_EXCHANGE_WALLETS.items()
-        }
-
-        for chain, addrs in parsed.items():
-            merged.setdefault(
-                chain,
-                {},
-            ).update(addrs)
-
-        return merged
-
-    except (
-        json.JSONDecodeError,
-        AttributeError,
-    ):
-        return DEFAULT_EXCHANGE_WALLETS
 
 
 @dataclass(frozen=True)
 class Settings:
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Telegram
-    # ---------------------------------------------------------
+    # =========================================================
 
     bot_token: str = field(
         default_factory=lambda:
@@ -131,6 +111,10 @@ class Settings:
         default_factory=lambda:
         _env_str("CHAT_ID")
     )
+
+    # =========================================================
+    # Access control
+    # =========================================================
 
     bot_access_password: str = field(
         default_factory=lambda:
@@ -178,26 +162,24 @@ class Settings:
 
     telegram_webhook_secret: str = field(
         default_factory=lambda:
-        _env_str("TELEGRAM_WEBHOOK_SECRET")
-    )
-
-    # ---------------------------------------------------------
-    # Market
-    # ---------------------------------------------------------
-
-    # IMPORTANT:
-    # No absolute dollar minimum filter.
-    #
-    # The actual signal gate is:
-    # current closed candle >= volume_spike_ratio
-    # x average of previous 48 closed candles.
-    min_inflow_usd_5m: float = field(
-        default_factory=lambda:
-        _env_float(
-            "MIN_INFLOW_USD_5M",
-            0,
+        _env_str(
+            "TELEGRAM_WEBHOOK_SECRET"
         )
     )
+
+    # =========================================================
+    # MARKET ANALYSIS
+    # =========================================================
+
+    # IMPORTANT:
+    # MIN_INFLOW_USD_5M intentionally removed.
+    #
+    # Signal volume filter is now:
+    #
+    # current closed 5m candle >=
+    # 2x previous 48 closed candles average
+    #
+    # Or a larger configured VOLUME_SPIKE_RATIO.
 
     volume_spike_ratio: float = field(
         default_factory=lambda:
@@ -248,15 +230,6 @@ class Settings:
         )
     )
 
-    # Previous 48 closed candles = 4 hours.
-    volume_baseline_candles: int = field(
-        default_factory=lambda:
-        _env_int(
-            "VOLUME_BASELINE_CANDLES",
-            48,
-        )
-    )
-
     pump_zscore_enabled: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -273,31 +246,18 @@ class Settings:
         )
     )
 
-    # ---------------------------------------------------------
-    # Candle storage
-    # ---------------------------------------------------------
-
-    candle_store_path: str = field(
+    # Separate directory for source-specific candle history.
+    candle_history_path: str = field(
         default_factory=lambda:
         _env_str(
-            "CANDLE_STORE_PATH",
+            "CANDLE_HISTORY_PATH",
             "market_history",
         )
     )
 
-    # Local save is cheap.
-    # GitHub synchronization can be handled separately.
-    candle_save_interval_sec: int = field(
-        default_factory=lambda:
-        _env_int(
-            "CANDLE_SAVE_INTERVAL_SEC",
-            300,
-        )
-    )
-
-    # ---------------------------------------------------------
+    # =========================================================
     # Status
-    # ---------------------------------------------------------
+    # =========================================================
 
     send_status_report: bool = field(
         default_factory=lambda:
@@ -315,9 +275,9 @@ class Settings:
         )
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # On-chain
-    # ---------------------------------------------------------
+    # =========================================================
 
     etherscan_api_key: str = field(
         default_factory=lambda:
@@ -363,14 +323,17 @@ class Settings:
         _env_str("COINGECKO_API_KEY")
     )
 
-    exchange_wallets: Dict = field(
+    exchange_wallets: Dict[
+        str,
+        Dict[str, str],
+    ] = field(
         default_factory=lambda:
         _load_exchange_wallets()
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Persistence
-    # ---------------------------------------------------------
+    # =========================================================
 
     state_file_path: str = field(
         default_factory=lambda:
@@ -388,9 +351,9 @@ class Settings:
         )
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # HTTP
-    # ---------------------------------------------------------
+    # =========================================================
 
     http_timeout_sec: int = field(
         default_factory=lambda:
@@ -408,33 +371,46 @@ class Settings:
         )
     )
 
+    # =========================================================
+    # ADMIN
+    # =========================================================
+
     @property
-    def admin_chat_id_resolved(self):
+    def admin_chat_id_resolved(self) -> str:
+
         return (
             self.admin_chat_id
             or self.chat_id
         )
+
+    # =========================================================
+    # VALIDATION
+    # =========================================================
 
     def validate(self) -> List[str]:
 
         problems = []
 
         if not self.bot_token:
+
             problems.append(
                 "BOT_TOKEN تنظیم نشده است."
             )
 
         if not self.chat_id:
+
             problems.append(
                 "CHAT_ID تنظیم نشده است."
             )
 
         if not self.bot_access_password:
+
             problems.append(
                 "BOT_ACCESS_PASSWORD تنظیم نشده است."
             )
 
         if not self.telegram_webhook_secret:
+
             problems.append(
                 "TELEGRAM_WEBHOOK_SECRET تنظیم نشده است."
             )
@@ -443,44 +419,88 @@ class Settings:
             self.github_gist_id
             and self.github_gist_token
         ):
+
             problems.append(
-                "GITHUB_GIST_ID/GITHUB_GIST_TOKEN تنظیم نشده است."
+                "GITHUB_GIST_ID/GITHUB_GIST_TOKEN "
+                "تنظیم نشده است."
             )
 
-        if (
-            self.price_pump_min
-            >= self.price_pump_max
-        ):
-            problems.append(
-                "PRICE_PUMP_MIN باید کمتر از PRICE_PUMP_MAX باشد."
-            )
+        if self.price_pump_min >= self.price_pump_max:
 
-        if self.volume_spike_ratio < 1:
             problems.append(
-                "VOLUME_SPIKE_RATIO باید حداقل 1 باشد."
+                "PRICE_PUMP_MIN باید کوچکتر "
+                "از PRICE_PUMP_MAX باشد."
             )
 
         if self.scan_interval_sec <= 0:
+
             problems.append(
                 "SCAN_INTERVAL_SEC باید مثبت باشد."
             )
 
-        if self.history_window < 49:
+        if self.history_window < 864:
+
             problems.append(
-                "HISTORY_WINDOW باید حداقل 49 باشد."
+                "HISTORY_WINDOW باید حداقل 864 باشد."
+            )
+
+        if self.volume_spike_ratio < 2.0:
+
+            problems.append(
+                "VOLUME_SPIKE_RATIO نمی‌تواند کمتر "
+                "از 2.0 باشد."
             )
 
         if not self.etherscan_api_key:
+
             problems.append(
                 "ETHERSCAN_API_KEY تنظیم نشده است."
             )
 
         if not self.coingecko_api_key:
+
             problems.append(
                 "COINGECKO_API_KEY تنظیم نشده است."
             )
 
         return problems
+
+
+def _load_exchange_wallets():
+
+    raw = os.environ.get(
+        "EXCHANGE_WALLETS_JSON",
+        "",
+    ).strip()
+
+    if not raw:
+        return DEFAULT_EXCHANGE_WALLETS
+
+    try:
+
+        parsed = json.loads(raw)
+
+        merged = {
+            chain: dict(addresses)
+            for chain, addresses
+            in DEFAULT_EXCHANGE_WALLETS.items()
+        }
+
+        for chain, addresses in parsed.items():
+
+            merged.setdefault(
+                chain,
+                {},
+            ).update(addresses)
+
+        return merged
+
+    except (
+        json.JSONDecodeError,
+        AttributeError,
+    ):
+
+        return DEFAULT_EXCHANGE_WALLETS
 
 
 settings = Settings()
