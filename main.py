@@ -61,6 +61,12 @@ log = logging.getLogger("smart_money_bot")
 
 INSTANCE_ID = uuid.uuid4().hex[:8]
 
+# Startup Telegram announce is sent at most once (persisted in BotState).
+# Re-deploys / process restarts must not spam users.
+STARTUP_ANNOUNCE_KEY = "bot_startup_announce"
+# Effectively permanent once marked (~30 years).
+STARTUP_ANNOUNCE_TTL_SEC = 30 * 365 * 24 * 3600
+
 log.info(
     "SMART MONEY BOT START | instance_id=%s",
     INSTANCE_ID,
@@ -197,6 +203,42 @@ def broadcast_targets():
     )
 
 
+def send_startup_announcement_once() -> None:
+    """
+    Telegram startup banner — only the first time the bot ever runs
+    (or after state file is cleared). Subsequent process restarts skip it.
+    """
+
+    if state.is_in_cooldown(
+        STARTUP_ANNOUNCE_KEY,
+        STARTUP_ANNOUNCE_TTL_SEC,
+    ):
+        log.info(
+            "STARTUP ANNOUNCE SKIPPED | already sent previously"
+        )
+        return
+
+    try:
+        notifier.broadcast(
+            (
+                "🚀 <b>سیستم تحلیل هوشمند فعال شد.</b>\n"
+                f"👨‍💻 <b>توسعه‌دهنده:</b> {esc(settings.developer_name)}\n"
+                "پوشش بازار + تحلیل حجم + پامپ/دامپ + ردیابی آن‌چین."
+            ),
+            broadcast_targets(),
+        )
+        state.mark_alerted(STARTUP_ANNOUNCE_KEY)
+        try:
+            state.save()
+        except Exception:
+            log.exception("STARTUP ANNOUNCE STATE SAVE FAILED")
+
+        log.info("STARTUP ANNOUNCE SENT")
+
+    except Exception:
+        log.exception("STARTUP ANNOUNCE FAILED")
+
+
 def queue_dirty_to_github() -> int:
 
     if not github_backup.is_configured():
@@ -269,12 +311,7 @@ def market_loop():
 
     time.sleep(3)
 
-    notifier.broadcast(
-        f"🚀 <b>سیستم تحلیل هوشمند فعال شد.</b>\n"
-        f"👨‍💻 <b>توسعه‌دهنده:</b> {esc(settings.developer_name)}\n"
-        f"پوشش بازار + تحلیل حجم + پامپ/دامپ + ردیابی آن‌چین.",
-        broadcast_targets(),
-    )
+    send_startup_announcement_once()
 
     log.info(
         "MARKET LOOP STARTED | interval=%ss",
