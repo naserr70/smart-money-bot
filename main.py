@@ -1,22 +1,59 @@
 """
 Smart Money Bot v2 — entry point.
 
-Two fully independent background loops run side by side — each produces
-and sends its own signals without depending on the other:
+Architecture
+------------
+Two independent background loops:
 
-  1. Market loop   (every SCAN_INTERVAL_SEC):
-     CEX ticker volume/price spike + statistical pump detection.
+1. Market loop
+   - Binance is preferred.
+   - KuCoin is used as fallback when Binance is unavailable.
+   - Binance and KuCoin candle histories are NEVER mixed.
+   - Each exchange maintains its own 5-minute candle history.
+   - 48 closed candles are used for smart-money / volume-flow detection.
+   - Up to 864 closed candles (72 hours) are retained for pump/dump analysis.
+   - The currently open candle is kept separately by CandleStore.
 
-  2. Whale loop     (every WHALE_SCAN_INTERVAL_SEC):
-     On-chain exchange-wallet inflow/outflow detection (ETH/BSC/TRON).
-     Skipped automatically (with a one-time log message) if not configured.
+2. Whale loop
+   - Independent on-chain exchange-wallet flow detection.
+   - ETH / BSC / TRON.
 
-Alerts from both loops are broadcast to the admin (ADMIN_CHAT_ID / CHAT_ID)
-plus every currently-authorized user (see access_control.py) — access is
-password-gated via a Telegram webhook (see /telegram/webhook below); the
-admin can grant a specific user access for a specific number of days via
-the /grant command sent to the bot.
+Persistent candle history
+--------------------------
+CandleStore keeps:
+
+    market_history/
+        binance/
+            BTCUSDT.json
+            ETHUSDT.json
+            ...
+        kucoin/
+            BTCUSDT.json
+            ETHUSDT.json
+            ...
+
+The two sources are completely isolated.
+
+GitHub persistence
+------------------
+If configured, CandleStore periodically synchronizes the candle files
+to the configured GitHub repository. Local storage remains the primary
+working cache; GitHub is the persistent backup.
+
+IMPORTANT:
+The market source selected for the current analysis cycle does NOT decide
+which historical data gets stored. Whenever a source is available, its own
+history is maintained independently.
+
+This prevents the following bad situation:
+
+    Binance unavailable
+        -> KuCoin becomes active
+        -> Binance history gets overwritten by KuCoin
+
+That must NEVER happen.
 """
+
 import logging
 import os
 import threading
@@ -30,6 +67,7 @@ from flask import Flask, jsonify, request
 
 import bot_commands
 from access_control import AccessControl
+from candle_store import CandleStore
 from config import settings
 from exchange_flow import ExchangeFlowTracker
 from formatting import esc
@@ -37,225 +75,1024 @@ from market_analyzer import MarketAnalyzer
 from state import BotState
 from telegram_notifier import TelegramNotifier
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# ============================================================
+# Logging
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
 log = logging.getLogger("smart_money_bot")
 
-# A fresh random ID every time this Python process starts. If /status (or
-# the admin menu's وضعیت ربات) shows a DIFFERENT instance_id between two
-# requests hitting the same URL, that proves Render is routing across more
-# than one running instance — each with its own separate in-memory/disk
-# state — which is the #1 explanation for "grant works here, real signals
-# come from somewhere else that never saw the grant."
+
+# ============================================================
+# Process identity
+# ============================================================
+
 INSTANCE_ID = uuid.uuid4().hex[:8]
-log.info(f"این پردازش با instance_id={INSTANCE_ID} استارت شد.")
+
+log.info(
+    "SMART MONEY BOT START | instance_id=%s",
+    INSTANCE_ID,
+)
+
+
+# ============================================================
+# Flask
+# ============================================================
 
 app = Flask(__name__)
 
 
+# ============================================================
+# HTTP session
+# ============================================================
+
 def build_http_session() -> requests.Session:
+    """
+    Shared HTTP session.
+
+    Retries are deliberately limited. Binance 418 must NOT be hammered
+    repeatedly because that can make rate-limit / IP restrictions worse.
+    """
+
     session = requests.Session()
+
     retries = Retry(
         total=settings.http_max_retries,
+        connect=settings.http_max_retries,
+        read=settings.http_max_retries,
         backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
     )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    session.headers.update({"User-Agent": "SmartMoneyBot/2.0"})
+
+    adapter = HTTPAdapter(
+        max_retries=retries,
+        pool_connections=20,
+        pool_maxsize=20,
+    )
+
+    session.mount("https://", adapter)
+
+    session.headers.update(
+        {
+            "User-Agent": "SmartMoneyBot/2.0",
+            "Accept": "application/json",
+        }
+    )
+
     return session
 
 
 http_session = build_http_session()
-state = BotState(history_window=settings.history_window, state_file_path=settings.state_file_path)
+
+
+# ============================================================
+# Persistent bot state
+# ============================================================
+
+state = BotState(
+    history_window=settings.history_window,
+    state_file_path=settings.state_file_path,
+)
+
+
+# ============================================================
+# Access control
+# ============================================================
+
 access = AccessControl(
-    settings.auth_state_file_path, settings.admin_chat_id_resolved,
-    gist_id=settings.github_gist_id, gist_token=settings.github_gist_token,
+    settings.auth_state_file_path,
+    settings.admin_chat_id_resolved,
+    gist_id=settings.github_gist_id,
+    gist_token=settings.github_gist_token,
     http_session=http_session,
 )
-notifier = TelegramNotifier(
-    settings.bot_token, settings.chat_id,
-    timeout=settings.http_timeout_sec, max_retries=settings.http_max_retries,
-)
-market_analyzer = MarketAnalyzer(settings, state, http_session)
-whale_tracker = ExchangeFlowTracker(settings, state, http_session)
 
+
+# ============================================================
+# Telegram notifier
+# ============================================================
+
+notifier = TelegramNotifier(
+    settings.bot_token,
+    settings.chat_id,
+    timeout=settings.http_timeout_sec,
+    max_retries=settings.http_max_retries,
+)
+
+
+# ============================================================
+# Candle Store
+# ============================================================
+
+"""
+CandleStore is intentionally created BEFORE MarketAnalyzer.
+
+The analyzer receives the store and therefore never needs to create
+its own independent history.
+
+This is important because otherwise we could accidentally have:
+
+    MarketAnalyzer -> history A
+    MarketData      -> history B
+    GitHub          -> history C
+
+and the three would drift apart.
+"""
+
+try:
+    candle_store = CandleStore(
+        root_path=settings.candle_store_path,
+        max_candles=settings.history_candle_limit,
+        github_enabled=settings.github_candle_store_enabled,
+        github_token=settings.github_candle_store_token,
+        github_repo=settings.github_candle_store_repo,
+        github_branch=settings.github_candle_store_branch,
+        github_sync_interval_sec=settings.github_candle_sync_interval_sec,
+    )
+
+    log.info(
+        "CANDLE STORE READY | root=%s | max_candles=%s | github=%s",
+        settings.candle_store_path,
+        settings.history_candle_limit,
+        (
+            "enabled"
+            if settings.github_candle_store_enabled
+            else "disabled"
+        ),
+    )
+
+except TypeError:
+    """
+    Compatibility fallback.
+
+    If the CandleStore version currently installed only accepts the basic
+    constructor arguments, do not crash the entire bot. GitHub persistence
+    is then handled by its own available methods.
+    """
+
+    candle_store = CandleStore(
+        root_path=settings.candle_store_path,
+        max_candles=settings.history_candle_limit,
+    )
+
+    log.warning(
+        "CANDLE STORE CREATED IN COMPATIBILITY MODE | "
+        "GitHub arguments are not supported by the installed CandleStore"
+    )
+
+
+# ============================================================
+# Market analyzer
+# ============================================================
+
+try:
+    market_analyzer = MarketAnalyzer(
+        settings=settings,
+        state=state,
+        session=http_session,
+        candle_store=candle_store,
+    )
+
+    log.info(
+        "MARKET ANALYZER READY | candle_store=injected"
+    )
+
+except TypeError:
+    """
+    Compatibility with the older constructor.
+
+    If the installed MarketAnalyzer still has the old signature,
+    the bot remains runnable instead of failing during import.
+
+    Once the new analyzer is installed, the first branch is used.
+    """
+
+    market_analyzer = MarketAnalyzer(
+        settings,
+        state,
+        http_session,
+    )
+
+    log.warning(
+        "MARKET ANALYZER USING LEGACY CONSTRUCTOR | "
+        "update market_analyzer.py to enable direct CandleStore injection"
+    )
+
+
+# ============================================================
+# Whale tracker
+# ============================================================
+
+whale_tracker = ExchangeFlowTracker(
+    settings,
+    state,
+    http_session,
+)
+
+
+# ============================================================
+# Helpers
+# ============================================================
 
 def broadcast_targets():
-    """Admin + every currently-authorized, non-expired user, deduped."""
-    admin = settings.admin_chat_id_resolved
-    targets = [admin] if admin else []
-    targets.extend(access.active_chat_ids())
-    return list(dict.fromkeys(t for t in targets if t))
+    """
+    Admin + every currently-authorized non-expired user.
 
+    Duplicates are removed while preserving order.
+    """
+
+    admin = settings.admin_chat_id_resolved
+
+    targets = [admin] if admin else []
+
+    targets.extend(
+        access.active_chat_ids()
+    )
+
+    return list(
+        dict.fromkeys(
+            target
+            for target in targets
+            if target
+        )
+    )
+
+
+def save_candle_store():
+    """
+    Best-effort persistence.
+
+    The exact CandleStore implementation may expose one or more of these
+    methods depending on the installed version. We deliberately keep this
+    isolated so the main bot loop doesn't die because persistence failed.
+    """
+
+    try:
+        if hasattr(candle_store, "save_dirty"):
+            candle_store.save_dirty()
+            return
+
+        if hasattr(candle_store, "save_all"):
+            candle_store.save_all()
+            return
+
+    except Exception:
+        log.exception(
+            "CANDLE STORE SAVE FAILED"
+        )
+
+
+def start_candle_store():
+    """
+    Start CandleStore background persistence if supported.
+
+    Some versions of CandleStore manage their own GitHub sync thread.
+    Others rely on save_dirty/save_all from the main process.
+    """
+
+    try:
+        if hasattr(candle_store, "start"):
+            candle_store.start()
+
+            log.info(
+                "CANDLE STORE BACKGROUND WORKER STARTED"
+            )
+
+        elif hasattr(candle_store, "start_background_sync"):
+            candle_store.start_background_sync()
+
+            log.info(
+                "CANDLE STORE BACKGROUND SYNC STARTED"
+            )
+
+        else:
+            log.info(
+                "CANDLE STORE BACKGROUND WORKER NOT REQUIRED"
+            )
+
+    except Exception:
+        log.exception(
+            "CANDLE STORE START FAILED"
+        )
+
+
+# ============================================================
+# Market loop
+# ============================================================
 
 def market_loop():
+    """
+    Main CEX market loop.
+
+    IMPORTANT:
+    Binance/KuCoin selection is handled by MarketData/MarketAnalyzer.
+
+    This loop does NOT copy history from one exchange to another.
+    """
+
     time.sleep(3)
+
     notifier.broadcast(
         f"🚀 <b>سیستم تحلیل هوشمند فعال شد.</b>\n"
         f"👨‍💻 <b>توسعه‌دهنده:</b> {esc(settings.developer_name)}\n"
-        f"پوشش جامع تمام بازارهای ریالی و تتری نوبیتکس + ردیابی آن‌چین کیف‌پول صرافی‌ها.",
+        f"پوشش بازار + تحلیل حجم + پامپ/دامپ + ردیابی آن‌چین.",
         broadcast_targets(),
     )
+
+    log.info(
+        "MARKET LOOP STARTED | interval=%ss",
+        settings.scan_interval_sec,
+    )
+
     while True:
+
+        cycle_started = time.time()
+
         try:
-            signals, data_source, scanned = market_analyzer.run_cycle()
+
+            log.info(
+                "MARKET CYCLE START"
+            )
+
+            signals, data_source, scanned = (
+                market_analyzer.run_cycle()
+            )
+
             targets = broadcast_targets()
-            log.info(f"چرخه‌ی مارکت: {len(signals)} سیگنال، گیرنده‌ها={targets}")
+
+            inflow_n = sum(
+                1
+                for signal in signals
+                if signal.direction.value == "inflow"
+            )
+
+            outflow_n = sum(
+                1
+                for signal in signals
+                if signal.direction.value == "outflow"
+            )
+
+            elapsed = time.time() - cycle_started
+
+            log.info(
+                "MARKET CYCLE COMPLETE | "
+                "source=%s | scanned=%s | "
+                "signals=%s | inflow=%s | outflow=%s | "
+                "elapsed=%.2fs",
+                data_source,
+                scanned,
+                len(signals),
+                inflow_n,
+                outflow_n,
+                elapsed,
+            )
+
             if signals:
-                notifier.broadcast_chunked([s.to_telegram() for s in signals], targets)
+
+                log.info(
+                    "MARKET SIGNALS BROADCAST | count=%s | targets=%s",
+                    len(signals),
+                    targets,
+                )
+
+                notifier.broadcast_chunked(
+                    [
+                        signal.to_telegram()
+                        for signal in signals
+                    ],
+                    targets,
+                )
+
+            else:
+
+                log.info(
+                    "MARKET NO SIGNAL | "
+                    "source=%s | scanned=%s | "
+                    "reason=NO_CONFIRMED_SIGNAL",
+                    data_source,
+                    scanned,
+                )
+
+            # ------------------------------------------------
+            # Status report
+            # ------------------------------------------------
 
             if settings.send_status_report:
-                inflow_n = sum(1 for s in signals if s.direction.value == "inflow")
-                outflow_n = sum(1 for s in signals if s.direction.value == "outflow")
-                status_msg = market_analyzer.build_status_message(data_source, scanned, inflow_n, outflow_n)
-                for target in targets:
-                    notifier.send_temporary(status_msg, settings.auto_delete_delay_sec, chat_id=target)
-            state.record_market_cycle()
-        except Exception as e:
-            log.exception("خطای بحرانی در چرخه تحلیل مارکت")
-            state.record_market_cycle(error=str(e))
-            # Technical error messages go to the admin only, not every user.
-            notifier.send_temporary(
-                f"⚠️ خطا در چرخه تحلیل مارکت رخ داد: <code>{esc(e)}</code>\nسیستم به کار خود ادامه می‌دهد.",
-                settings.auto_delete_delay_sec,
-                chat_id=settings.admin_chat_id_resolved,
-            )
-        time.sleep(settings.scan_interval_sec)
 
+                status_msg = (
+                    market_analyzer.build_status_message(
+                        data_source,
+                        scanned,
+                        inflow_n,
+                        outflow_n,
+                    )
+                )
+
+                for target in targets:
+
+                    try:
+
+                        notifier.send_temporary(
+                            status_msg,
+                            settings.auto_delete_delay_sec,
+                            chat_id=target,
+                        )
+
+                    except Exception:
+                        log.exception(
+                            "STATUS MESSAGE FAILED | target=%s",
+                            target,
+                        )
+
+            # ------------------------------------------------
+            # Save state
+            # ------------------------------------------------
+
+            state.record_market_cycle()
+
+            # CandleStore persistence is deliberately separate from
+            # signal calculation.
+            save_candle_store()
+
+        except Exception as e:
+
+            log.exception(
+                "CRITICAL MARKET LOOP ERROR"
+            )
+
+            state.record_market_cycle(
+                error=str(e)
+            )
+
+            admin = settings.admin_chat_id_resolved
+
+            if admin:
+
+                try:
+
+                    notifier.send_temporary(
+                        (
+                            "⚠️ <b>خطا در چرخه تحلیل مارکت</b>\n\n"
+                            f"<code>{esc(str(e))}</code>\n\n"
+                            "سیستم به کار خود ادامه می‌دهد."
+                        ),
+                        settings.auto_delete_delay_sec,
+                        chat_id=admin,
+                    )
+
+                except Exception:
+                    log.exception(
+                        "FAILED TO SEND MARKET ERROR TO ADMIN"
+                    )
+
+        # ----------------------------------------------------
+        # Interval
+        # ----------------------------------------------------
+
+        elapsed = time.time() - cycle_started
+
+        sleep_for = max(
+            1,
+            settings.scan_interval_sec - elapsed,
+        )
+
+        log.info(
+            "MARKET CYCLE SLEEP | seconds=%.1f",
+            sleep_for,
+        )
+
+        time.sleep(sleep_for)
+
+
+# ============================================================
+# Whale loop
+# ============================================================
 
 def whale_loop():
+
     if not whale_tracker.is_enabled():
+
         log.warning(
-            "ماژول ردیابی ولت/صرافی غیرفعال است (ETHERSCAN_API_KEY یا لیست ولت‌ها تنظیم نشده). "
-            "این حلقه اجرا نخواهد شد."
+            "WHALE TRACKER DISABLED | "
+            "ETHERSCAN_API_KEY or exchange wallets not configured"
         )
+
         return
 
     time.sleep(8)
-    while True:
-        try:
-            signals = whale_tracker.scan()
-            if signals:
-                notifier.broadcast_chunked([s.to_telegram() for s in signals], broadcast_targets())
-            state.record_whale_cycle()
-        except Exception as e:
-            log.exception("خطای بحرانی در چرخه ردیابی آن‌چین")
-            state.record_whale_cycle(error=str(e))
-        time.sleep(settings.whale_scan_interval_sec)
 
+    log.info(
+        "WHALE LOOP STARTED | interval=%ss",
+        settings.whale_scan_interval_sec,
+    )
+
+    while True:
+
+        cycle_started = time.time()
+
+        try:
+
+            log.info(
+                "WHALE CYCLE START"
+            )
+
+            signals = whale_tracker.scan()
+
+            targets = broadcast_targets()
+
+            log.info(
+                "WHALE CYCLE COMPLETE | "
+                "signals=%s | targets=%s",
+                len(signals),
+                targets,
+            )
+
+            if signals:
+
+                notifier.broadcast_chunked(
+                    [
+                        signal.to_telegram()
+                        for signal in signals
+                    ],
+                    targets,
+                )
+
+            else:
+
+                log.info(
+                    "WHALE NO SIGNAL"
+                )
+
+            state.record_whale_cycle()
+
+        except Exception as e:
+
+            log.exception(
+                "CRITICAL WHALE LOOP ERROR"
+            )
+
+            state.record_whale_cycle(
+                error=str(e)
+            )
+
+        elapsed = time.time() - cycle_started
+
+        sleep_for = max(
+            1,
+            settings.whale_scan_interval_sec - elapsed,
+        )
+
+        time.sleep(sleep_for)
+
+
+# ============================================================
+# Telegram webhook
+# ============================================================
 
 def register_telegram_webhook():
-    """Point Telegram at this service's /telegram/webhook route. Render sets
-    RENDER_EXTERNAL_URL automatically; without it (e.g. local dev) this is
-    skipped — set the webhook manually in that case."""
-    base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    """
+    Register Telegram webhook automatically on Render.
+    """
+
+    base_url = (
+        os.environ
+        .get("RENDER_EXTERNAL_URL", "")
+        .rstrip("/")
+    )
+
     if not base_url or not settings.bot_token:
-        log.warning("RENDER_EXTERNAL_URL یا BOT_TOKEN تنظیم نشده؛ webhook خودکار ثبت نشد.")
+
+        log.warning(
+            "TELEGRAM WEBHOOK NOT REGISTERED | "
+            "RENDER_EXTERNAL_URL or BOT_TOKEN missing"
+        )
+
         return
-    webhook_url = f"{base_url}/telegram/webhook"
-    payload = {"url": webhook_url}
+
+    webhook_url = (
+        f"{base_url}/telegram/webhook"
+    )
+
+    payload = {
+        "url": webhook_url
+    }
+
     if settings.telegram_webhook_secret:
-        payload["secret_token"] = settings.telegram_webhook_secret
+
+        payload["secret_token"] = (
+            settings.telegram_webhook_secret
+        )
+
     try:
-        res = http_session.post(
-            f"https://api.telegram.org/bot{settings.bot_token}/setWebhook",
+
+        response = http_session.post(
+            (
+                f"https://api.telegram.org/"
+                f"bot{settings.bot_token}/setWebhook"
+            ),
             json=payload,
             timeout=settings.http_timeout_sec,
         )
-        if res.status_code == 200 and res.json().get("ok"):
-            log.info(f"وبهوک تلگرام روی {webhook_url} ثبت شد.")
-        else:
-            log.warning(f"ثبت وبهوک تلگرام ناموفق بود: {res.text[:300]}")
-    except requests.RequestException as e:
-        log.warning(f"ثبت وبهوک تلگرام ناموفق بود: {e}")
 
+        if (
+            response.status_code == 200
+            and response.json().get("ok")
+        ):
+
+            log.info(
+                "TELEGRAM WEBHOOK REGISTERED | url=%s",
+                webhook_url,
+            )
+
+        else:
+
+            log.warning(
+                "TELEGRAM WEBHOOK REGISTRATION FAILED | "
+                "status=%s | response=%s",
+                response.status_code,
+                response.text[:300],
+            )
+
+    except requests.RequestException as e:
+
+        log.warning(
+            "TELEGRAM WEBHOOK REGISTRATION FAILED | error=%s",
+            e,
+        )
+
+
+# ============================================================
+# Startup
+# ============================================================
 
 def start_background_threads():
+
+    log.info(
+        "BACKGROUND SERVICES INITIALIZING | instance=%s",
+        INSTANCE_ID,
+    )
+
+    # --------------------------------------------------------
+    # Configuration validation
+    # --------------------------------------------------------
+
     for problem in settings.validate():
-        log.warning(problem)
+
+        log.warning(
+            "CONFIG WARNING | %s",
+            problem,
+        )
+
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
 
     register_telegram_webhook()
 
-    # Render's default (disk-less) web services wipe local files on every
-    # deploy/restart — this is the #1 cause of "a user I granted access to
-    # stopped getting signals": authorized_users.json got reset to empty.
-    # Surface that immediately instead of it silently going unnoticed.
-    if not access.list_users():
-        log.warning(
-            "لیست کاربران مجاز خالیه. اگه قبلاً کسی رو گرنت کرده بودید و الان نیست، "
-            "احتمالاً دیسک موقتی Render با ری‌استارت/دیپلوی پاک شده — از منو دوباره گرنتش کنید. "
-            "برای دائمی موندنش، یک Persistent Disk روی Render اضافه کنید و "
-            "STATE_FILE_PATH / AUTH_STATE_FILE_PATH رو به مسیر همون دیسک اشاره بدید."
-        )
-        admin_id = settings.admin_chat_id_resolved
-        if admin_id:
-            notifier.send(
-                "⚠️ لیست کاربران مجاز الان خالیه (به‌جز ادمین).\n\n"
-                "اگه قبلاً کسی رو با «اعطای دسترسی» اضافه کرده بودید و الان دیگه سیگنال دریافت نمی‌کنه، "
-                "علتش احتمالاً پاک شدن دیسک موقتی Render موقع دیپلوی جدیده — لطفاً از منو دوباره اضافه‌اش کنید.",
-                chat_id=admin_id,
-            )
+    # --------------------------------------------------------
+    # Candle Store
+    # --------------------------------------------------------
 
-    threading.Thread(target=market_loop, daemon=True, name="market-loop").start()
-    threading.Thread(target=whale_loop, daemon=True, name="whale-loop").start()
-    state.start_autosave(settings.state_save_interval_sec)
+    start_candle_store()
+
+    # --------------------------------------------------------
+    # Access control
+    # --------------------------------------------------------
+
+    if not access.list_users():
+
+        log.warning(
+            "AUTHORIZED USERS EMPTY | "
+            "admin=%s",
+            settings.admin_chat_id_resolved,
+        )
+
+        admin_id = settings.admin_chat_id_resolved
+
+        if admin_id:
+
+            try:
+
+                notifier.send(
+                    (
+                        "⚠️ <b>لیست کاربران مجاز خالی است.</b>\n\n"
+                        "اگر قبلاً کاربری را مجاز کرده بودید و بعد از "
+                        "ری‌استارت حذف شده، احتمالاً فایل محلی پاک شده است."
+                    ),
+                    chat_id=admin_id,
+                )
+
+            except Exception:
+                log.exception(
+                    "FAILED TO SEND EMPTY USERS WARNING"
+                )
+
+    # --------------------------------------------------------
+    # Market thread
+    # --------------------------------------------------------
+
+    market_thread = threading.Thread(
+        target=market_loop,
+        daemon=True,
+        name="market-loop",
+    )
+
+    market_thread.start()
+
+    log.info(
+        "THREAD STARTED | name=market-loop"
+    )
+
+    # --------------------------------------------------------
+    # Whale thread
+    # --------------------------------------------------------
+
+    whale_thread = threading.Thread(
+        target=whale_loop,
+        daemon=True,
+        name="whale-loop",
+    )
+
+    whale_thread.start()
+
+    log.info(
+        "THREAD STARTED | name=whale-loop"
+    )
+
+    # --------------------------------------------------------
+    # Bot state autosave
+    # --------------------------------------------------------
+
+    state.start_autosave(
+        settings.state_save_interval_sec
+    )
+
+    log.info(
+        "BOT STARTUP COMPLETE | instance=%s",
+        INSTANCE_ID,
+    )
 
 
 start_background_threads()
 
 
+# ============================================================
+# Health check
+# ============================================================
+
 @app.route("/")
 def health_check():
-    return "Smart Money Bot v2 — Market ticker + on-chain exchange-wallet tracking active.", 200
 
+    return (
+        "Smart Money Bot v2 — "
+        "Market ticker + independent Binance/KuCoin "
+        "candle history + on-chain tracking active.",
+        200,
+    )
+
+
+# ============================================================
+# Status API
+# ============================================================
 
 @app.route("/status")
 def status():
+
     health = state.snapshot_health()
-    health["whale_tracker_enabled"] = whale_tracker.is_enabled()
-    health["authorized_users_count"] = len(access.active_chat_ids())
+
+    health["whale_tracker_enabled"] = (
+        whale_tracker.is_enabled()
+    )
+
+    health["authorized_users_count"] = (
+        len(access.active_chat_ids())
+    )
+
     health["instance_id"] = INSTANCE_ID
+
+    # CandleStore diagnostics
+    try:
+
+        health["candle_store"] = {
+            "root_path": settings.candle_store_path,
+            "max_candles": settings.history_candle_limit,
+            "github_enabled": (
+                settings.github_candle_store_enabled
+            ),
+        }
+
+    except Exception:
+
+        health["candle_store"] = {
+            "status": "unknown"
+        }
+
     return jsonify(health)
 
 
+# ============================================================
+# Admin status
+# ============================================================
+
 def build_admin_status_text() -> str:
+
     health = state.snapshot_health()
+
     lines = [
         "📈 <b>وضعیت ربات</b>\n",
-        f"🆔 instance_id: <code>{esc(INSTANCE_ID)}</code>",
-        f"💾 حافظه‌ی دائمی (JSONBin): <code>{'فعال' if access.is_remote_enabled() else 'غیرفعال — ری‌استارت‌ها کاربرها را پاک می‌کند'}</code>",
-        f"🕐 آخرین چرخه‌ی مارکت: <code>{esc(health.get('last_market_cycle_at') or '-')}</code>",
-        f"🐋 آخرین چرخه‌ی نهنگ: <code>{esc(health.get('last_whale_cycle_at') or '-')}</code>",
-        f"🔁 تعداد چرخه‌های مارکت: <code>{health.get('market_cycles_completed')}</code>",
-        f"🔁 تعداد چرخه‌های نهنگ: <code>{health.get('whale_cycles_completed')}</code>",
-        f"🐋 ماژول نهنگ فعال: <code>{'بله' if whale_tracker.is_enabled() else 'خیر'}</code>",
-        f"👥 کاربران مجاز فعال: <code>{len(access.active_chat_ids())}</code>",
+
+        (
+            f"🆔 instance_id: "
+            f"<code>{esc(INSTANCE_ID)}</code>"
+        ),
+
+        (
+            f"💾 حافظه کاربران: "
+            f"<code>{'فعال' if access.is_remote_enabled() else 'غیرفعال'}</code>"
+        ),
+
+        (
+            f"🕐 آخرین چرخه مارکت: "
+            f"<code>{esc(health.get('last_market_cycle_at') or '-')}</code>"
+        ),
+
+        (
+            f"🐋 آخرین چرخه نهنگ: "
+            f"<code>{esc(health.get('last_whale_cycle_at') or '-')}</code>"
+        ),
+
+        (
+            f"🔁 تعداد چرخه مارکت: "
+            f"<code>{health.get('market_cycles_completed')}</code>"
+        ),
+
+        (
+            f"🔁 تعداد چرخه نهنگ: "
+            f"<code>{health.get('whale_cycles_completed')}</code>"
+        ),
+
+        (
+            f"🐋 ماژول نهنگ: "
+            f"<code>{'فعال' if whale_tracker.is_enabled() else 'غیرفعال'}</code>"
+        ),
+
+        (
+            f"👥 کاربران فعال: "
+            f"<code>{len(access.active_chat_ids())}</code>"
+        ),
+
+        (
+            f"🕯 ذخیره کندل: "
+            f"<code>{esc(str(settings.candle_store_path))}</code>"
+        ),
+
+        (
+            f"☁️ پشتیبان GitHub کندل: "
+            f"<code>{'فعال' if settings.github_candle_store_enabled else 'غیرفعال'}</code>"
+        ),
+
+        (
+            f"📊 سقف تاریخچه: "
+            f"<code>{settings.history_candle_limit} کندل 5m</code>"
+        ),
     ]
+
     if health.get("last_error"):
-        lines.append(f"⚠️ آخرین خطا: <code>{esc(health.get('last_error'))}</code>")
+
+        lines.append(
+            (
+                f"⚠️ آخرین خطا: "
+                f"<code>{esc(health.get('last_error'))}</code>"
+            )
+        )
+
     return "\n".join(lines)
 
 
-@app.route("/telegram/webhook", methods=["POST"])
+# ============================================================
+# Telegram webhook endpoint
+# ============================================================
+
+@app.route(
+    "/telegram/webhook",
+    methods=["POST"],
+)
 def telegram_webhook():
-    # Telegram sends this header back exactly as registered via setWebhook's
-    # secret_token — validating it is what stops a random POST to this
-    # public URL from injecting fake commands (e.g. a forged /grant).
+
+    # --------------------------------------------------------
+    # Telegram secret validation
+    # --------------------------------------------------------
+
     if settings.telegram_webhook_secret:
-        incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if incoming != settings.telegram_webhook_secret:
-            log.warning("درخواست webhook با secret token نامعتبر رد شد.")
+
+        incoming = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            "",
+        )
+
+        if (
+            incoming
+            != settings.telegram_webhook_secret
+        ):
+
+            log.warning(
+                "TELEGRAM WEBHOOK REJECTED | "
+                "invalid secret token"
+            )
+
             return "forbidden", 403
 
-    update = request.get_json(silent=True) or {}
+    # --------------------------------------------------------
+    # Parse update
+    # --------------------------------------------------------
+
+    update = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
     try:
-        bot_commands.handle_update(update, settings, access, notifier,
-                                   admin_status_provider=build_admin_status_text)
+
+        bot_commands.handle_update(
+            update,
+            settings,
+            access,
+            notifier,
+            admin_status_provider=build_admin_status_text,
+        )
+
     except Exception:
-        log.exception("خطا در پردازش پیام ورودی تلگرام")
+
+        log.exception(
+            "TELEGRAM UPDATE PROCESSING ERROR"
+        )
+
     return "ok", 200
 
 
+# ============================================================
+# Graceful-ish shutdown helper
+# ============================================================
+
+def shutdown_persistence():
+
+    log.info(
+        "PERSISTENCE SHUTDOWN START"
+    )
+
+    try:
+
+        save_candle_store()
+
+    except Exception:
+
+        log.exception(
+            "FINAL CANDLE STORE SAVE FAILED"
+        )
+
+    try:
+
+        state.save()
+
+    except Exception:
+
+        log.exception(
+            "FINAL BOT STATE SAVE FAILED"
+        )
+
+    log.info(
+        "PERSISTENCE SHUTDOWN COMPLETE"
+    )
+
+
+# ============================================================
+# Local development
+# ============================================================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            8080,
+        )
+    )
+
+    log.info(
+        "FLASK SERVER START | port=%s",
+        port,
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+    )
