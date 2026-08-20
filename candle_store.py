@@ -2,7 +2,7 @@
 Persistent independent rolling 5-minute candle store.
 
 IMPORTANT:
-- Binance and KuCoin histories are completely independent.
+- Binance, Bybit and KuCoin histories are completely independent.
 - Maximum history = 864 CLOSED 5m candles = 72 hours.
 - The currently-open candle is NOT part of the closed history.
 - A new closed candle replaces the oldest candle automatically.
@@ -23,6 +23,8 @@ log = logging.getLogger("smart_money_bot.candle_store")
 CANDLE_LIMIT = 864
 SMART_MONEY_BASELINE_CANDLES = 48
 PUMP_HISTORY_CANDLES = 864
+
+VALID_SOURCES = ("binance", "bybit", "kucoin")
 
 
 @dataclass
@@ -52,6 +54,27 @@ class Candle:
         )
 
     @classmethod
+    def from_bybit(cls, raw: list) -> "Candle":
+        """
+        Bybit v5 kline list item (already oldest-first after reverse):
+        [startTime, open, high, low, close, volume, turnover]
+
+        startTime is ms. turnover is quote volume (USDT for spot).
+        """
+        open_ms = int(float(raw[0]))
+        return cls(
+            open_time=open_ms,
+            close_time=open_ms + 5 * 60 * 1000 - 1,
+            open=float(raw[1]),
+            high=float(raw[2]),
+            low=float(raw[3]),
+            close=float(raw[4]),
+            volume=float(raw[5]),
+            quote_volume=float(raw[6]),
+            trades=0,
+        )
+
+    @classmethod
     def from_kucoin(cls, raw: list) -> "Candle":
         """
         KuCoin kline format (official):
@@ -75,16 +98,13 @@ class Candle:
 
 class CandleStore:
     """
-    One store instance can contain both exchanges, but they are physically
-    separated by source:
+    Histories are physically separated by source:
 
-        Binance:
-            market_history/binance/SUIUSDT.json
+        market_history/binance/...
+        market_history/bybit/...
+        market_history/kucoin/...
 
-        KuCoin:
-            market_history/kucoin/SUIUSDT.json
-
-    NEVER mix the two.
+    NEVER mix sources.
     """
 
     def __init__(
@@ -98,7 +118,6 @@ class CandleStore:
         github_sync_interval_sec: int = 300,
         **kwargs,
     ):
-        # Accept extra kwargs for forward compatibility with older callers.
         del kwargs
 
         self.root_path = root_path
@@ -106,22 +125,17 @@ class CandleStore:
         self._lock = threading.RLock()
 
         self._closed: Dict[str, Dict[str, deque]] = {
-            "binance": {},
-            "kucoin": {},
+            src: {} for src in VALID_SOURCES
         }
 
         self._current: Dict[str, Dict[str, Candle]] = {
-            "binance": {},
-            "kucoin": {},
+            src: {} for src in VALID_SOURCES
         }
 
         self._dirty = {
-            "binance": set(),
-            "kucoin": set(),
+            src: set() for src in VALID_SOURCES
         }
 
-        # GitHub metadata (actual sync is handled externally via
-        # github_candle_backup when configured).
         self.github_enabled = bool(github_enabled and github_token and github_repo)
         self.github_token = github_token or ""
         self.github_repo = github_repo or ""
@@ -129,25 +143,17 @@ class CandleStore:
         self.github_sync_interval_sec = max(60, int(github_sync_interval_sec))
 
         os.makedirs(self.root_path, exist_ok=True)
-        os.makedirs(os.path.join(self.root_path, "binance"), exist_ok=True)
-        os.makedirs(os.path.join(self.root_path, "kucoin"), exist_ok=True)
-
-    # =========================================================
-    # SOURCE NORMALIZATION
-    # =========================================================
+        for src in VALID_SOURCES:
+            os.makedirs(os.path.join(self.root_path, src), exist_ok=True)
 
     @staticmethod
     def normalize_source(source: str) -> str:
         source = source.lower().strip()
 
-        if source not in ("binance", "kucoin"):
+        if source not in VALID_SOURCES:
             raise ValueError(f"Unsupported candle source: {source}")
 
         return source
-
-    # =========================================================
-    # PATHS
-    # =========================================================
 
     def _path(self, source: str, symbol: str) -> str:
         source = self.normalize_source(source)
@@ -162,10 +168,6 @@ class CandleStore:
             source,
             f"{safe}.json",
         )
-
-    # =========================================================
-    # LOAD
-    # =========================================================
 
     def load(self, source: str, symbol: str) -> bool:
         source = self.normalize_source(source)
@@ -255,10 +257,6 @@ class CandleStore:
             )
             return False
 
-    # =========================================================
-    # SEED
-    # =========================================================
-
     def seed(
         self,
         source: str,
@@ -281,7 +279,6 @@ class CandleStore:
             key=lambda c: c.open_time,
         )
 
-        # Deduplicate by open_time.
         unique = {}
 
         for candle in candles:
@@ -308,10 +305,6 @@ class CandleStore:
             self.max_candles,
         )
 
-    # =========================================================
-    # UPDATE
-    # =========================================================
-
     def update(
         self,
         source: str,
@@ -330,7 +323,6 @@ class CandleStore:
 
             current = self._current[source].get(symbol)
 
-            # First observation.
             if current is None:
 
                 self._current[source][symbol] = candle
@@ -344,14 +336,12 @@ class CandleStore:
 
                 return "current"
 
-            # Same candle -> update live candle.
             if candle.open_time == current.open_time:
 
                 self._current[source][symbol] = candle
 
                 return "current"
 
-            # Newer candle -> previous one has closed.
             if candle.open_time > current.open_time:
 
                 closed_candle = current
@@ -374,7 +364,6 @@ class CandleStore:
 
                 return "closed"
 
-            # Old/out-of-order.
             log.warning(
                 "CANDLE IGNORED OUT_OF_ORDER | source=%s symbol=%s incoming=%s current=%s",
                 source,
@@ -384,10 +373,6 @@ class CandleStore:
             )
 
             return "ignored"
-
-    # =========================================================
-    # EXPLICIT CLOSED CANDLE
-    # =========================================================
 
     def add_closed(
         self,
@@ -407,7 +392,6 @@ class CandleStore:
 
             if history:
 
-                # Replace same candle if necessary.
                 if candle.open_time == history[-1].open_time:
                     history[-1] = candle
                     self._dirty[source].add(symbol)
@@ -422,21 +406,12 @@ class CandleStore:
 
             return True
 
-    # =========================================================
-    # APPLY A BATCH OF RECENT CANDLES (live update path)
-    # =========================================================
-
     def apply_recent(
         self,
         source: str,
         symbol: str,
         candles: List[Candle],
     ) -> int:
-        """
-        Feed a short list of recent candles (oldest -> newest) into the store.
-
-        Returns the number of newly closed candles produced by this batch.
-        """
         if not candles:
             return 0
 
@@ -449,10 +424,6 @@ class CandleStore:
                 closed_count += 1
 
         return closed_count
-
-    # =========================================================
-    # GETTERS
-    # =========================================================
 
     def get_current(
         self,
@@ -508,10 +479,6 @@ class CandleStore:
                 self._closed[source].get(symbol, ())
             )
 
-    # =========================================================
-    # BASELINE
-    # =========================================================
-
     def average_quote_volume(
         self,
         source: str,
@@ -537,14 +504,7 @@ class CandleStore:
         if len(values) < count:
             return None
 
-        # IMPORTANT:
-        # RAW MEAN ONLY.
-        # No trimmed mean / winsorization / normalization.
         return sum(values) / len(values)
-
-    # =========================================================
-    # PUMP / DUMP HISTORICAL METRICS
-    # =========================================================
 
     def average_quote_volume_long(
         self,
@@ -605,20 +565,12 @@ class CandleStore:
 
         return returns
 
-    # =========================================================
-    # DIRTY
-    # =========================================================
-
     def dirty_symbols(self, source: str) -> List[str]:
 
         source = self.normalize_source(source)
 
         with self._lock:
             return list(self._dirty[source])
-
-    # =========================================================
-    # SERIALIZATION
-    # =========================================================
 
     def to_payload(
         self,
@@ -652,10 +604,6 @@ class CandleStore:
                 else None
             ),
         }
-
-    # =========================================================
-    # LOCAL SAVE
-    # =========================================================
 
     def save(
         self,
@@ -717,7 +665,7 @@ class CandleStore:
         sources = (
             [self.normalize_source(source)]
             if source
-            else ["binance", "kucoin"]
+            else list(VALID_SOURCES)
         )
 
         for src in sources:
@@ -727,7 +675,7 @@ class CandleStore:
 
     def save_all(self) -> None:
 
-        for source in ("binance", "kucoin"):
+        for source in VALID_SOURCES:
 
             with self._lock:
                 symbols = list(
