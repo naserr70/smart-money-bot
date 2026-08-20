@@ -1,17 +1,21 @@
 """
-CEX market-data providers.
+CEX market data providers.
 
-IMPORTANT:
-    Binance and KuCoin are treated as independent data sources.
+IMPORTANT ARCHITECTURE:
 
-    No candle history, volume baseline, or statistical history is shared
-    between them.
+Binance and KuCoin are completely independent sources.
 
-Provider priority:
-    1. Binance
-    2. KuCoin fallback
+Both are fetched every market cycle:
 
-Every failure is logged explicitly.
+    Binance -> Binance ticker + Binance candles
+    KuCoin  -> KuCoin ticker  + KuCoin candles
+
+The analyzer chooses the active source:
+
+    Binance available -> Binance
+    Binance unavailable -> KuCoin
+
+Historical data is NEVER copied between exchanges.
 """
 
 import logging
@@ -21,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from assets import TARGET_SYMBOLS, resolve_alias
-from candle_store import Candle
+from candle_store import Candle, CandleStore
 
 log = logging.getLogger("smart_money_bot.market_data")
 
@@ -40,8 +44,12 @@ BINANCE_KLINES_ENDPOINTS = [
     "https://api.binance.com/api/v3/klines",
 ]
 
-KUCOIN_ENDPOINT = (
+KUCOIN_TICKER_ENDPOINT = (
     "https://api.kucoin.com/api/v1/market/allTickers"
+)
+
+KUCOIN_KLINES_ENDPOINT = (
+    "https://api.kucoin.com/api/ua/v1/market/kline"
 )
 
 
@@ -50,410 +58,221 @@ class MarketDataProvider:
         self,
         session: requests.Session,
         timeout: int = 8,
+        candle_store: Optional[CandleStore] = None,
+        history_limit: int = 864,
     ):
         self.session = session
         self.timeout = timeout
 
-        self.last_binance_error = None
-        self.last_kucoin_error = None
+        self.candle_store = candle_store
+        self.history_limit = history_limit
 
-    # ---------------------------------------------------------
-    # main ticker fetch
-    # ---------------------------------------------------------
+        self._bootstrap_attempted = {
+            "binance": set(),
+            "kucoin": set(),
+        }
 
-    def fetch(self) -> Tuple[Dict[str, dict], str]:
+        self._last_history_attempt = {
+            "binance": {},
+            "kucoin": {},
+        }
+
+    # =========================================================
+    # PUBLIC
+    # =========================================================
+
+    def fetch(
+        self,
+    ) -> Tuple[
+        Dict[str, dict],
+        str,
+    ]:
         """
-        Returns:
-            data, source
+        Fetch both exchanges.
+
+        Return value:
+
+            active_ticker_data,
+            active_source
+
+        Side effect:
+
+            Both exchanges' candle histories are updated.
         """
 
-        log.info("MARKET DATA | starting provider selection")
+        log.info("MARKET FETCH START")
 
         binance_data = self._fetch_binance()
-
-        if binance_data:
-            log.info(
-                "MARKET DATA | source=binance | symbols=%d",
-                len(binance_data),
-            )
-            return binance_data, "binance"
-
-        log.error(
-            "MARKET DATA | Binance unavailable | switching to KuCoin | reason=%s",
-            self.last_binance_error or "unknown",
-        )
-
         kucoin_data = self._fetch_kucoin()
 
+        log.info(
+            "MARKET SOURCES | binance_symbols=%d | kucoin_symbols=%d",
+            len(binance_data),
+            len(kucoin_data),
+        )
+
+        # History is maintained independently for BOTH sources.
+        if self.candle_store:
+
+            self._maintain_history(
+                source="binance",
+                ticker_data=binance_data,
+            )
+
+            self._maintain_history(
+                source="kucoin",
+                ticker_data=kucoin_data,
+            )
+
+        # Binance is primary.
+        if binance_data:
+            log.info(
+                "ACTIVE MARKET SOURCE | Binance | symbols=%d",
+                len(binance_data),
+            )
+
+            return binance_data, "binance"
+
+        # KuCoin is fallback.
         if kucoin_data:
             log.warning(
-                "MARKET DATA | source=kucoin | symbols=%d | Binance fallback active",
-                len(kucoin_data),
+                "ACTIVE MARKET SOURCE | KuCoin FALLBACK | "
+                "Binance unavailable"
             )
+
             return kucoin_data, "kucoin"
 
         log.error(
-            "MARKET DATA | ALL PROVIDERS FAILED | Binance=%s | KuCoin=%s",
-            self.last_binance_error,
-            self.last_kucoin_error,
+            "MARKET DATA FAILURE | Binance and KuCoin unavailable"
         )
 
         return {}, "none"
 
-    # ---------------------------------------------------------
-    # Binance ticker
-    # ---------------------------------------------------------
+    # =========================================================
+    # BINANCE
+    # =========================================================
 
-    def _fetch_binance(self) -> Dict[str, dict]:
-        self.last_binance_error = None
-
-        for index, url in enumerate(BINANCE_ENDPOINTS, start=1):
-            started = time.monotonic()
-
-            try:
-                res = self.session.get(
-                    url,
-                    timeout=self.timeout,
-                )
-
-                elapsed = time.monotonic() - started
-
-                if res.status_code != 200:
-                    reason = (
-                        f"endpoint={index} "
-                        f"status={res.status_code} "
-                        f"elapsed={elapsed:.2f}s"
-                    )
-
-                    self.last_binance_error = reason
-
-                    log.warning(
-                        "BINANCE TICKER FAILED | %s",
-                        reason,
-                    )
-
-                    continue
-
-                try:
-                    raw = res.json()
-                except ValueError as e:
-                    self.last_binance_error = (
-                        f"endpoint={index} invalid_json={e}"
-                    )
-
-                    log.error(
-                        "BINANCE TICKER JSON ERROR | endpoint=%d | error=%s",
-                        index,
-                        e,
-                    )
-
-                    continue
-
-                if not isinstance(raw, list):
-                    self.last_binance_error = (
-                        f"endpoint={index} response_not_list"
-                    )
-
-                    log.error(
-                        "BINANCE TICKER INVALID RESPONSE | endpoint=%d",
-                        index,
-                    )
-
-                    continue
-
-                filtered: Dict[str, dict] = {}
-
-                invalid_items = 0
-
-                for item in raw:
-                    sym = item.get("symbol")
-
-                    if sym not in TARGET_SYMBOLS:
-                        continue
-
-                    try:
-                        normalized = resolve_alias(sym)
-
-                        filtered[normalized] = {
-                            "lastPrice": float(
-                                item["lastPrice"]
-                            ),
-                            "quoteVolume": float(
-                                item["quoteVolume"]
-                            ),
-                            "priceChangePercent": float(
-                                item["priceChangePercent"]
-                            ),
-                        }
-
-                    except (
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ):
-                        invalid_items += 1
-
-                if not filtered:
-                    self.last_binance_error = (
-                        f"endpoint={index} "
-                        f"no_target_symbols"
-                    )
-
-                    log.error(
-                        "BINANCE TICKER EMPTY | endpoint=%d | raw=%d | target=%d",
-                        index,
-                        len(raw),
-                        len(TARGET_SYMBOLS),
-                    )
-
-                    continue
-
-                log.info(
-                    "BINANCE TICKER OK | endpoint=%d | symbols=%d | invalid=%d | elapsed=%.2fs",
-                    index,
-                    len(filtered),
-                    invalid_items,
-                    elapsed,
-                )
-
-                return filtered
-
-            except requests.Timeout as e:
-                self.last_binance_error = (
-                    f"endpoint={index} timeout={e}"
-                )
-
-                log.error(
-                    "BINANCE TICKER TIMEOUT | endpoint=%d | error=%s",
-                    index,
-                    e,
-                )
-
-            except requests.RequestException as e:
-                self.last_binance_error = (
-                    f"endpoint={index} request_error={e}"
-                )
-
-                log.error(
-                    "BINANCE TICKER REQUEST ERROR | endpoint=%d | error=%s",
-                    index,
-                    e,
-                )
-
-            except Exception as e:
-                self.last_binance_error = (
-                    f"endpoint={index} unexpected={e}"
-                )
-
-                log.exception(
-                    "BINANCE TICKER UNEXPECTED ERROR | endpoint=%d",
-                    index,
-                )
-
-        return {}
-
-    # ---------------------------------------------------------
-    # Binance 5m candles
-    # ---------------------------------------------------------
-
-    def fetch_recent_5m_candles(
+    def _fetch_binance(
         self,
-        binance_symbol: str,
-        limit: int = 864,
-    ) -> Optional[List[Candle]]:
-        """
-        Fetch closed 5m candles.
+    ) -> Dict[str, dict]:
 
-        The last currently-open candle is intentionally removed.
+        for url in BINANCE_ENDPOINTS:
 
-        This method is ONLY Binance data.
-        It must never be used to populate KuCoin history.
-        """
-
-        limit = max(
-            2,
-            min(int(limit), 1000),
-        )
-
-        last_error = None
-
-        for index, url in enumerate(
-            BINANCE_KLINES_ENDPOINTS,
-            start=1,
-        ):
             try:
                 res = self.session.get(
                     url,
-                    params={
-                        "symbol": binance_symbol,
-                        "interval": "5m",
-                        "limit": limit,
-                    },
                     timeout=self.timeout,
                 )
 
                 if res.status_code != 200:
-                    last_error = (
-                        f"endpoint={index} "
-                        f"status={res.status_code}"
-                    )
-
                     log.warning(
-                        "BINANCE KLINES FAILED | symbol=%s | %s",
-                        binance_symbol,
-                        last_error,
+                        "BINANCE TICKER HTTP ERROR | "
+                        "status=%s endpoint=%s",
+                        res.status_code,
+                        url,
                     )
-
                     continue
 
                 raw = res.json()
 
                 if not isinstance(raw, list):
-                    last_error = (
-                        f"endpoint={index} invalid_response"
-                    )
-                    continue
-
-                candles: List[Candle] = []
-
-                now_ms = int(time.time() * 1000)
-
-                for row in raw:
-                    try:
-                        candle = Candle.from_binance(row)
-
-                        # Do NOT put open candle into closed history.
-                        if candle.close_time >= now_ms:
-                            continue
-
-                        candles.append(candle)
-
-                    except (
-                        IndexError,
-                        TypeError,
-                        ValueError,
-                    ):
-                        continue
-
-                if not candles:
-                    last_error = (
-                        f"endpoint={index} no_closed_candles"
-                    )
-
                     log.warning(
-                        "BINANCE KLINES EMPTY | symbol=%s",
-                        binance_symbol,
+                        "BINANCE TICKER INVALID RESPONSE"
                     )
-
                     continue
+
+            except (
+                requests.RequestException,
+                ValueError,
+            ) as e:
+
+                log.warning(
+                    "BINANCE TICKER REQUEST ERROR | error=%s",
+                    e,
+                )
+                continue
+
+            filtered = {}
+
+            for item in raw:
+
+                sym = item.get("symbol")
+
+                if sym not in TARGET_SYMBOLS:
+                    continue
+
+                try:
+                    filtered[
+                        resolve_alias(sym)
+                    ] = {
+                        "lastPrice": float(
+                            item["lastPrice"]
+                        ),
+                        "quoteVolume": float(
+                            item["quoteVolume"]
+                        ),
+                        "priceChangePercent": float(
+                            item["priceChangePercent"]
+                        ),
+                    }
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    log.debug(
+                        "BINANCE INVALID TICKER | symbol=%s",
+                        sym,
+                    )
+                    continue
+
+            if filtered:
 
                 log.info(
-                    "BINANCE KLINES OK | symbol=%s | closed=%d",
-                    binance_symbol,
-                    len(candles),
+                    "BINANCE TICKER OK | symbols=%d",
+                    len(filtered),
                 )
 
-                return candles
-
-            except requests.Timeout as e:
-                last_error = (
-                    f"endpoint={index} timeout={e}"
-                )
-
-                log.error(
-                    "BINANCE KLINES TIMEOUT | symbol=%s | error=%s",
-                    binance_symbol,
-                    e,
-                )
-
-            except requests.RequestException as e:
-                last_error = (
-                    f"endpoint={index} request_error={e}"
-                )
-
-                log.error(
-                    "BINANCE KLINES REQUEST ERROR | symbol=%s | error=%s",
-                    binance_symbol,
-                    e,
-                )
-
-            except ValueError as e:
-                last_error = (
-                    f"endpoint={index} invalid_json={e}"
-                )
-
-                log.error(
-                    "BINANCE KLINES JSON ERROR | symbol=%s | error=%s",
-                    binance_symbol,
-                    e,
-                )
+                return filtered
 
         log.error(
-            "BINANCE KLINES FAILED ALL ENDPOINTS | symbol=%s | reason=%s",
-            binance_symbol,
-            last_error,
+            "BINANCE TICKER FAILED | all endpoints unavailable"
         )
 
-        return None
+        return {}
 
-    # ---------------------------------------------------------
-    # KuCoin ticker
-    # ---------------------------------------------------------
+    # =========================================================
+    # KUCOIN
+    # =========================================================
 
-    def _fetch_kucoin(self) -> Dict[str, dict]:
-        self.last_kucoin_error = None
-
-        started = time.monotonic()
+    def _fetch_kucoin(
+        self,
+    ) -> Dict[str, dict]:
 
         try:
             res = self.session.get(
-                KUCOIN_ENDPOINT,
-                timeout=self.timeout + 2,
+                KUCOIN_TICKER_ENDPOINT,
+                timeout=self.timeout,
             )
-
-            elapsed = time.monotonic() - started
 
             if res.status_code != 200:
-                self.last_kucoin_error = (
-                    f"status={res.status_code}"
-                )
 
-                log.error(
-                    "KUCOIN TICKER FAILED | status=%s | elapsed=%.2fs",
+                log.warning(
+                    "KUCOIN TICKER HTTP ERROR | status=%s",
                     res.status_code,
-                    elapsed,
                 )
 
                 return {}
 
-            try:
-                payload = res.json()
-            except ValueError as e:
-                self.last_kucoin_error = (
-                    f"invalid_json={e}"
-                )
+            payload = res.json()
 
-                log.error(
-                    "KUCOIN TICKER JSON ERROR | error=%s",
-                    e,
-                )
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as e:
 
-                return {}
-
-        except requests.Timeout as e:
-            self.last_kucoin_error = f"timeout={e}"
-
-            log.error(
-                "KUCOIN TICKER TIMEOUT | error=%s",
-                e,
-            )
-
-            return {}
-
-        except requests.RequestException as e:
-            self.last_kucoin_error = f"request_error={e}"
-
-            log.error(
+            log.warning(
                 "KUCOIN TICKER REQUEST ERROR | error=%s",
                 e,
             )
@@ -466,20 +285,10 @@ class MarketDataProvider:
             .get("ticker", [])
         )
 
-        if not isinstance(tickers, list):
-            self.last_kucoin_error = "ticker_not_list"
-
-            log.error(
-                "KUCOIN TICKER INVALID PAYLOAD"
-            )
-
-            return {}
-
-        result: Dict[str, dict] = {}
-
-        invalid = 0
+        result = {}
 
         for ticker in tickers:
+
             raw_symbol = ticker.get(
                 "symbol",
                 "",
@@ -496,52 +305,424 @@ class MarketDataProvider:
             if normalized not in TARGET_SYMBOLS:
                 continue
 
-            last_price = ticker.get("last")
-            vol_value = ticker.get("volValue")
-            change_rate = ticker.get("changeRate")
-
-            if (
-                last_price is None
-                or vol_value is None
-                or change_rate is None
-            ):
-                invalid += 1
-                continue
-
             try:
+
+                last_price = float(
+                    ticker["last"]
+                )
+
+                quote_volume = float(
+                    ticker["volValue"]
+                )
+
+                change_rate = float(
+                    ticker["changeRate"]
+                )
+
                 result[
                     resolve_alias(normalized)
                 ] = {
-                    "lastPrice": float(last_price),
-                    "quoteVolume": float(vol_value),
+                    "lastPrice": last_price,
+                    "quoteVolume": quote_volume,
                     "priceChangePercent": (
-                        float(change_rate) * 100
+                        change_rate * 100
                     ),
                 }
 
             except (
+                KeyError,
                 TypeError,
                 ValueError,
             ):
-                invalid += 1
+                log.debug(
+                    "KUCOIN INVALID TICKER | symbol=%s",
+                    raw_symbol,
+                )
 
-        if not result:
-            self.last_kucoin_error = (
-                "no_target_symbols"
+        if result:
+
+            log.info(
+                "KUCOIN TICKER OK | symbols=%d",
+                len(result),
             )
+
+        else:
 
             log.error(
-                "KUCOIN TICKER EMPTY | target_symbols=%d",
-                len(TARGET_SYMBOLS),
+                "KUCOIN TICKER FAILED | no target symbols"
             )
 
-            return {}
+        return result
+
+    # =========================================================
+    # HISTORY MAINTENANCE
+    # =========================================================
+
+    def _maintain_history(
+        self,
+        source: str,
+        ticker_data: Dict[str, dict],
+    ) -> None:
+
+        if not self.candle_store:
+            return
+
+        symbols = list(ticker_data.keys())
 
         log.info(
-            "KUCOIN TICKER OK | symbols=%d | invalid=%d | elapsed=%.2fs",
-            len(result),
-            invalid,
-            time.monotonic() - started,
+            "HISTORY MAINTENANCE | source=%s symbols=%d",
+            source,
+            len(symbols),
         )
 
-        return result
+        for symbol in symbols:
+
+            try:
+
+                # Load local history first.
+                self.candle_store.load(
+                    source,
+                    symbol,
+                )
+
+                count = self.candle_store.count(
+                    source,
+                    symbol,
+                )
+
+                # -------------------------------------------------
+                # BOOTSTRAP
+                # -------------------------------------------------
+
+                if count < self.history_limit:
+
+                    if symbol not in self._bootstrap_attempted[
+                        source
+                    ]:
+
+                        self._bootstrap_attempted[
+                            source
+                        ].add(symbol)
+
+                        log.info(
+                            "HISTORY BOOTSTRAP | "
+                            "source=%s symbol=%s current=%d/%d",
+                            source,
+                            symbol,
+                            count,
+                            self.history_limit,
+                        )
+
+                        candles = (
+                            self.fetch_recent_5m_candles(
+                                source,
+                                symbol,
+                                limit=self.history_limit,
+                            )
+                        )
+
+                        if candles:
+
+                            self.candle_store.seed(
+                                source,
+                                symbol,
+                                candles,
+                            )
+
+                            self.candle_store.save(
+                                source,
+                                symbol,
+                            )
+
+                            log.info(
+                                "HISTORY BOOTSTRAP OK | "
+                                "source=%s symbol=%s candles=%d/%d",
+                                source,
+                                symbol,
+                                self.candle_store.count(
+                                    source,
+                                    symbol,
+                                ),
+                                self.history_limit,
+                            )
+
+                        else:
+
+                            log.warning(
+                                "HISTORY BOOTSTRAP FAILED | "
+                                "source=%s symbol=%s",
+                                source,
+                                symbol,
+                            )
+
+                    # We do not repeatedly hammer REST on every cycle.
+                    continue
+
+                # -------------------------------------------------
+                # NORMAL UPDATE
+                # -------------------------------------------------
+
+                candles = (
+                    self.fetch_recent_5m_candles(
+                        source,
+                        symbol,
+                        limit=2,
+                    )
+                )
+
+                if not candles:
+                    log.warning(
+                        "LIVE CANDLE UPDATE FAILED | "
+                        "source=%s symbol=%s",
+                        source,
+                        symbol,
+                    )
+                    continue
+
+                # The API gives the most recent candle(s).
+                for candle in candles:
+                    self.candle_store.update(
+                        source,
+                        symbol,
+                        candle,
+                    )
+
+            except Exception as e:
+
+                log.exception(
+                    "HISTORY MAINTENANCE ERROR | "
+                    "source=%s symbol=%s error=%s",
+                    source,
+                    symbol,
+                    e,
+                )
+
+    # =========================================================
+    # CANDLES
+    # =========================================================
+
+    def fetch_recent_5m_candles(
+        self,
+        source: str,
+        symbol: str,
+        limit: int = 864,
+    ) -> Optional[List[Candle]]:
+
+        source = source.lower()
+
+        if source == "binance":
+
+            return self._fetch_binance_candles(
+                symbol,
+                limit,
+            )
+
+        if source == "kucoin":
+
+            return self._fetch_kucoin_candles(
+                symbol,
+                limit,
+            )
+
+        raise ValueError(
+            f"Unsupported source: {source}"
+        )
+
+    # ---------------------------------------------------------
+    # Binance candles
+    # ---------------------------------------------------------
+
+    def _fetch_binance_candles(
+        self,
+        symbol: str,
+        limit: int,
+    ) -> Optional[List[Candle]]:
+
+        for endpoint in BINANCE_KLINES_ENDPOINTS:
+
+            try:
+
+                response = self.session.get(
+                    endpoint,
+                    params={
+                        "symbol": symbol,
+                        "interval": "5m",
+                        "limit": min(
+                            int(limit),
+                            1000,
+                        ),
+                    },
+                    timeout=self.timeout,
+                )
+
+                if response.status_code != 200:
+
+                    log.warning(
+                        "BINANCE KLINE HTTP ERROR | "
+                        "symbol=%s status=%s",
+                        symbol,
+                        response.status_code,
+                    )
+
+                    continue
+
+                raw = response.json()
+
+                if not isinstance(raw, list):
+                    continue
+
+                candles = []
+
+                now_ms = int(
+                    time.time() * 1000
+                )
+
+                for item in raw:
+
+                    try:
+
+                        candle = Candle.from_binance(
+                            item
+                        )
+
+                        # NEVER put an open candle into closed history.
+                        if candle.close_time >= now_ms:
+                            continue
+
+                        candles.append(candle)
+
+                    except (
+                        TypeError,
+                        ValueError,
+                        IndexError,
+                    ):
+                        continue
+
+                if candles:
+
+                    return candles
+
+            except (
+                requests.RequestException,
+                ValueError,
+            ) as e:
+
+                log.warning(
+                    "BINANCE KLINE ERROR | "
+                    "symbol=%s error=%s",
+                    symbol,
+                    e,
+                )
+
+        return None
+
+    # ---------------------------------------------------------
+    # KuCoin candles
+    # ---------------------------------------------------------
+
+    def _fetch_kucoin_candles(
+        self,
+        symbol: str,
+        limit: int,
+    ) -> Optional[List[Candle]]:
+
+        kucoin_symbol = (
+            f"{symbol}-USDT"
+        )
+
+        now_sec = int(
+            time.time()
+        )
+
+        start_sec = (
+            now_sec
+            - (limit * 300)
+            - 600
+        )
+
+        try:
+
+            response = self.session.get(
+                KUCOIN_KLINES_ENDPOINT,
+                params={
+                    "tradeType": "SPOT",
+                    "symbol": kucoin_symbol,
+                    "interval": "5min",
+                    "startAt": start_sec,
+                    "endAt": now_sec,
+                },
+                timeout=self.timeout,
+            )
+
+            if response.status_code != 200:
+
+                log.warning(
+                    "KUCOIN KLINE HTTP ERROR | "
+                    "symbol=%s status=%s",
+                    symbol,
+                    response.status_code,
+                )
+
+                return None
+
+            payload = response.json()
+
+            if payload.get("code") != "200000":
+                log.warning(
+                    "KUCOIN KLINE API ERROR | "
+                    "symbol=%s response=%s",
+                    symbol,
+                    payload,
+                )
+                return None
+
+            raw = payload.get(
+                "data",
+                [],
+            )
+
+            candles = []
+
+            now_ms = int(
+                time.time() * 1000
+            )
+
+            for item in raw:
+
+                try:
+
+                    candle = Candle.from_kucoin(
+                        item
+                    )
+
+                    if candle.close_time >= now_ms:
+                        continue
+
+                    candles.append(candle)
+
+                except (
+                    TypeError,
+                    ValueError,
+                    IndexError,
+                ):
+                    continue
+
+            candles.sort(
+                key=lambda c: c.open_time
+            )
+
+            return candles[-min(limit, 864):]
+
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as e:
+
+            log.warning(
+                "KUCOIN KLINE ERROR | "
+                "symbol=%s error=%s",
+                symbol,
+                e,
+            )
+
+            return None
