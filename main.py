@@ -7,7 +7,8 @@ Two independent background loops:
 
 1. Market loop
    - Priority: Binance → Bybit → KuCoin.
-   - Each exchange maintains its own 5-minute candle history (never mixed).
+   - On start: restore from GitHub, else download last 864 5m candles.
+   - Persist to local disk + GitHub so Render restarts keep history.
    - 48 closed candles for smart-money / volume-flow detection.
    - Up to 864 closed candles (72 hours) for pump/dump analysis.
 
@@ -61,10 +62,7 @@ log = logging.getLogger("smart_money_bot")
 
 INSTANCE_ID = uuid.uuid4().hex[:8]
 
-# Startup Telegram announce is sent at most once (persisted in BotState).
-# Re-deploys / process restarts must not spam users.
 STARTUP_ANNOUNCE_KEY = "bot_startup_announce"
-# Effectively permanent once marked (~30 years).
 STARTUP_ANNOUNCE_TTL_SEC = 30 * 365 * 24 * 3600
 
 log.info(
@@ -204,10 +202,6 @@ def broadcast_targets():
 
 
 def send_startup_announcement_once() -> None:
-    """
-    Telegram startup banner — only the first time the bot ever runs
-    (or after state file is cleared). Subsequent process restarts skip it.
-    """
 
     if state.is_in_cooldown(
         STARTUP_ANNOUNCE_KEY,
@@ -307,11 +301,48 @@ def start_candle_store():
         log.info("CANDLE STORE BACKGROUND WORKER NOT REQUIRED")
 
 
+def run_startup_history_bootstrap() -> None:
+    """
+    Restore from GitHub when possible, otherwise download last 864
+    candles from live exchanges, then persist local + GitHub.
+    """
+
+    log.info("STARTUP HISTORY BOOTSTRAP BEGIN")
+
+    try:
+        stats = market_analyzer.bootstrap_histories(
+            github_backup=github_backup,
+            target_count=settings.history_candle_limit,
+        )
+        log.info("STARTUP HISTORY BOOTSTRAP STATS | %s", stats)
+    except Exception:
+        log.exception("STARTUP HISTORY BOOTSTRAP FAILED")
+
+    try:
+        save_candle_store()
+    except Exception:
+        log.exception("STARTUP HISTORY LOCAL SAVE FAILED")
+
+    if github_backup.is_configured():
+        try:
+            ok = github_backup.backup()
+            log.info(
+                "STARTUP HISTORY GITHUB BACKUP | ok=%s pending=%s",
+                ok,
+                github_backup.pending_count(),
+            )
+        except Exception:
+            log.exception("STARTUP HISTORY GITHUB BACKUP FAILED")
+
+
 def market_loop():
 
     time.sleep(3)
 
     send_startup_announcement_once()
+
+    # Full 72h window before first analysis cycle.
+    run_startup_history_bootstrap()
 
     log.info(
         "MARKET LOOP STARTED | interval=%ss",
