@@ -54,18 +54,20 @@ class Candle:
     @classmethod
     def from_kucoin(cls, raw: list) -> "Candle":
         """
-        KuCoin kline format:
+        KuCoin kline format (official):
         [time, open, close, high, low, volume, turnover]
-        """
 
+        time is in seconds (unix).
+        """
+        open_ms = int(float(raw[0]) * 1000)
         return cls(
-            open_time=int(float(raw[0]) * 1000),
-            close_time=int(float(raw[0]) * 1000) + 5 * 60 * 1000 - 1,
+            open_time=open_ms,
+            close_time=open_ms + 5 * 60 * 1000 - 1,
             open=float(raw[1]),
-            close=float(raw[3]),
-            high=float(raw[4]),
-            low=float(raw[5]),
-            volume=float(raw[6]),
+            close=float(raw[2]),
+            high=float(raw[3]),
+            low=float(raw[4]),
+            volume=float(raw[5]),
             quote_volume=float(raw[6]),
             trades=0,
         )
@@ -80,7 +82,7 @@ class CandleStore:
             market_history/binance/SUIUSDT.json
 
         KuCoin:
-            market_history/kucoin/SUI-USDT.json
+            market_history/kucoin/SUIUSDT.json
 
     NEVER mix the two.
     """
@@ -89,7 +91,16 @@ class CandleStore:
         self,
         root_path: str = "market_history",
         max_candles: int = CANDLE_LIMIT,
+        github_enabled: bool = False,
+        github_token: str = "",
+        github_repo: str = "",
+        github_branch: str = "main",
+        github_sync_interval_sec: int = 300,
+        **kwargs,
     ):
+        # Accept extra kwargs for forward compatibility with older callers.
+        del kwargs
+
         self.root_path = root_path
         self.max_candles = max_candles
         self._lock = threading.RLock()
@@ -108,6 +119,14 @@ class CandleStore:
             "binance": set(),
             "kucoin": set(),
         }
+
+        # GitHub metadata (actual sync is handled externally via
+        # github_candle_backup when configured).
+        self.github_enabled = bool(github_enabled and github_token and github_repo)
+        self.github_token = github_token or ""
+        self.github_repo = github_repo or ""
+        self.github_branch = github_branch or "main"
+        self.github_sync_interval_sec = max(60, int(github_sync_interval_sec))
 
         os.makedirs(self.root_path, exist_ok=True)
         os.makedirs(os.path.join(self.root_path, "binance"), exist_ok=True)
@@ -402,6 +421,34 @@ class CandleStore:
             self._dirty[source].add(symbol)
 
             return True
+
+    # =========================================================
+    # APPLY A BATCH OF RECENT CANDLES (live update path)
+    # =========================================================
+
+    def apply_recent(
+        self,
+        source: str,
+        symbol: str,
+        candles: List[Candle],
+    ) -> int:
+        """
+        Feed a short list of recent candles (oldest -> newest) into the store.
+
+        Returns the number of newly closed candles produced by this batch.
+        """
+        if not candles:
+            return 0
+
+        candles = sorted(candles, key=lambda c: c.open_time)
+        closed_count = 0
+
+        for candle in candles:
+            result = self.update(source, symbol, candle)
+            if result == "closed":
+                closed_count += 1
+
+        return closed_count
 
     # =========================================================
     # GETTERS
