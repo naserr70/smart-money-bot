@@ -709,12 +709,6 @@ class MarketAnalyzer:
             f"📤 <b>سیگنال خروج:</b> "
             f"<code>{outflow_count}</code> مورد\n"
 
-            f"📚 <b>Baseline حجم:</b> "
-            f"<code>48 × 5m</code>\n"
-
-            f"📖 <b>تاریخچه:</b> "
-            f"<code>864 × 5m = 72h</code>\n"
-
             f"📡 <b>وضعیت سیستم:</b> "
             f"فعال و ۲۴ ساعته"
         )
