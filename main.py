@@ -6,14 +6,10 @@ Architecture
 Two independent background loops:
 
 1. Market loop
-   - Binance is preferred.
-   - KuCoin is used as fallback when Binance is unavailable.
-   - Binance and KuCoin candle histories are NEVER mixed.
-   - Each exchange maintains its own 5-minute candle history.
-   - 48 closed candles are used for smart-money / volume-flow detection.
-   - Up to 864 closed candles (72 hours) are retained for pump/dump analysis.
-   - The currently open candle is kept separately by CandleStore.
-   - Every cycle fetches a few recent candles and advances the rolling window.
+   - Priority: Binance → Bybit → KuCoin.
+   - Each exchange maintains its own 5-minute candle history (never mixed).
+   - 48 closed candles for smart-money / volume-flow detection.
+   - Up to 864 closed candles (72 hours) for pump/dump analysis.
 
 2. Whale loop
    - Independent on-chain exchange-wallet flow detection.
@@ -21,17 +17,10 @@ Two independent background loops:
 
 Persistent candle history
 --------------------------
-CandleStore keeps:
-
     market_history/
         binance/
-            BTCUSDT.json
-            ...
+        bybit/
         kucoin/
-            BTCUSDT.json
-            ...
-
-The two sources are completely isolated.
 
 GitHub persistence
 ------------------
@@ -53,7 +42,7 @@ from flask import Flask, jsonify, request
 
 import bot_commands
 from access_control import AccessControl
-from candle_store import CandleStore
+from candle_store import CandleStore, VALID_SOURCES
 from config import settings
 from exchange_flow import ExchangeFlowTracker
 from formatting import esc
@@ -63,21 +52,12 @@ from state import BotState
 from telegram_notifier import TelegramNotifier
 
 
-# ============================================================
-# Logging
-# ============================================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
 log = logging.getLogger("smart_money_bot")
-
-
-# ============================================================
-# Process identity
-# ============================================================
 
 INSTANCE_ID = uuid.uuid4().hex[:8]
 
@@ -86,25 +66,10 @@ log.info(
     INSTANCE_ID,
 )
 
-
-# ============================================================
-# Flask
-# ============================================================
-
 app = Flask(__name__)
 
 
-# ============================================================
-# HTTP session
-# ============================================================
-
 def build_http_session() -> requests.Session:
-    """
-    Shared HTTP session.
-
-    Retries are deliberately limited. Binance 418 must NOT be hammered
-    repeatedly because that can make rate-limit / IP restrictions worse.
-    """
 
     session = requests.Session()
 
@@ -138,20 +103,10 @@ def build_http_session() -> requests.Session:
 
 http_session = build_http_session()
 
-
-# ============================================================
-# Persistent bot state
-# ============================================================
-
 state = BotState(
     history_window=settings.history_window,
     state_file_path=settings.state_file_path,
 )
-
-
-# ============================================================
-# Access control
-# ============================================================
 
 access = AccessControl(
     settings.auth_state_file_path,
@@ -161,22 +116,12 @@ access = AccessControl(
     http_session=http_session,
 )
 
-
-# ============================================================
-# Telegram notifier
-# ============================================================
-
 notifier = TelegramNotifier(
     settings.bot_token,
     settings.chat_id,
     timeout=settings.http_timeout_sec,
     max_retries=settings.http_max_retries,
 )
-
-
-# ============================================================
-# Candle Store
-# ============================================================
 
 candle_store = CandleStore(
     root_path=settings.candle_store_path,
@@ -194,11 +139,6 @@ log.info(
     settings.history_candle_limit,
     "enabled" if settings.github_candle_store_enabled else "disabled",
 )
-
-
-# ============================================================
-# GitHub candle backup (Trees API, single-commit batches)
-# ============================================================
 
 github_backup = GitHubCandleBackup(
     session=http_session,
@@ -222,11 +162,6 @@ else:
         "set GITHUB_TOKEN and GITHUB_REPO to enable"
     )
 
-
-# ============================================================
-# Market analyzer
-# ============================================================
-
 market_analyzer = MarketAnalyzer(
     settings=settings,
     state=state,
@@ -236,11 +171,6 @@ market_analyzer = MarketAnalyzer(
 
 log.info("MARKET ANALYZER READY | candle_store=injected")
 
-
-# ============================================================
-# Whale tracker
-# ============================================================
-
 whale_tracker = ExchangeFlowTracker(
     settings,
     state,
@@ -248,16 +178,7 @@ whale_tracker = ExchangeFlowTracker(
 )
 
 
-# ============================================================
-# Helpers
-# ============================================================
-
 def broadcast_targets():
-    """
-    Admin + every currently-authorized non-expired user.
-
-    Duplicates are removed while preserving order.
-    """
 
     admin = settings.admin_chat_id_resolved
 
@@ -277,22 +198,13 @@ def broadcast_targets():
 
 
 def queue_dirty_to_github() -> int:
-    """
-    After local save, queue dirty (just-saved) payloads to GitHub backup.
-
-    Returns number of files newly queued.
-    """
 
     if not github_backup.is_configured():
         return 0
 
     queued = 0
 
-    for source in ("binance", "kucoin"):
-        # Symbols that were dirty before save_dirty cleared them are gone;
-        # re-scan in-memory closed histories and queue any that differ.
-        # Practical approach: queue every symbol that currently has history
-        # and let the backup module hash-dedupe unchanged content.
+    for source in VALID_SOURCES:
         try:
             with candle_store._lock:
                 symbols = list(
@@ -317,7 +229,6 @@ def queue_dirty_to_github() -> int:
 
 
 def save_candle_store():
-    """Best-effort local persistence + optional GitHub queue."""
 
     try:
         candle_store.save_dirty()
@@ -338,7 +249,6 @@ def save_candle_store():
 
 
 def start_candle_store():
-    """Start GitHub backup background loop when configured."""
 
     if github_backup.is_configured():
         try:
@@ -355,19 +265,7 @@ def start_candle_store():
         log.info("CANDLE STORE BACKGROUND WORKER NOT REQUIRED")
 
 
-# ============================================================
-# Market loop
-# ============================================================
-
 def market_loop():
-    """
-    Main CEX market loop.
-
-    IMPORTANT:
-    Binance/KuCoin selection is handled by MarketData/MarketAnalyzer.
-
-    This loop does NOT copy history from one exchange to another.
-    """
 
     time.sleep(3)
 
@@ -524,10 +422,6 @@ def market_loop():
         time.sleep(sleep_for)
 
 
-# ============================================================
-# Whale loop
-# ============================================================
-
 def whale_loop():
 
     if not whale_tracker.is_enabled():
@@ -599,14 +493,7 @@ def whale_loop():
         time.sleep(sleep_for)
 
 
-# ============================================================
-# Telegram webhook
-# ============================================================
-
 def register_telegram_webhook():
-    """
-    Register Telegram webhook automatically on Render.
-    """
 
     base_url = (
         os.environ
@@ -674,10 +561,6 @@ def register_telegram_webhook():
             e,
         )
 
-
-# ============================================================
-# Startup
-# ============================================================
 
 def start_background_threads():
 
@@ -758,24 +641,16 @@ def start_background_threads():
 start_background_threads()
 
 
-# ============================================================
-# Health check
-# ============================================================
-
 @app.route("/")
 def health_check():
 
     return (
         "Smart Money Bot v2 — "
-        "Market ticker + independent Binance/KuCoin "
+        "Market ticker + independent Binance/Bybit/KuCoin "
         "candle history + on-chain tracking active.",
         200,
     )
 
-
-# ============================================================
-# Status API
-# ============================================================
 
 @app.route("/status")
 def status():
@@ -813,10 +688,6 @@ def status():
 
     return jsonify(health)
 
-
-# ============================================================
-# Admin status
-# ============================================================
 
 def build_admin_status_text() -> str:
 
@@ -907,10 +778,6 @@ def build_admin_status_text() -> str:
     return "\n".join(lines)
 
 
-# ============================================================
-# Telegram webhook endpoint
-# ============================================================
-
 @app.route(
     "/telegram/webhook",
     methods=["POST"],
@@ -962,10 +829,6 @@ def telegram_webhook():
     return "ok", 200
 
 
-# ============================================================
-# Graceful-ish shutdown helper
-# ============================================================
-
 def shutdown_persistence():
 
     log.info("PERSISTENCE SHUTDOWN START")
@@ -988,10 +851,6 @@ def shutdown_persistence():
 
     log.info("PERSISTENCE SHUTDOWN COMPLETE")
 
-
-# ============================================================
-# Local development
-# ============================================================
 
 if __name__ == "__main__":
 
