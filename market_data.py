@@ -8,7 +8,7 @@ for redundancy), then KuCoin as a fallback if Binance is unreachable
 using Nobitex-canonical symbols (aliases already resolved).
 """
 import logging
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -22,6 +22,7 @@ BINANCE_ENDPOINTS = [
     "https://api3.binance.com/api/v3/ticker/24hr",
     "https://api.binance.com/api/v3/ticker/24hr",
 ]
+BINANCE_KLINES_ENDPOINT = "https://api.binance.com/api/v3/klines"
 KUCOIN_ENDPOINT = "https://api.kucoin.com/api/v1/market/allTickers"
 
 
@@ -47,7 +48,7 @@ class MarketDataProvider:
                     continue
                 raw = res.json()
             except (requests.RequestException, ValueError) as e:
-                log.warning(f"Ø¨Ø§ÛÙÙØ³ {url} Ø®Ø·Ø§ Ø¯Ø§Ø¯: {e}")
+                log.warning(f"بایننس {url} خطا داد: {e}")
                 continue
 
             filtered: Dict[str, dict] = {}
@@ -67,6 +68,33 @@ class MarketDataProvider:
                 return filtered
         return {}
 
+    def fetch_recent_5m_volumes(self, binance_symbol: str, limit: int = 36) -> Optional[List[float]]:
+        """Real, per-candle 5-minute quote-volume history from Binance's
+        klines endpoint — used to seed an accurate volume baseline
+        immediately, instead of the old 24h-rolling-delta proxy (which is
+        contaminated by whatever happened at this exact time-of-day
+        yesterday) or the naive 24h/288 uniform-distribution guess used
+        during the first few cycles after a symbol is first seen.
+        Returns None on any failure so the caller can fall back gracefully;
+        never raises."""
+        try:
+            res = self.session.get(
+                BINANCE_KLINES_ENDPOINT,
+                params={"symbol": binance_symbol, "interval": "5m", "limit": limit},
+                timeout=self.timeout,
+            )
+            if res.status_code != 200:
+                return None
+            raw = res.json()
+            if not isinstance(raw, list):
+                return None
+            # kline format: [openTime, open, high, low, close, volume, closeTime,
+            #                 quoteAssetVolume, numTrades, takerBuyBase, takerBuyQuote, ignore]
+            volumes = [float(candle[7]) for candle in raw]
+            return volumes if volumes else None
+        except (requests.RequestException, ValueError, IndexError, TypeError):
+            return None
+
     def _fetch_kucoin(self) -> Dict[str, dict]:
         try:
             res = self.session.get(KUCOIN_ENDPOINT, timeout=self.timeout + 2)
@@ -74,7 +102,7 @@ class MarketDataProvider:
                 return {}
             payload = res.json()
         except (requests.RequestException, ValueError) as e:
-            log.warning(f"Ú©ÙÚ©ÙÛÙ Ø®Ø·Ø§ Ø¯Ø§Ø¯: {e}")
+            log.warning(f"کوکوین خطا داد: {e}")
             return {}
 
         tickers = payload.get("data", {}).get("ticker", [])
@@ -102,4 +130,3 @@ class MarketDataProvider:
             except (TypeError, ValueError):
                 continue
         return result
-
