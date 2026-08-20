@@ -63,7 +63,12 @@ class BotState:
     def get_baseline_volume(self, symbol: str, fallback_avg: float) -> float:
         with self._lock:
             hist = self.volume_history.get(symbol)
-            if hist and len(hist) >= 3:
+            # Require a meaningful sample count before trusting the real
+            # average over the naive fallback — with klines seeding this is
+            # usually moot (seeds in a full window immediately), but it's
+            # the safety net for the rare case seeding failed and history
+            # is accumulating one real cycle at a time.
+            if hist and len(hist) >= 10:
                 return max(statistics.mean(hist), 1.0)
         return max(fallback_avg, 1.0)
 
@@ -71,6 +76,18 @@ class BotState:
         with self._lock:
             hist = self.volume_history.setdefault(symbol, deque(maxlen=self._history_window))
             hist.append(value)
+
+    def seed_volume_history(self, symbol: str, samples: list) -> None:
+        """One-time seed of real per-candle volumes (from Binance klines) so
+        a symbol has an accurate baseline from its very first cycle, instead
+        of relying on the naive 24h/288 fallback for the first few cycles.
+        No-ops if this symbol already has history (never overwrites live
+        data that's already been collected)."""
+        with self._lock:
+            if symbol in self.volume_history and len(self.volume_history[symbol]) >= 10:
+                return
+            hist = deque(samples[-self._history_window:], maxlen=self._history_window)
+            self.volume_history[symbol] = hist
 
     def push_price_return_sample(self, symbol: str, pct_change: float) -> None:
         with self._lock:
