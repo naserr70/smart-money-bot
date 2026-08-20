@@ -3,13 +3,14 @@ Independent exchange-aware market analyzer.
 
 Signal logic
 ------------
-1. Smart Money:
-   Most recently CLOSED 5m candle volume compared with previous
-   48 CLOSED 5m candles from the SAME exchange.
+1. Volume spike (smart money):
+   Latest CLOSED 5m quote_volume vs the mean of the previous
+   candles inside the rolling 864-candle window (72 hours)
+   from the SAME exchange. Signal candle is excluded from the mean.
 
 2. Pump / Dump:
    Price movement and volume anomaly evaluated against the long
-   CLOSED-candle history, up to 864 candles.
+   CLOSED-candle history (up to 864 candles).
 
 3. Active analysis priority:
    Binance → Bybit → KuCoin
@@ -26,7 +27,6 @@ import requests
 
 from candle_store import (
     CandleStore,
-    SMART_MONEY_BASELINE_CANDLES,
     PUMP_HISTORY_CANDLES,
     VALID_SOURCES,
 )
@@ -44,6 +44,9 @@ from state import BotState
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
 LIVE_UPDATE_LIMIT = 5
+
+# Volume baseline = rolling 72h window (864 × 5m), excluding signal candle.
+VOLUME_BASELINE_CANDLES = PUMP_HISTORY_CANDLES  # 864
 
 
 class MarketAnalyzer:
@@ -94,7 +97,6 @@ class MarketAnalyzer:
         for source, tickers in sources_tickers.items():
             self._live_update_candles(source=source, tickers=tickers)
 
-        # Priority: Binance → Bybit → KuCoin
         if binance_tickers:
             active_source = "binance"
             ticker_stats = binance_tickers
@@ -193,7 +195,7 @@ class MarketAnalyzer:
                     symbol,
                 )
 
-                if current_count >= PUMP_HISTORY_CANDLES:
+                if current_count >= VOLUME_BASELINE_CANDLES:
                     continue
 
                 self.candle_store.load(
@@ -206,16 +208,14 @@ class MarketAnalyzer:
                     symbol,
                 )
 
-                if current_count >= PUMP_HISTORY_CANDLES:
+                if current_count >= VOLUME_BASELINE_CANDLES:
                     continue
 
-                if current_count >= SMART_MONEY_BASELINE_CANDLES:
-                    continue
-
+                # Always aim for full 72h window (864) for volume baseline.
                 candles = self.provider.fetch_candles(
                     source=source,
                     symbol=symbol,
-                    limit=PUMP_HISTORY_CANDLES,
+                    limit=VOLUME_BASELINE_CANDLES,
                 )
 
                 if not candles:
@@ -244,7 +244,7 @@ class MarketAnalyzer:
                     source,
                     symbol,
                     stored_count,
-                    PUMP_HISTORY_CANDLES,
+                    VOLUME_BASELINE_CANDLES,
                 )
 
             except Exception:
@@ -317,9 +317,9 @@ class MarketAnalyzer:
             symbol,
         )
 
-        minimum_required = (
-            SMART_MONEY_BASELINE_CANDLES + 1
-        )
+        # Need a full rolling 72h window so baseline is the 864-mean
+        # of prior candles (signal candle excluded).
+        minimum_required = VOLUME_BASELINE_CANDLES
 
         if len(history) < minimum_required:
 
@@ -335,7 +335,10 @@ class MarketAnalyzer:
 
             return None
 
-        current_candle = history[-1]
+        # Last VOLUME_BASELINE_CANDLES closed candles (rolling window).
+        window = history[-VOLUME_BASELINE_CANDLES:]
+
+        current_candle = window[-1]
 
         signal_key = f"{source}:{symbol}"
         last_ot = self._last_signaled_open_time.get(signal_key)
@@ -343,18 +346,19 @@ class MarketAnalyzer:
         if last_ot is not None and current_candle.open_time <= last_ot:
             return None
 
-        baseline_candles = history[
-            -SMART_MONEY_BASELINE_CANDLES - 1:-1
-        ]
+        # Baseline = mean quote_volume of the window EXCLUDING the
+        # candle under evaluation (up to 863 prior candles when full).
+        baseline_candles = window[:-1]
 
-        if len(baseline_candles) != (
-            SMART_MONEY_BASELINE_CANDLES
-        ):
+        if len(baseline_candles) < (VOLUME_BASELINE_CANDLES - 1):
             log.warning(
                 "NO_SIGNAL | source=%s symbol=%s "
-                "reason=BASELINE_NOT_READY",
+                "reason=BASELINE_NOT_READY "
+                "baseline_n=%s need=%s",
                 source,
                 symbol,
+                len(baseline_candles),
+                VOLUME_BASELINE_CANDLES - 1,
             )
             return None
 
@@ -364,14 +368,16 @@ class MarketAnalyzer:
             if c.quote_volume > 0
         ]
 
-        if len(baseline_values) != (
-            SMART_MONEY_BASELINE_CANDLES
-        ):
+        # Require a complete positive-volume baseline (no zero gaps).
+        if len(baseline_values) != len(baseline_candles):
             log.warning(
                 "NO_SIGNAL | source=%s symbol=%s "
-                "reason=INVALID_BASELINE_VALUES",
+                "reason=INVALID_BASELINE_VALUES "
+                "valid=%s/%s",
                 source,
                 symbol,
+                len(baseline_values),
+                len(baseline_candles),
             )
             return None
 
@@ -534,7 +540,7 @@ class MarketAnalyzer:
             log.info(
                 "NO_SIGNAL | source=%s symbol=%s "
                 "reason=THRESHOLD_NOT_MET "
-                "volume=%.2f baseline=%.2f spike=%.2fX "
+                "volume=%.2f baseline_72h=%.2f spike=%.2fX "
                 "required=%.2fX price=%.2f%% "
                 "close_to_close=%s zscore=%s",
                 source,
@@ -647,7 +653,7 @@ class MarketAnalyzer:
         log.warning(
             "SIGNAL FIRED | source=%s symbol=%s "
             "direction=%s trigger=%s "
-            "volume=%.2f baseline=%.2f spike=%.2fX "
+            "volume=%.2f baseline_72h=%.2f spike=%.2fX "
             "inflow=%.2f price=%.2f%% zscore=%s",
             source,
             symbol,
