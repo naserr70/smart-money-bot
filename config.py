@@ -81,17 +81,6 @@ def _load_exchange_wallets() -> Dict[str, Dict[str, str]]:
     """
     Load exchange wallets from EXCHANGE_WALLETS_JSON.
 
-    Example:
-
-    {
-        "ETH": {
-            "0x123...": "Binance"
-        },
-        "BSC": {
-            "0x456...": "Binance"
-        }
-    }
-
     User-provided wallets extend the defaults.
     """
 
@@ -218,19 +207,6 @@ class Settings:
     # CEX market analysis
     # ========================================================
 
-    #
-    # IMPORTANT:
-    #
-    # MIN_INFLOW_USD_5M has deliberately been removed from
-    # signal gating.
-    #
-    # A signal is NOT required to have a fixed $50K/$100K
-    # amount anymore.
-    #
-    # Volume abnormality itself determines whether the market
-    # activity is significant.
-    #
-
     volume_spike_ratio: float = field(
         default_factory=lambda:
         _env_float(
@@ -287,10 +263,6 @@ class Settings:
     # Candle history
     # ========================================================
 
-    #
-    # 864 x 5 minutes = 72 hours.
-    #
-
     candle_history_limit: int = field(
         default_factory=lambda:
         _env_int(
@@ -307,13 +279,6 @@ class Settings:
         )
     )
 
-    #
-    # Number of CLOSED candles used for smart-money volume
-    # comparison.
-    #
-    # 48 x 5m = 4 hours.
-    #
-
     volume_baseline_candles: int = field(
         default_factory=lambda:
         _env_int(
@@ -321,11 +286,6 @@ class Settings:
             48,
         )
     )
-
-    #
-    # Full historical window used for statistical pump/dump
-    # analysis.
-    #
 
     pump_history_candles: int = field(
         default_factory=lambda:
@@ -355,11 +315,6 @@ class Settings:
         )
     )
 
-    #
-    # Minimum historical observations required before a
-    # statistical calculation is considered valid.
-    #
-
     pump_min_history_candles: int = field(
         default_factory=lambda:
         _env_int(
@@ -372,10 +327,6 @@ class Settings:
     # Exchange source selection
     # ========================================================
 
-    #
-    # Binance is preferred.
-    #
-
     binance_enabled: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -383,10 +334,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # KuCoin remains available as an independent fallback.
-    #
 
     kucoin_enabled: bool = field(
         default_factory=lambda:
@@ -396,13 +343,6 @@ class Settings:
         )
     )
 
-    #
-    # Never merge Binance and KuCoin candle histories.
-    #
-    # This is intentionally a configuration flag so the behavior
-    # is explicit.
-    #
-
     separate_exchange_history: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -410,13 +350,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # Active market source:
-    #
-    # Binance -> preferred
-    # KuCoin  -> fallback
-    #
 
     preferred_market_source: str = field(
         default_factory=lambda:
@@ -430,11 +363,6 @@ class Settings:
     # Candle bootstrap
     # ========================================================
 
-    #
-    # Number of candles requested when a symbol has no local
-    # history.
-    #
-
     candle_bootstrap_limit: int = field(
         default_factory=lambda:
         _env_int(
@@ -442,11 +370,6 @@ class Settings:
             864,
         )
     )
-
-    #
-    # When an exchange already has some history, request only
-    # the missing section instead of downloading everything.
-    #
 
     candle_incremental_bootstrap: bool = field(
         default_factory=lambda:
@@ -460,21 +383,6 @@ class Settings:
     # Local candle storage
     # ========================================================
 
-    #
-    # Fast local cache.
-    #
-    # Example:
-    #
-    # market_history/
-    #   binance/
-    #       BTCUSDT.json
-    #       ETHUSDT.json
-    #
-    #   kucoin/
-    #       BTCUSDT.json
-    #       ETHUSDT.json
-    #
-
     candle_store_path: str = field(
         default_factory=lambda:
         _env_str(
@@ -482,10 +390,6 @@ class Settings:
             "market_history",
         )
     )
-
-    #
-    # Save local candle changes immediately after an update.
-    #
 
     candle_local_autosave: bool = field(
         default_factory=lambda:
@@ -499,14 +403,6 @@ class Settings:
     # GitHub candle persistence
     # ========================================================
 
-    #
-    # GitHub repository used as persistent storage.
-    #
-    # Example:
-    #
-    # naserr70/smart-money-bot
-    #
-
     github_repo: str = field(
         default_factory=lambda:
         _env_str(
@@ -515,18 +411,10 @@ class Settings:
         )
     )
 
-    #
-    # GitHub Personal Access Token.
-    #
-
     github_token: str = field(
         default_factory=lambda:
         _env_str("GITHUB_TOKEN")
     )
-
-    #
-    # Branch where candle files are stored.
-    #
 
     github_branch: str = field(
         default_factory=lambda:
@@ -536,10 +424,6 @@ class Settings:
         )
     )
 
-    #
-    # Directory inside GitHub repository.
-    #
-
     github_candle_path: str = field(
         default_factory=lambda:
         _env_str(
@@ -547,17 +431,6 @@ class Settings:
             "market_history",
         )
     )
-
-    #
-    # Backup interval.
-    #
-    # The bot can update local history every cycle but should not
-    # continuously hit GitHub for every individual ticker.
-    #
-    # Default:
-    #
-    # 300 sec = 5 minutes
-    #
 
     github_candle_sync_interval_sec: int = field(
         default_factory=lambda:
@@ -567,10 +440,6 @@ class Settings:
         )
     )
 
-    #
-    # Upload only changed files.
-    #
-
     github_sync_dirty_only: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -578,13 +447,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # Use Git Trees API / Git Data API instead of creating a
-    # separate commit for every single candle file.
-    #
-    # This is important because we may have hundreds of symbols.
-    #
 
     github_use_git_trees_api: bool = field(
         default_factory=lambda:
@@ -594,12 +456,6 @@ class Settings:
         )
     )
 
-    #
-    # Maximum number of files included in one GitHub sync.
-    #
-    # 0 means unlimited.
-    #
-
     github_max_files_per_sync: int = field(
         default_factory=lambda:
         _env_int(
@@ -608,10 +464,6 @@ class Settings:
         )
     )
 
-    #
-    # GitHub request timeout.
-    #
-
     github_http_timeout_sec: int = field(
         default_factory=lambda:
         _env_int(
@@ -619,10 +471,6 @@ class Settings:
             20,
         )
     )
-
-    #
-    # Retry GitHub synchronization after failure.
-    #
 
     github_max_retries: int = field(
         default_factory=lambda:
@@ -636,18 +484,6 @@ class Settings:
     # Market history source policy
     # ========================================================
 
-    #
-    # When Binance is available:
-    #
-    #     Binance ticker + Binance candles
-    #
-    # When Binance is unavailable:
-    #
-    #     KuCoin ticker + KuCoin candles
-    #
-    # The histories NEVER mix.
-    #
-
     use_source_specific_history: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -656,11 +492,6 @@ class Settings:
         )
     )
 
-    #
-    # Always maintain both exchange histories whenever data
-    # from both exchanges can be obtained.
-    #
-
     maintain_both_exchange_histories: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -668,11 +499,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # If Binance ticker is unavailable but KuCoin is available,
-    # use KuCoin for the active signal cycle.
-    #
 
     allow_kucoin_fallback: bool = field(
         default_factory=lambda:
@@ -686,16 +512,6 @@ class Settings:
     # Volume calculation
     # ========================================================
 
-    #
-    # Signal condition:
-    #
-    # current CLOSED 5m candle quote volume
-    # ------------------------------------- >= ratio
-    # average of previous 48 CLOSED candles
-    #
-    # No MIN_INFLOW_USD filter.
-    #
-
     volume_signal_enabled: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -703,12 +519,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # 2.0 means:
-    #
-    # current candle >= 2x average
-    #
 
     volume_signal_multiplier: float = field(
         default_factory=lambda:
@@ -718,12 +528,6 @@ class Settings:
         )
     )
 
-    #
-    # Do NOT normalize a currently-open candle.
-    #
-    # Signals are generated after a 5m candle is closed.
-    #
-
     signal_only_on_closed_candle: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -731,11 +535,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # This prevents the current candle from contaminating its
-    # own baseline.
-    #
 
     exclude_current_candle_from_baseline: bool = field(
         default_factory=lambda:
@@ -749,11 +548,6 @@ class Settings:
     # Price change calculation
     # ========================================================
 
-    #
-    # Price movement is calculated from candle OHLC data,
-    # not from 24h ticker movement.
-    #
-
     use_candle_price_change: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -761,10 +555,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # Closed-candle price movement used for static pump/dump.
-    #
 
     static_price_signal_enabled: bool = field(
         default_factory=lambda:
@@ -887,10 +677,6 @@ class Settings:
         )
     )
 
-    #
-    # Detailed market analysis logging.
-    #
-
     market_debug_logging: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -899,10 +685,6 @@ class Settings:
         )
     )
 
-    #
-    # Log every reason why a signal was rejected.
-    #
-
     signal_reason_logging: bool = field(
         default_factory=lambda:
         _env_bool(
@@ -910,10 +692,6 @@ class Settings:
             True,
         )
     )
-
-    #
-    # Log exchange source selection.
-    #
 
     source_logging: bool = field(
         default_factory=lambda:
@@ -924,8 +702,32 @@ class Settings:
     )
 
     # ========================================================
-    # Resolved admin
+    # Compatibility aliases used by main.py / older modules
     # ========================================================
+
+    @property
+    def history_window(self) -> int:
+        return self.candle_history_limit
+
+    @property
+    def history_candle_limit(self) -> int:
+        return self.candle_history_limit
+
+    @property
+    def github_candle_store_enabled(self) -> bool:
+        return bool(self.github_token and self.github_repo)
+
+    @property
+    def github_candle_store_token(self) -> str:
+        return self.github_token
+
+    @property
+    def github_candle_store_repo(self) -> str:
+        return self.github_repo
+
+    @property
+    def github_candle_store_branch(self) -> str:
+        return self.github_branch
 
     @property
     def admin_chat_id_resolved(self) -> str:
@@ -934,7 +736,6 @@ class Settings:
 
         If it is not configured, CHAT_ID is used.
         """
-
         return self.admin_chat_id or self.chat_id
 
     # ========================================================
@@ -951,10 +752,6 @@ class Settings:
 
         problems: List[str] = []
 
-        # ----------------------------------------------------
-        # Telegram
-        # ----------------------------------------------------
-
         if not self.bot_token:
             problems.append(
                 "BOT_TOKEN تنظیم نشده است — ارسال پیام غیرممکن خواهد بود."
@@ -964,10 +761,6 @@ class Settings:
             problems.append(
                 "CHAT_ID تنظیم نشده است — ارسال پیام غیرممکن خواهد بود."
             )
-
-        # ----------------------------------------------------
-        # Authentication
-        # ----------------------------------------------------
 
         if not self.bot_access_password:
             problems.append(
@@ -979,10 +772,6 @@ class Settings:
                 "TELEGRAM_WEBHOOK_SECRET تنظیم نشده است."
             )
 
-        # ----------------------------------------------------
-        # GitHub authentication
-        # ----------------------------------------------------
-
         if not self.github_token:
             problems.append(
                 "GITHUB_TOKEN تنظیم نشده است — "
@@ -993,10 +782,6 @@ class Settings:
             problems.append(
                 "GITHUB_REPO تنظیم نشده است."
             )
-
-        # ----------------------------------------------------
-        # Market source
-        # ----------------------------------------------------
 
         if (
             not self.binance_enabled
@@ -1013,10 +798,6 @@ class Settings:
             problems.append(
                 "PREFERRED_MARKET_SOURCE باید binance یا kucoin باشد."
             )
-
-        # ----------------------------------------------------
-        # Candle history
-        # ----------------------------------------------------
 
         if self.candle_history_limit <= 0:
             problems.append(
@@ -1054,10 +835,6 @@ class Settings:
                 "CANDLE_HISTORY_LIMIT باشد."
             )
 
-        # ----------------------------------------------------
-        # Volume
-        # ----------------------------------------------------
-
         if self.volume_signal_multiplier < 1.0:
             problems.append(
                 "VOLUME_SIGNAL_MULTIPLIER نباید کمتر از 1 باشد."
@@ -1068,10 +845,6 @@ class Settings:
                 "VOLUME_SPIKE_RATIO نباید کمتر از 1 باشد."
             )
 
-        # ----------------------------------------------------
-        # Price
-        # ----------------------------------------------------
-
         if self.price_pump_min < 0:
             problems.append(
                 "PRICE_PUMP_MIN نمی‌تواند منفی باشد."
@@ -1081,10 +854,6 @@ class Settings:
             problems.append(
                 "PRICE_PUMP_MIN باید کوچکتر از PRICE_PUMP_MAX باشد."
             )
-
-        # ----------------------------------------------------
-        # Z-score
-        # ----------------------------------------------------
 
         if self.pump_zscore_threshold <= 0:
             problems.append(
@@ -1099,10 +868,6 @@ class Settings:
                 "PUMP_MIN_HISTORY_CANDLES نمی‌تواند بیشتر از "
                 "PUMP_HISTORY_CANDLES باشد."
             )
-
-        # ----------------------------------------------------
-        # Intervals
-        # ----------------------------------------------------
 
         if self.scan_interval_sec <= 0:
             problems.append(
@@ -1119,10 +884,6 @@ class Settings:
                 "ALERT_COOLDOWN_SEC نمی‌تواند منفی باشد."
             )
 
-        # ----------------------------------------------------
-        # GitHub sync
-        # ----------------------------------------------------
-
         if self.github_candle_sync_interval_sec <= 0:
             problems.append(
                 "GITHUB_CANDLE_SYNC_INTERVAL_SEC باید مثبت باشد."
@@ -1137,10 +898,6 @@ class Settings:
             problems.append(
                 "GITHUB_MAX_RETRIES نمی‌تواند منفی باشد."
             )
-
-        # ----------------------------------------------------
-        # On-chain
-        # ----------------------------------------------------
 
         if not self.etherscan_api_key:
             problems.append(
