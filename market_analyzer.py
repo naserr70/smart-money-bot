@@ -44,6 +44,9 @@ from state import BotState
 
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
+# How many recent candles to fetch each cycle for the rolling update.
+LIVE_UPDATE_LIMIT = 5
+
 
 class MarketAnalyzer:
 
@@ -65,6 +68,10 @@ class MarketAnalyzer:
 
         self.candle_store = candle_store
 
+        # Track last closed open_time we already evaluated for signals,
+        # so we only fire once per newly closed candle.
+        self._last_signaled_open_time: Dict[str, int] = {}
+
     # =========================================================
     # MAIN CYCLE
     # =========================================================
@@ -84,14 +91,7 @@ class MarketAnalyzer:
             return [], "none", 0
 
         # -----------------------------------------------------
-        # IMPORTANT:
         # Maintain BOTH histories independently.
-        #
-        # Never do:
-        #
-        # Binance unavailable -> copy KuCoin into Binance history
-        #
-        # That is explicitly forbidden.
         # -----------------------------------------------------
 
         self._maintain_history(
@@ -100,6 +100,21 @@ class MarketAnalyzer:
         )
 
         self._maintain_history(
+            source="kucoin",
+            tickers=kucoin_tickers,
+        )
+
+        # -----------------------------------------------------
+        # Live rolling update: fetch a few recent candles and
+        # push them into the store so history advances.
+        # -----------------------------------------------------
+
+        self._live_update_candles(
+            source="binance",
+            tickers=binance_tickers,
+        )
+
+        self._live_update_candles(
             source="kucoin",
             tickers=kucoin_tickers,
         )
@@ -174,7 +189,7 @@ class MarketAnalyzer:
         )
 
     # =========================================================
-    # HISTORY MAINTENANCE
+    # HISTORY MAINTENANCE (bootstrap)
     # =========================================================
 
     def _maintain_history(
@@ -210,13 +225,8 @@ class MarketAnalyzer:
                     symbol,
                 )
 
-                # Full history already exists.
                 if current_count >= PUMP_HISTORY_CANDLES:
                     continue
-
-                # -------------------------------------------------
-                # Try loading existing local history first.
-                # -------------------------------------------------
 
                 self.candle_store.load(
                     source,
@@ -231,20 +241,10 @@ class MarketAnalyzer:
                 if current_count >= PUMP_HISTORY_CANDLES:
                     continue
 
-                # -------------------------------------------------
-                # If enough history already exists, don't repeatedly
-                # bootstrap it on every scan.
-                #
-                # CandleStore is responsible for maintaining the
-                # rolling history after this bootstrap.
-                # -------------------------------------------------
-
+                # Enough for smart-money baseline; live updates
+                # will continue to grow the window.
                 if current_count >= SMART_MONEY_BASELINE_CANDLES:
                     continue
-
-                # -------------------------------------------------
-                # Bootstrap ONLY from the SAME exchange.
-                # -------------------------------------------------
 
                 if source == "binance":
                     candles = self.provider.fetch_binance_candles(
@@ -295,6 +295,66 @@ class MarketAnalyzer:
                 )
 
     # =========================================================
+    # LIVE CANDLE UPDATE (rolling window)
+    # =========================================================
+
+    def _live_update_candles(
+        self,
+        source: str,
+        tickers: Dict[str, dict],
+    ) -> None:
+
+        if not tickers:
+            return
+
+        updated = 0
+        closed_total = 0
+
+        for symbol in tickers:
+
+            try:
+                # Ensure local history is loaded before updating.
+                if self.candle_store.count(source, symbol) == 0:
+                    self.candle_store.load(source, symbol)
+
+                if source == "binance":
+                    candles = self.provider.fetch_binance_candles(
+                        symbol=symbol,
+                        limit=LIVE_UPDATE_LIMIT,
+                    )
+                else:
+                    candles = self.provider.fetch_kucoin_candles(
+                        symbol=symbol,
+                        limit=LIVE_UPDATE_LIMIT,
+                    )
+
+                if not candles:
+                    continue
+
+                closed = self.candle_store.apply_recent(
+                    source,
+                    symbol,
+                    candles,
+                )
+
+                updated += 1
+                closed_total += closed
+
+            except Exception:
+                log.exception(
+                    "LIVE UPDATE ERROR | source=%s symbol=%s",
+                    source,
+                    symbol,
+                )
+
+        log.info(
+            "LIVE UPDATE DONE | source=%s symbols=%s newly_closed=%s",
+            source,
+            updated,
+            closed_total,
+        )
+
+    # =========================================================
     # SYMBOL ANALYSIS
     # =========================================================
 
@@ -328,14 +388,15 @@ class MarketAnalyzer:
 
             return None
 
-        # -----------------------------------------------------
-        # history is already CLOSED candles.
-        #
-        # The final item is therefore the newest CLOSED candle,
-        # never the currently open candle.
-        # -----------------------------------------------------
-
         current_candle = history[-1]
+
+        # Only evaluate a candle once (when it first becomes the
+        # newest closed candle).
+        signal_key = f"{source}:{symbol}"
+        last_ot = self._last_signaled_open_time.get(signal_key)
+
+        if last_ot is not None and current_candle.open_time <= last_ot:
+            return None
 
         baseline_candles = history[
             -SMART_MONEY_BASELINE_CANDLES - 1:-1
@@ -391,10 +452,11 @@ class MarketAnalyzer:
             current_volume / baseline
         )
 
-        # -----------------------------------------------------
-        # Current candle open -> close movement.
-        # Used for the user-facing 5m price movement.
-        # -----------------------------------------------------
+        # Estimated additional volume (net inflow approximation).
+        estimated_inflow = max(
+            0.0,
+            current_volume - baseline,
+        )
 
         if current_candle.open <= 0:
             log.warning(
@@ -413,10 +475,6 @@ class MarketAnalyzer:
             / current_candle.open
         ) * 100.0
 
-        # -----------------------------------------------------
-        # Smart-money volume threshold.
-        # -----------------------------------------------------
-
         volume_threshold = (
             baseline
             * self.settings.volume_spike_ratio
@@ -426,47 +484,9 @@ class MarketAnalyzer:
             current_volume >= volume_threshold
         )
 
-        # -----------------------------------------------------
-        # Long-term CLOSED history.
-        # -----------------------------------------------------
-
         long_history = history[
             -PUMP_HISTORY_CANDLES:
         ]
-
-        long_volume_values = [
-            float(c.quote_volume)
-            for c in long_history
-            if c.quote_volume > 0
-        ]
-
-        long_average = None
-
-        if len(long_volume_values) >= 100:
-            long_average = (
-                sum(long_volume_values)
-                / len(long_volume_values)
-            )
-
-        # -----------------------------------------------------
-        # Statistical price anomaly.
-        #
-        # IMPORTANT FIX:
-        #
-        # The historical distribution is CLOSE-to-CLOSE returns.
-        # Therefore the current observation must ALSO be a
-        # CLOSE-to-CLOSE return.
-        #
-        # The old implementation compared:
-        #
-        #     current open -> close
-        #
-        # against:
-        #
-        #     previous close -> current close
-        #
-        # which is statistically inconsistent.
-        # -----------------------------------------------------
 
         current_close_to_close = None
 
@@ -511,9 +531,6 @@ class MarketAnalyzer:
             and len(long_returns) >= 100
         ):
 
-            # Exclude the current observation from the baseline.
-            # Otherwise the event being tested partially determines
-            # its own mean/stdev.
             baseline_returns = long_returns[:-1]
 
             if len(baseline_returns) >= 99:
@@ -530,13 +547,6 @@ class MarketAnalyzer:
                     zscore = (
                         current_close_to_close - mean
                     ) / stdev
-
-        # -----------------------------------------------------
-        # Static pump / dump.
-        #
-        # Static detection remains based on the CLOSED candle's
-        # own open -> close movement.
-        # -----------------------------------------------------
 
         static_pump = (
             is_volume_spike
@@ -566,16 +576,18 @@ class MarketAnalyzer:
             and is_volume_spike
         )
 
-        # -----------------------------------------------------
-        # NO SIGNAL
-        # -----------------------------------------------------
-
         if not (
             static_pump
             or static_dump
             or statistical_pump
             or statistical_dump
         ):
+
+            # Still mark as processed so we don't re-evaluate
+            # the same closed candle every cycle.
+            self._last_signaled_open_time[signal_key] = (
+                current_candle.open_time
+            )
 
             log.info(
                 "NO_SIGNAL | source=%s symbol=%s "
@@ -604,10 +616,6 @@ class MarketAnalyzer:
 
             return None
 
-        # -----------------------------------------------------
-        # COOLDOWN
-        # -----------------------------------------------------
-
         cooldown_key = (
             f"market:{source}:{symbol}"
         )
@@ -617,6 +625,10 @@ class MarketAnalyzer:
             self.settings.alert_cooldown_sec,
         ):
 
+            self._last_signaled_open_time[signal_key] = (
+                current_candle.open_time
+            )
+
             log.info(
                 "NO_SIGNAL | source=%s symbol=%s "
                 "reason=COOLDOWN",
@@ -625,10 +637,6 @@ class MarketAnalyzer:
             )
 
             return None
-
-        # -----------------------------------------------------
-        # Direction / trigger
-        # -----------------------------------------------------
 
         if static_pump or statistical_pump:
 
@@ -651,10 +659,6 @@ class MarketAnalyzer:
                 trigger = TriggerType.STATISTICAL
             else:
                 trigger = TriggerType.STATIC
-
-        # -----------------------------------------------------
-        # Signal
-        # -----------------------------------------------------
 
         try:
             price = float(current_candle.close)
@@ -682,7 +686,7 @@ class MarketAnalyzer:
             price=price,
             change_5m=candle_price_change,
             change_24h=change_24h,
-            inflow_usd=current_volume,
+            inflow_usd=estimated_inflow,
             spike_multiplier=spike_multiplier,
             direction=direction,
             trigger=trigger,
@@ -694,11 +698,15 @@ class MarketAnalyzer:
             cooldown_key
         )
 
+        self._last_signaled_open_time[signal_key] = (
+            current_candle.open_time
+        )
+
         log.warning(
             "SIGNAL FIRED | source=%s symbol=%s "
             "direction=%s trigger=%s "
             "volume=%.2f baseline=%.2f spike=%.2fX "
-            "price=%.2f%% zscore=%s",
+            "inflow=%.2f price=%.2f%% zscore=%s",
             source,
             symbol,
             direction.value,
@@ -706,6 +714,7 @@ class MarketAnalyzer:
             current_volume,
             baseline,
             spike_multiplier,
+            estimated_inflow,
             candle_price_change,
             (
                 f"{zscore:.2f}"
