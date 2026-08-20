@@ -55,6 +55,8 @@ class MarketAnalyzer:
 
             prev = self.state.previous_market_snapshot.get(symbol)
             if not prev or price_usd <= 0 or prev["price"] <= 0:
+                if not prev:
+                    self._seed_baseline_if_new(symbol, full_symbol)
                 continue
 
             price_change = ((price_usd - prev["price"]) / prev["price"]) * 100
@@ -123,10 +125,26 @@ class MarketAnalyzer:
         self.state.swap_snapshot(current_snapshot)
         return signals, data_source, len(ticker_stats)
 
+    def _seed_baseline_if_new(self, symbol: str, binance_symbol: str) -> None:
+        """Called the first time a symbol is ever seen (this cycle or after
+        a restart). Pulls real 5-minute candle volumes from Binance so the
+        very next cycle already has an accurate rolling baseline, instead
+        of relying on the naive 24h/288 uniform-distribution guess for the
+        first ~15 minutes. Best-effort: any failure just leaves the old
+        fallback in place, nothing breaks."""
+        try:
+            volumes = self.provider.fetch_recent_5m_volumes(binance_symbol, limit=self.settings.history_window)
+            if volumes:
+                self.state.seed_volume_history(symbol, volumes)
+        except Exception:
+            log.debug(f"seed baseline برای {symbol} ناموفق بود؛ به fallback قبلی اکتفا می‌شود.")
+        finally:
+            time.sleep(0.05)  # stay well clear of Binance's rate limit during the first-cycle burst
+
     def build_status_message(self, data_source: str, symbols_scanned: int,
                               inflow_count: int, outflow_count: int) -> str:
         return (
-            f"🟢 <b>گزارش رصد زنده مارکت</b> \n\n"
+            f"🟢 <b>گزارش رصد زنده مارکت</b> <i>(حذف خودکار پس از {self.settings.auto_delete_delay_sec // 60} دقیقه)</i>\n\n"
             f"⏰ <b>زمان (UTC):</b> <code>{datetime.now(timezone.utc).strftime('%H:%M:%S')}</code>\n"
             f"🌐 <b>منبع داده:</b> <code>{esc(data_source)}</code>\n"
             f"🔍 <b>ارزهای آنالیز شده:</b> <code>{symbols_scanned}</code> از تمامی بازارهای نوبیتکس\n"
