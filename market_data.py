@@ -1,11 +1,13 @@
 """
 Independent Binance / KuCoin market data provider.
 
-Rules:
+Rules
+-----
 - Binance and KuCoin are completely independent.
 - No history is copied between exchanges.
-- Both sources can maintain their own candle history.
-- Market analyzer chooses Binance when available, otherwise KuCoin.
+- Each exchange maintains its own candle history.
+- MarketAnalyzer chooses Binance for the current analysis cycle
+  when available, otherwise KuCoin.
 """
 
 import logging
@@ -15,22 +17,23 @@ import requests
 
 from assets import TARGET_SYMBOLS, resolve_alias
 
+
 log = logging.getLogger("smart_money_bot.market_data")
 
 
-BINANCE_TICKER_ENDPOINTS = [
+BINANCE_TICKER_ENDPOINTS = (
     "https://api1.binance.com/api/v3/ticker/24hr",
     "https://api2.binance.com/api/v3/ticker/24hr",
     "https://api3.binance.com/api/v3/ticker/24hr",
     "https://api.binance.com/api/v3/ticker/24hr",
-]
+)
 
-BINANCE_KLINES_ENDPOINTS = [
+BINANCE_KLINES_ENDPOINTS = (
     "https://api1.binance.com/api/v3/klines",
     "https://api2.binance.com/api/v3/klines",
     "https://api3.binance.com/api/v3/klines",
     "https://api.binance.com/api/v3/klines",
-]
+)
 
 KUCOIN_TICKER_ENDPOINT = (
     "https://api.kucoin.com/api/v1/market/allTickers"
@@ -49,7 +52,7 @@ class MarketDataProvider:
         timeout: int = 10,
     ):
         self.session = session
-        self.timeout = timeout
+        self.timeout = max(1, int(timeout))
 
     # =========================================================
     # TICKERS
@@ -57,47 +60,56 @@ class MarketDataProvider:
 
     def fetch_binance(self) -> Dict[str, dict]:
 
-        log.info(
-            "BINANCE TICKER FETCH START"
-        )
+        log.info("BINANCE TICKER FETCH START")
 
         for endpoint in BINANCE_TICKER_ENDPOINTS:
 
             try:
-
                 response = self.session.get(
                     endpoint,
                     timeout=self.timeout,
                 )
 
                 if response.status_code != 200:
-
                     log.warning(
-                        "BINANCE TICKER HTTP ERROR | status=%s endpoint=%s",
+                        "BINANCE TICKER HTTP ERROR | "
+                        "status=%s endpoint=%s",
                         response.status_code,
                         endpoint,
                     )
-
                     continue
 
-                raw = response.json()
+                try:
+                    raw = response.json()
+                except ValueError:
+                    log.warning(
+                        "BINANCE TICKER INVALID JSON | "
+                        "endpoint=%s",
+                        endpoint,
+                    )
+                    continue
 
                 if not isinstance(raw, list):
+                    log.warning(
+                        "BINANCE TICKER INVALID PAYLOAD | "
+                        "endpoint=%s",
+                        endpoint,
+                    )
                     continue
 
-                result = {}
+                result: Dict[str, dict] = {}
 
                 for item in raw:
 
-                    symbol = item.get(
-                        "symbol"
-                    )
+                    if not isinstance(item, dict):
+                        continue
+
+                    symbol = item.get("symbol")
 
                     if symbol not in TARGET_SYMBOLS:
                         continue
 
                     try:
-
                         normalized = resolve_alias(
                             symbol
                         )
@@ -122,71 +134,79 @@ class MarketDataProvider:
                         continue
 
                 if result:
-
                     log.info(
-                        "BINANCE TICKER OK | symbols=%s endpoint=%s",
+                        "BINANCE TICKER OK | "
+                        "symbols=%s endpoint=%s",
                         len(result),
                         endpoint,
                     )
-
                     return result
 
-            except requests.RequestException as e:
-
+            except requests.RequestException as exc:
                 log.warning(
-                    "BINANCE TICKER REQUEST ERROR | endpoint=%s error=%s",
+                    "BINANCE TICKER REQUEST ERROR | "
+                    "endpoint=%s error=%s",
                     endpoint,
-                    e,
+                    exc,
                 )
 
         log.error(
-            "BINANCE TICKER FAILED | all endpoints unavailable"
+            "BINANCE TICKER FAILED | "
+            "all endpoints unavailable"
         )
 
         return {}
 
     def fetch_kucoin(self) -> Dict[str, dict]:
 
-        log.info(
-            "KUCOIN TICKER FETCH START"
-        )
+        log.info("KUCOIN TICKER FETCH START")
 
         try:
-
             response = self.session.get(
                 KUCOIN_TICKER_ENDPOINT,
                 timeout=self.timeout + 2,
             )
 
             if response.status_code != 200:
-
                 log.warning(
                     "KUCOIN TICKER HTTP ERROR | status=%s",
                     response.status_code,
                 )
-
                 return {}
 
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError:
+                log.warning(
+                    "KUCOIN TICKER INVALID JSON"
+                )
+                return {}
 
-            tickers = (
-                payload
-                .get("data", {})
-                .get("ticker", [])
-            )
+            if not isinstance(payload, dict):
+                return {}
 
-            result = {}
+            data = payload.get("data", {})
+
+            if not isinstance(data, dict):
+                return {}
+
+            tickers = data.get("ticker", [])
+
+            if not isinstance(tickers, list):
+                return {}
+
+            result: Dict[str, dict] = {}
 
             for item in tickers:
 
-                raw_symbol = item.get(
-                    "symbol",
-                    "",
-                )
+                if not isinstance(item, dict):
+                    continue
 
-                if not raw_symbol.endswith(
-                    "-USDT"
-                ):
+                raw_symbol = str(
+                    item.get("symbol", "")
+                ).upper()
+
+                if not raw_symbol.endswith("-USDT"):
                     continue
 
                 normalized = raw_symbol.replace(
@@ -198,7 +218,6 @@ class MarketDataProvider:
                     continue
 
                 try:
-
                     canonical = resolve_alias(
                         normalized
                     )
@@ -213,7 +232,7 @@ class MarketDataProvider:
                         "priceChangePercent": (
                             float(
                                 item["changeRate"]
-                            ) * 100
+                            ) * 100.0
                         ),
                     }
 
@@ -231,16 +250,11 @@ class MarketDataProvider:
 
             return result
 
-        except (
-            requests.RequestException,
-            ValueError,
-        ) as e:
-
+        except requests.RequestException as exc:
             log.error(
                 "KUCOIN TICKER FAILED | error=%s",
-                e,
+                exc,
             )
-
             return {}
 
     # =========================================================
@@ -253,16 +267,17 @@ class MarketDataProvider:
         limit: int = 864,
     ) -> Optional[list]:
 
+        limit = max(1, min(int(limit), 1000))
+
         params = {
             "symbol": symbol,
             "interval": "5m",
-            "limit": min(limit, 1000),
+            "limit": limit,
         }
 
         for endpoint in BINANCE_KLINES_ENDPOINTS:
 
             try:
-
                 response = self.session.get(
                     endpoint,
                     params=params,
@@ -270,24 +285,31 @@ class MarketDataProvider:
                 )
 
                 if response.status_code != 200:
-
                     log.warning(
-                        "BINANCE HISTORY HTTP ERROR | symbol=%s status=%s endpoint=%s",
+                        "BINANCE HISTORY HTTP ERROR | "
+                        "symbol=%s status=%s endpoint=%s",
                         symbol,
                         response.status_code,
                         endpoint,
                     )
-
                     continue
 
-                raw = response.json()
+                try:
+                    raw = response.json()
+                except ValueError:
+                    log.warning(
+                        "BINANCE HISTORY INVALID JSON | "
+                        "symbol=%s",
+                        symbol,
+                    )
+                    continue
 
                 if not isinstance(raw, list):
-
                     return None
 
                 log.info(
-                    "BINANCE HISTORY OK | symbol=%s candles=%s/%s",
+                    "BINANCE HISTORY OK | "
+                    "symbol=%s candles=%s/%s",
                     symbol,
                     len(raw),
                     limit,
@@ -295,16 +317,13 @@ class MarketDataProvider:
 
                 return raw
 
-            except (
-                requests.RequestException,
-                ValueError,
-            ) as e:
-
+            except requests.RequestException as exc:
                 log.warning(
-                    "BINANCE HISTORY ERROR | symbol=%s endpoint=%s error=%s",
+                    "BINANCE HISTORY ERROR | "
+                    "symbol=%s endpoint=%s error=%s",
                     symbol,
                     endpoint,
-                    e,
+                    exc,
                 )
 
         return None
@@ -315,15 +334,14 @@ class MarketDataProvider:
         limit: int = 864,
     ) -> Optional[list]:
 
-        # KuCoin uses SYMBOL-USDT.
-        if "-" not in symbol:
+        limit = max(1, int(limit))
 
-            symbol = (
-                symbol[:-4]
-                + "-USDT"
-                if symbol.endswith("USDT")
-                else symbol
-            )
+        if "-" not in symbol:
+            if symbol.endswith("USDT"):
+                symbol = (
+                    symbol[:-4]
+                    + "-USDT"
+                )
 
         params = {
             "symbol": symbol,
@@ -331,7 +349,6 @@ class MarketDataProvider:
         }
 
         try:
-
             response = self.session.get(
                 KUCOIN_KLINES_ENDPOINT,
                 params=params,
@@ -339,32 +356,40 @@ class MarketDataProvider:
             )
 
             if response.status_code != 200:
-
                 log.warning(
-                    "KUCOIN HISTORY HTTP ERROR | symbol=%s status=%s",
+                    "KUCOIN HISTORY HTTP ERROR | "
+                    "symbol=%s status=%s",
                     symbol,
                     response.status_code,
                 )
-
                 return None
 
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError:
+                log.warning(
+                    "KUCOIN HISTORY INVALID JSON | "
+                    "symbol=%s",
+                    symbol,
+                )
+                return None
 
-            raw = payload.get(
-                "data",
-                [],
-            )
+            if not isinstance(payload, dict):
+                return None
+
+            raw = payload.get("data", [])
 
             if not isinstance(raw, list):
                 return None
 
-            # KuCoin can return newest first.
+            # KuCoin commonly returns newest-first.
             raw = list(reversed(raw))
 
             raw = raw[-limit:]
 
             log.info(
-                "KUCOIN HISTORY OK | symbol=%s candles=%s/%s",
+                "KUCOIN HISTORY OK | "
+                "symbol=%s candles=%s/%s",
                 symbol,
                 len(raw),
                 limit,
@@ -372,17 +397,13 @@ class MarketDataProvider:
 
             return raw
 
-        except (
-            requests.RequestException,
-            ValueError,
-        ) as e:
-
+        except requests.RequestException as exc:
             log.warning(
-                "KUCOIN HISTORY ERROR | symbol=%s error=%s",
+                "KUCOIN HISTORY ERROR | "
+                "symbol=%s error=%s",
                 symbol,
-                e,
+                exc,
             )
-
             return None
 
     # =========================================================
@@ -394,7 +415,6 @@ class MarketDataProvider:
         symbol: str,
         limit: int = 864,
     ):
-
         from candle_store import Candle
 
         raw = self.fetch_binance_klines(
@@ -408,7 +428,6 @@ class MarketDataProvider:
         candles = []
 
         for row in raw:
-
             try:
                 candles.append(
                     Candle.from_binance(row)
@@ -427,7 +446,6 @@ class MarketDataProvider:
         symbol: str,
         limit: int = 864,
     ):
-
         from candle_store import Candle
 
         raw = self.fetch_kucoin_klines(
@@ -441,7 +459,6 @@ class MarketDataProvider:
         candles = []
 
         for row in raw:
-
             try:
                 candles.append(
                     Candle.from_kucoin(row)
@@ -466,11 +483,17 @@ class MarketDataProvider:
         Dict[str, dict],
     ]:
 
+        # Fetch both independently.
+        #
+        # A failure in Binance does not prevent KuCoin from being
+        # queried, and vice versa.
+
         binance = self.fetch_binance()
         kucoin = self.fetch_kucoin()
 
         log.info(
-            "MARKET SOURCES | binance_symbols=%s | kucoin_symbols=%s",
+            "MARKET SOURCES | "
+            "binance_symbols=%s | kucoin_symbols=%s",
             len(binance),
             len(kucoin),
         )
