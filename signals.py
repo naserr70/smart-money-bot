@@ -1,5 +1,8 @@
 """
-Typed signal objects and Telegram formatting.
+Typed market and exchange-flow signal objects.
+
+Telegram messages intentionally contain only user-facing trading
+information. Internal source/debug information is NOT displayed.
 """
 
 from dataclasses import dataclass
@@ -22,29 +25,30 @@ class TriggerType(Enum):
 
 @dataclass
 class MarketSignal:
+
     symbol: str
-
     price: float
-
     change_5m: float
-
     change_24h: float
-
-    # Dollar volume of the signal candle.
     inflow_usd: float
-
-    # Current closed candle volume / previous 48-candle average.
     spike_multiplier: float
-
     direction: SignalDirection
 
     trigger: TriggerType = TriggerType.STATIC
 
     zscore: Optional[float] = None
 
+    # Internal only. Never displayed in Telegram.
+    source: str = ""
+
     def to_telegram(self) -> str:
 
-        is_statistical = (
+        is_pump = (
+            self.direction
+            == SignalDirection.INFLOW
+        )
+
+        is_pump_labeled = (
             self.trigger
             in (
                 TriggerType.STATISTICAL,
@@ -52,92 +56,69 @@ class MarketSignal:
             )
         )
 
-        if self.direction == SignalDirection.INFLOW:
+        if is_pump:
 
-            if is_statistical:
+            if is_pump_labeled:
+
                 header = (
                     "🚀 <b>پامپ شناسایی شد "
                     "(PUMP DETECTED)</b> 🚀"
                 )
+
             else:
+
                 header = (
                     "🚨 <b>ورود پول هوشمند "
                     "(SMART MONEY IN)</b> 🚨"
                 )
 
             price_line = (
-                f"📈 <b>رشد قیمت اخیر:</b> "
+                "📈 <b>رشد قیمت اخیر:</b> "
                 f"<code>+{self.change_5m:.2f}%</code>"
             )
 
-            flow_label = "حجم معاملات"
+            flow_label = "ورود پول خالص"
 
             advice = (
                 "🎯 <b>توصیه:</b> "
-                "بررسی چارت در تایم‌فریم ۱۵ دقیقه."
+                "بررسی چارت در تایم‌فریم ۱۵ دقیقه "
+                "و ورود پله‌ای."
             )
 
         else:
 
-            if is_statistical:
+            if is_pump_labeled:
+
                 header = (
                     "💥 <b>دامپ ناگهانی شناسایی شد "
                     "(SUDDEN DUMP DETECTED)</b> 💥"
                 )
+
             else:
+
                 header = (
                     "🔻 <b>خروج پول هوشمند "
                     "(SMART MONEY OUT)</b> 🔻"
                 )
 
             price_line = (
-                f"📉 <b>افت قیمت اخیر:</b> "
+                "📉 <b>افت قیمت اخیر:</b> "
                 f"<code>{self.change_5m:.2f}%</code>"
             )
 
-            flow_label = "حجم معاملات"
+            flow_label = "خروج پول خالص"
 
             advice = (
                 "🎯 <b>توصیه:</b> "
+                "احتمال توزیع/خروج نهنگ؛ "
                 "احتیاط در نگهداری پوزیشن."
             )
 
-        detection_line = ""
-
-        if self.trigger == TriggerType.STATIC:
-
-            detection_line = (
-                "🔎 <b>نوع تشخیص:</b> "
-                "جهش حجم + حرکت قیمتی"
-            )
-
-        elif self.trigger == TriggerType.STATISTICAL:
-
-            z = (
-                f"{self.zscore:.1f}σ"
-                if self.zscore is not None
-                else "N/A"
-            )
-
-            detection_line = (
-                "🔎 <b>نوع تشخیص:</b> "
-                f"ناهنجاری آماری "
-                f"(<code>{esc(z)}</code>)"
-            )
-
-        elif self.trigger == TriggerType.BOTH:
-
-            z = (
-                f"{self.zscore:.1f}σ"
-                if self.zscore is not None
-                else "N/A"
-            )
-
-            detection_line = (
-                "🔎 <b>نوع تشخیص:</b> "
-                f"جهش حجم + ناهنجاری آماری "
-                f"(<code>{esc(z)}</code>)"
-            )
+        # Do NOT expose z-score.
+        #
+        # Do NOT expose exchange source.
+        #
+        # Do NOT expose internal detection methodology.
 
         return (
             f"{header}\n\n"
@@ -149,17 +130,18 @@ class MarketSignal:
             f"📊 <b>تغییرات ۲۴ ساعته:</b> "
             f"<code>{self.change_24h:+.2f}%</code>\n\n"
             f"{price_line}\n"
-            f"🔥 <b>{flow_label}:</b> "
+            f"🔥 <b>{esc(flow_label)}:</b> "
             f"<code>${self.inflow_usd / 1e3:,.1f}K</code>\n"
-            f"⚡ <b>جهش حجم:</b> "
-            f"<code>{self.spike_multiplier:.1f}X</code>\n"
-            f"{detection_line}\n\n"
+            f"⚡ <b>جهش حجم معاملاتی:</b> "
+            f"<code>{self.spike_multiplier:.1f}X</code> "
+            f"برابر میانگین ۴ ساعت گذشته\n\n"
             f"{advice}"
         )
 
 
 @dataclass
 class ExchangeFlowSignal:
+
     chain: str
     token_symbol: str
     exchange_name: str
@@ -191,23 +173,29 @@ class ExchangeFlowSignal:
             self.direction
             == SignalDirection.INFLOW
         ):
+
             header = (
-                "📥 <b>واریز نهنگ به صرافی</b> 📥"
+                "📥 <b>واریز نهنگ به صرافی "
+                "(EXCHANGE INFLOW)</b> 📥"
             )
 
             advice = (
                 "🎯 <b>توصیه:</b> "
-                "احتمال افزایش فشار فروش."
+                "احتمال افزایش فشار فروش؛ "
+                "دارایی در حال واریز به کیف‌پول صرافی است."
             )
 
         else:
+
             header = (
-                "📤 <b>برداشت نهنگ از صرافی</b> 📤"
+                "📤 <b>برداشت نهنگ از صرافی "
+                "(EXCHANGE OUTFLOW)</b> 📤"
             )
 
             advice = (
                 "🎯 <b>توصیه:</b> "
-                "احتمال کاهش عرضه."
+                "احتمال کاهش عرضه در بازار؛ "
+                "دارایی در حال خروج به کیف شخصی/کلد است."
             )
 
         return (
@@ -221,7 +209,7 @@ class ExchangeFlowSignal:
             f"📦 <b>مقدار:</b> "
             f"<code>{self.amount_native:,.4f} "
             f"{esc(self.token_symbol)}</code>\n"
-            f"💰 <b>ارزش:</b> "
+            f"💰 <b>ارزش تراکنش:</b> "
             f"${self.amount_usd:,.0f}\n"
             f'🔗 <a href="{esc(link)}">'
             f"مشاهده تراکنش</a>\n\n"
