@@ -3,14 +3,14 @@ Independent exchange-aware market analyzer.
 
 Signal logic
 ------------
-1. Volume spike (smart money):
-   Latest CLOSED 5m quote_volume vs the mean of the previous
-   candles inside the rolling 864-candle window (72 hours)
-   from the SAME exchange. Signal candle is excluded from the mean.
+1. Smart money (inflow / outflow):
+   Latest CLOSED 5m quote_volume vs mean of the previous 48 CLOSED
+   5m candles from the SAME exchange.
+   Direction follows candle price change (up = inflow, down = outflow).
 
 2. Pump / Dump:
-   Price movement and volume anomaly evaluated against the long
-   CLOSED-candle history (up to 864 candles).
+   Volume anomaly vs mean of the previous candles inside the rolling
+   864-candle window (72 hours), plus static price band and/or z-score.
 
 3. Active analysis priority:
    Binance → Bybit → KuCoin
@@ -27,6 +27,7 @@ import requests
 
 from candle_store import (
     CandleStore,
+    SMART_MONEY_BASELINE_CANDLES,
     PUMP_HISTORY_CANDLES,
     VALID_SOURCES,
 )
@@ -44,9 +45,6 @@ from state import BotState
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
 LIVE_UPDATE_LIMIT = 5
-
-# Volume baseline = rolling 72h window (864 × 5m), excluding signal candle.
-VOLUME_BASELINE_CANDLES = PUMP_HISTORY_CANDLES  # 864
 
 
 class MarketAnalyzer:
@@ -195,7 +193,7 @@ class MarketAnalyzer:
                     symbol,
                 )
 
-                if current_count >= VOLUME_BASELINE_CANDLES:
+                if current_count >= PUMP_HISTORY_CANDLES:
                     continue
 
                 self.candle_store.load(
@@ -208,14 +206,13 @@ class MarketAnalyzer:
                     symbol,
                 )
 
-                if current_count >= VOLUME_BASELINE_CANDLES:
+                if current_count >= PUMP_HISTORY_CANDLES:
                     continue
 
-                # Always aim for full 72h window (864) for volume baseline.
                 candles = self.provider.fetch_candles(
                     source=source,
                     symbol=symbol,
-                    limit=VOLUME_BASELINE_CANDLES,
+                    limit=PUMP_HISTORY_CANDLES,
                 )
 
                 if not candles:
@@ -244,7 +241,7 @@ class MarketAnalyzer:
                     source,
                     symbol,
                     stored_count,
-                    VOLUME_BASELINE_CANDLES,
+                    PUMP_HISTORY_CANDLES,
                 )
 
             except Exception:
@@ -305,6 +302,38 @@ class MarketAnalyzer:
             closed_total,
         )
 
+    @staticmethod
+    def _baseline_mean(
+        candles: List,
+        count: int,
+    ) -> Optional[float]:
+        """
+        Mean quote_volume of the last `count` candles before the newest
+        candle in `candles` (newest is excluded).
+
+        `candles` must already be ordered oldest → newest and include
+        the signal candle as the last element.
+        """
+
+        if count <= 0 or len(candles) < count + 1:
+            return None
+
+        prior = candles[-(count + 1):-1]
+
+        if len(prior) != count:
+            return None
+
+        values = [
+            float(c.quote_volume)
+            for c in prior
+            if c.quote_volume > 0
+        ]
+
+        if len(values) != count:
+            return None
+
+        return sum(values) / len(values)
+
     def _analyze_symbol(
         self,
         source: str,
@@ -317,11 +346,10 @@ class MarketAnalyzer:
             symbol,
         )
 
-        # Need a full rolling 72h window so baseline is the 864-mean
-        # of prior candles (signal candle excluded).
-        minimum_required = VOLUME_BASELINE_CANDLES
+        # Smart money needs 48 prior + 1 signal candle.
+        minimum_smart = SMART_MONEY_BASELINE_CANDLES + 1
 
-        if len(history) < minimum_required:
+        if len(history) < minimum_smart:
 
             log.warning(
                 "NO_SIGNAL | source=%s symbol=%s "
@@ -330,15 +358,12 @@ class MarketAnalyzer:
                 source,
                 symbol,
                 len(history),
-                minimum_required,
+                minimum_smart,
             )
 
             return None
 
-        # Last VOLUME_BASELINE_CANDLES closed candles (rolling window).
-        window = history[-VOLUME_BASELINE_CANDLES:]
-
-        current_candle = window[-1]
+        current_candle = history[-1]
 
         signal_key = f"{source}:{symbol}"
         last_ot = self._last_signaled_open_time.get(signal_key)
@@ -346,51 +371,9 @@ class MarketAnalyzer:
         if last_ot is not None and current_candle.open_time <= last_ot:
             return None
 
-        # Baseline = mean quote_volume of the window EXCLUDING the
-        # candle under evaluation (up to 863 prior candles when full).
-        baseline_candles = window[:-1]
+        current_volume = float(current_candle.quote_volume)
 
-        if len(baseline_candles) < (VOLUME_BASELINE_CANDLES - 1):
-            log.warning(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=BASELINE_NOT_READY "
-                "baseline_n=%s need=%s",
-                source,
-                symbol,
-                len(baseline_candles),
-                VOLUME_BASELINE_CANDLES - 1,
-            )
-            return None
-
-        baseline_values = [
-            float(c.quote_volume)
-            for c in baseline_candles
-            if c.quote_volume > 0
-        ]
-
-        # Require a complete positive-volume baseline (no zero gaps).
-        if len(baseline_values) != len(baseline_candles):
-            log.warning(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=INVALID_BASELINE_VALUES "
-                "valid=%s/%s",
-                source,
-                symbol,
-                len(baseline_values),
-                len(baseline_candles),
-            )
-            return None
-
-        baseline = (
-            sum(baseline_values)
-            / len(baseline_values)
-        )
-
-        current_volume = float(
-            current_candle.quote_volume
-        )
-
-        if baseline <= 0 or current_volume <= 0:
+        if current_volume <= 0:
             log.warning(
                 "NO_SIGNAL | source=%s symbol=%s "
                 "reason=INVALID_VOLUME",
@@ -398,15 +381,6 @@ class MarketAnalyzer:
                 symbol,
             )
             return None
-
-        spike_multiplier = (
-            current_volume / baseline
-        )
-
-        estimated_inflow = max(
-            0.0,
-            current_volume - baseline,
-        )
 
         if current_candle.open <= 0:
             log.warning(
@@ -425,18 +399,68 @@ class MarketAnalyzer:
             / current_candle.open
         ) * 100.0
 
-        volume_threshold = (
-            baseline
-            * self.settings.volume_spike_ratio
+        # -------------------------------------------------
+        # 1) Smart-money baseline: previous 48 closed candles
+        # -------------------------------------------------
+
+        baseline_48 = self._baseline_mean(
+            history,
+            SMART_MONEY_BASELINE_CANDLES,
         )
 
-        is_volume_spike = (
-            current_volume >= volume_threshold
+        smart_spike = None
+        smart_inflow = 0.0
+
+        if baseline_48 is not None and baseline_48 > 0:
+
+            smart_spike = current_volume / baseline_48
+            smart_inflow = max(0.0, current_volume - baseline_48)
+
+            is_smart_volume_spike = (
+                current_volume
+                >= baseline_48 * self.settings.volume_spike_ratio
+            )
+
+        else:
+
+            is_smart_volume_spike = False
+
+        # Direction for smart money: sign of candle body.
+        smart_inflow_signal = (
+            is_smart_volume_spike
+            and candle_price_change > 0
         )
 
-        long_history = history[
-            -PUMP_HISTORY_CANDLES:
-        ]
+        smart_outflow_signal = (
+            is_smart_volume_spike
+            and candle_price_change < 0
+        )
+
+        # -------------------------------------------------
+        # 2) Pump/dump baseline: previous candles in 72h window
+        # -------------------------------------------------
+
+        baseline_72h = self._baseline_mean(
+            history,
+            PUMP_HISTORY_CANDLES,
+        )
+
+        pump_spike = None
+
+        if baseline_72h is not None and baseline_72h > 0:
+
+            pump_spike = current_volume / baseline_72h
+
+            is_pump_volume_spike = (
+                current_volume
+                >= baseline_72h * self.settings.volume_spike_ratio
+            )
+
+        else:
+
+            is_pump_volume_spike = False
+
+        long_history = history[-PUMP_HISTORY_CANDLES:]
 
         current_close_to_close = None
 
@@ -499,14 +523,14 @@ class MarketAnalyzer:
                     ) / stdev
 
         static_pump = (
-            is_volume_spike
+            is_pump_volume_spike
             and self.settings.price_pump_min
             <= candle_price_change
             <= self.settings.price_pump_max
         )
 
         static_dump = (
-            is_volume_spike
+            is_pump_volume_spike
             and -self.settings.price_pump_max
             <= candle_price_change
             <= -self.settings.price_pump_min
@@ -516,22 +540,82 @@ class MarketAnalyzer:
             zscore is not None
             and zscore
             >= self.settings.pump_zscore_threshold
-            and is_volume_spike
+            and is_pump_volume_spike
         )
 
         statistical_dump = (
             zscore is not None
             and zscore
             <= -self.settings.pump_zscore_threshold
-            and is_volume_spike
+            and is_pump_volume_spike
         )
 
-        if not (
-            static_pump
-            or static_dump
-            or statistical_pump
-            or statistical_dump
-        ):
+        is_pump = static_pump or statistical_pump
+        is_dump = static_dump or statistical_dump
+
+        # -------------------------------------------------
+        # Decide which signal (if any) wins this candle
+        # Priority: pump/dump over pure smart-money
+        # -------------------------------------------------
+
+        if is_pump or is_dump:
+
+            if is_pump:
+
+                direction = SignalDirection.INFLOW
+
+                if static_pump and statistical_pump:
+                    trigger = TriggerType.BOTH
+                elif statistical_pump:
+                    trigger = TriggerType.STATISTICAL
+                else:
+                    trigger = TriggerType.STATIC
+
+            else:
+
+                direction = SignalDirection.OUTFLOW
+
+                if static_dump and statistical_dump:
+                    trigger = TriggerType.BOTH
+                elif statistical_dump:
+                    trigger = TriggerType.STATISTICAL
+                else:
+                    trigger = TriggerType.STATIC
+
+            # Report spike vs the 72h baseline used for this path.
+            spike_multiplier = (
+                pump_spike if pump_spike is not None else 0.0
+            )
+
+            estimated_inflow = max(
+                0.0,
+                current_volume - (baseline_72h or 0.0),
+            )
+
+            baseline_used = baseline_72h or 0.0
+            path = "pump_dump_72h"
+
+        elif smart_inflow_signal or smart_outflow_signal:
+
+            direction = (
+                SignalDirection.INFLOW
+                if smart_inflow_signal
+                else SignalDirection.OUTFLOW
+            )
+
+            # Smart-money path has no static/z band — mark STATIC
+            # as the volume-flow style trigger.
+            trigger = TriggerType.STATIC
+
+            spike_multiplier = (
+                smart_spike if smart_spike is not None else 0.0
+            )
+
+            estimated_inflow = smart_inflow
+            baseline_used = baseline_48 or 0.0
+            path = "smart_money_48"
+
+        else:
 
             self._last_signaled_open_time[signal_key] = (
                 current_candle.open_time
@@ -540,21 +624,34 @@ class MarketAnalyzer:
             log.info(
                 "NO_SIGNAL | source=%s symbol=%s "
                 "reason=THRESHOLD_NOT_MET "
-                "volume=%.2f baseline_72h=%.2f spike=%.2fX "
-                "required=%.2fX price=%.2f%% "
-                "close_to_close=%s zscore=%s",
+                "vol=%.2f baseline48=%s spike48=%s "
+                "baseline72h=%s spike72h=%s "
+                "required=%.2fX price=%.2f%% zscore=%s",
                 source,
                 symbol,
                 current_volume,
-                baseline,
-                spike_multiplier,
-                self.settings.volume_spike_ratio,
-                candle_price_change,
                 (
-                    f"{current_close_to_close:.2f}%"
-                    if current_close_to_close is not None
+                    f"{baseline_48:.2f}"
+                    if baseline_48 is not None
                     else "N/A"
                 ),
+                (
+                    f"{smart_spike:.2f}X"
+                    if smart_spike is not None
+                    else "N/A"
+                ),
+                (
+                    f"{baseline_72h:.2f}"
+                    if baseline_72h is not None
+                    else "N/A"
+                ),
+                (
+                    f"{pump_spike:.2f}X"
+                    if pump_spike is not None
+                    else "N/A"
+                ),
+                self.settings.volume_spike_ratio,
+                candle_price_change,
                 (
                     f"{zscore:.2f}"
                     if zscore is not None
@@ -585,28 +682,6 @@ class MarketAnalyzer:
             )
 
             return None
-
-        if static_pump or statistical_pump:
-
-            direction = SignalDirection.INFLOW
-
-            if static_pump and statistical_pump:
-                trigger = TriggerType.BOTH
-            elif statistical_pump:
-                trigger = TriggerType.STATISTICAL
-            else:
-                trigger = TriggerType.STATIC
-
-        else:
-
-            direction = SignalDirection.OUTFLOW
-
-            if static_dump and statistical_dump:
-                trigger = TriggerType.BOTH
-            elif statistical_dump:
-                trigger = TriggerType.STATISTICAL
-            else:
-                trigger = TriggerType.STATIC
 
         try:
             price = float(current_candle.close)
@@ -651,16 +726,17 @@ class MarketAnalyzer:
         )
 
         log.warning(
-            "SIGNAL FIRED | source=%s symbol=%s "
+            "SIGNAL FIRED | source=%s symbol=%s path=%s "
             "direction=%s trigger=%s "
-            "volume=%.2f baseline_72h=%.2f spike=%.2fX "
+            "volume=%.2f baseline=%.2f spike=%.2fX "
             "inflow=%.2f price=%.2f%% zscore=%s",
             source,
             symbol,
+            path,
             direction.value,
             trigger.value,
             current_volume,
-            baseline,
+            baseline_used,
             spike_multiplier,
             estimated_inflow,
             candle_price_change,
