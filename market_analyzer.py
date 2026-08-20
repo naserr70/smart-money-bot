@@ -16,16 +16,25 @@ Signal logic
    Binance → Bybit → KuCoin
 
 4. Histories are NEVER mixed across exchanges.
+
+Startup bootstrap
+-----------------
+Restores candle history from GitHub when available, otherwise downloads
+the last 864 closed 5m candles from each live exchange and persists
+them locally + to GitHub so ephemeral hosts (e.g. Render) keep state.
 """
 
 import logging
 import statistics
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
 
+from assets import NOBITEX_ALL_ASSETS
 from candle_store import (
+    Candle,
     CandleStore,
     SMART_MONEY_BASELINE_CANDLES,
     PUMP_HISTORY_CANDLES,
@@ -45,6 +54,45 @@ from state import BotState
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
 LIVE_UPDATE_LIMIT = 5
+
+
+def _candles_from_payload(data: dict) -> List[Candle]:
+    """Parse a stored / GitHub JSON payload into Candle objects."""
+
+    if not isinstance(data, dict):
+        return []
+
+    raw_list = data.get("candles") or []
+
+    if not isinstance(raw_list, list):
+        return []
+
+    parsed: List[Candle] = []
+
+    for item in raw_list:
+
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            parsed.append(
+                Candle(
+                    open_time=int(item["open_time"]),
+                    close_time=int(item["close_time"]),
+                    open=float(item["open"]),
+                    high=float(item["high"]),
+                    low=float(item["low"]),
+                    close=float(item["close"]),
+                    volume=float(item["volume"]),
+                    quote_volume=float(item["quote_volume"]),
+                    trades=int(item.get("trades", 0)),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    parsed.sort(key=lambda c: c.open_time)
+    return parsed
 
 
 class MarketAnalyzer:
@@ -68,6 +116,220 @@ class MarketAnalyzer:
         self.candle_store = candle_store
 
         self._last_signaled_open_time: Dict[str, int] = {}
+        self._startup_bootstrap_done = False
+
+    # =========================================================
+    # STARTUP BOOTSTRAP (864 candles + GitHub restore)
+    # =========================================================
+
+    def bootstrap_histories(
+        self,
+        github_backup=None,
+        symbols: Optional[List[str]] = None,
+        target_count: int = PUMP_HISTORY_CANDLES,
+    ) -> dict:
+        """
+        Ensure each live exchange has up to `target_count` (864) closed
+        candles per listed symbol.
+
+        Order per symbol:
+          1) local load
+          2) GitHub restore (if configured)
+          3) download from exchange API
+
+        Returns summary counters.
+        """
+
+        if self._startup_bootstrap_done:
+            log.info("STARTUP BOOTSTRAP SKIPPED | already completed")
+            return {"skipped": True}
+
+        target_count = max(1, int(target_count))
+        symbol_list = list(symbols or NOBITEX_ALL_ASSETS)
+
+        log.info(
+            "STARTUP BOOTSTRAP START | symbols=%s target=%s github=%s",
+            len(symbol_list),
+            target_count,
+            bool(github_backup and github_backup.is_configured()),
+        )
+
+        started = time.time()
+
+        try:
+            binance_t, bybit_t, kucoin_t = self.provider.fetch_all_sources()
+        except Exception:
+            log.exception("STARTUP BOOTSTRAP TICKER FETCH FAILED")
+            binance_t, bybit_t, kucoin_t = {}, {}, {}
+
+        source_tickers = {
+            "binance": binance_t,
+            "bybit": bybit_t,
+            "kucoin": kucoin_t,
+        }
+
+        stats = {
+            "local_ok": 0,
+            "github_restored": 0,
+            "api_seeded": 0,
+            "failed": 0,
+            "already_full": 0,
+            "sources": {},
+        }
+
+        for source, tickers in source_tickers.items():
+
+            if not tickers:
+                log.warning(
+                    "STARTUP BOOTSTRAP SOURCE SKIP | source=%s no_tickers",
+                    source,
+                )
+                stats["sources"][source] = {"symbols": 0, "seeded": 0}
+                continue
+
+            # Only symbols that actually trade on this exchange.
+            symbols_for_source = [
+                s for s in symbol_list if s in tickers
+            ]
+
+            seeded = 0
+
+            log.info(
+                "STARTUP BOOTSTRAP SOURCE | source=%s symbols=%s",
+                source,
+                len(symbols_for_source),
+            )
+
+            for symbol in symbols_for_source:
+
+                try:
+                    # 1) local
+                    self.candle_store.load(source, symbol)
+                    count = self.candle_store.count(source, symbol)
+
+                    if count >= target_count:
+                        stats["already_full"] += 1
+                        stats["local_ok"] += 1
+                        continue
+
+                    if count > 0:
+                        stats["local_ok"] += 1
+
+                    # 2) GitHub restore
+                    if (
+                        count < target_count
+                        and github_backup is not None
+                        and github_backup.is_configured()
+                    ):
+                        try:
+                            payload = github_backup.download(
+                                source,
+                                symbol,
+                            )
+                        except Exception:
+                            log.exception(
+                                "GITHUB RESTORE ERROR | "
+                                "source=%s symbol=%s",
+                                source,
+                                symbol,
+                            )
+                            payload = None
+
+                        if payload:
+                            restored = _candles_from_payload(payload)
+
+                            if restored:
+                                self.candle_store.seed(
+                                    source,
+                                    symbol,
+                                    restored,
+                                )
+                                count = self.candle_store.count(
+                                    source,
+                                    symbol,
+                                )
+                                stats["github_restored"] += 1
+
+                                log.info(
+                                    "GITHUB RESTORE OK | "
+                                    "source=%s symbol=%s candles=%s",
+                                    source,
+                                    symbol,
+                                    count,
+                                )
+
+                    if count >= target_count:
+                        continue
+
+                    # 3) Exchange API download
+                    candles = self.provider.fetch_candles(
+                        source=source,
+                        symbol=symbol,
+                        limit=target_count,
+                    )
+
+                    if not candles:
+                        stats["failed"] += 1
+                        log.warning(
+                            "STARTUP API SEED FAILED | "
+                            "source=%s symbol=%s",
+                            source,
+                            symbol,
+                        )
+                        continue
+
+                    self.candle_store.seed(
+                        source,
+                        symbol,
+                        candles,
+                    )
+
+                    seeded += 1
+                    stats["api_seeded"] += 1
+
+                    log.info(
+                        "STARTUP API SEED OK | "
+                        "source=%s symbol=%s candles=%s",
+                        source,
+                        symbol,
+                        self.candle_store.count(source, symbol),
+                    )
+
+                    # Mild pacing to reduce rate-limit risk.
+                    time.sleep(0.05)
+
+                except Exception:
+                    stats["failed"] += 1
+                    log.exception(
+                        "STARTUP BOOTSTRAP SYMBOL ERROR | "
+                        "source=%s symbol=%s",
+                        source,
+                        symbol,
+                    )
+
+            stats["sources"][source] = {
+                "symbols": len(symbols_for_source),
+                "seeded": seeded,
+            }
+
+        self.candle_store.save_dirty()
+
+        elapsed = time.time() - started
+        self._startup_bootstrap_done = True
+
+        log.info(
+            "STARTUP BOOTSTRAP COMPLETE | "
+            "local_ok=%s github_restored=%s api_seeded=%s "
+            "already_full=%s failed=%s elapsed=%.1fs",
+            stats["local_ok"],
+            stats["github_restored"],
+            stats["api_seeded"],
+            stats["already_full"],
+            stats["failed"],
+            elapsed,
+        )
+
+        return stats
 
     def run_cycle(
         self,
@@ -307,13 +569,6 @@ class MarketAnalyzer:
         candles: List,
         count: int,
     ) -> Optional[float]:
-        """
-        Mean quote_volume of the last `count` candles before the newest
-        candle in `candles` (newest is excluded).
-
-        `candles` must already be ordered oldest → newest and include
-        the signal candle as the last element.
-        """
 
         if count <= 0 or len(candles) < count + 1:
             return None
@@ -346,7 +601,6 @@ class MarketAnalyzer:
             symbol,
         )
 
-        # Smart money needs 48 prior + 1 signal candle.
         minimum_smart = SMART_MONEY_BASELINE_CANDLES + 1
 
         if len(history) < minimum_smart:
@@ -399,10 +653,6 @@ class MarketAnalyzer:
             / current_candle.open
         ) * 100.0
 
-        # -------------------------------------------------
-        # 1) Smart-money baseline: previous 48 closed candles
-        # -------------------------------------------------
-
         baseline_48 = self._baseline_mean(
             history,
             SMART_MONEY_BASELINE_CANDLES,
@@ -425,7 +675,6 @@ class MarketAnalyzer:
 
             is_smart_volume_spike = False
 
-        # Direction for smart money: sign of candle body.
         smart_inflow_signal = (
             is_smart_volume_spike
             and candle_price_change > 0
@@ -435,10 +684,6 @@ class MarketAnalyzer:
             is_smart_volume_spike
             and candle_price_change < 0
         )
-
-        # -------------------------------------------------
-        # 2) Pump/dump baseline: previous candles in 72h window
-        # -------------------------------------------------
 
         baseline_72h = self._baseline_mean(
             history,
@@ -553,11 +798,6 @@ class MarketAnalyzer:
         is_pump = static_pump or statistical_pump
         is_dump = static_dump or statistical_dump
 
-        # -------------------------------------------------
-        # Decide which signal (if any) wins this candle
-        # Priority: pump/dump over pure smart-money
-        # -------------------------------------------------
-
         if is_pump or is_dump:
 
             if is_pump:
@@ -582,7 +822,6 @@ class MarketAnalyzer:
                 else:
                     trigger = TriggerType.STATIC
 
-            # Report spike vs the 72h baseline used for this path.
             spike_multiplier = (
                 pump_spike if pump_spike is not None else 0.0
             )
@@ -603,8 +842,6 @@ class MarketAnalyzer:
                 else SignalDirection.OUTFLOW
             )
 
-            # Smart-money path has no static/z band — mark STATIC
-            # as the volume-flow style trigger.
             trigger = TriggerType.STATIC
 
             spike_multiplier = (
