@@ -13,6 +13,7 @@ Two independent background loops:
    - 48 closed candles are used for smart-money / volume-flow detection.
    - Up to 864 closed candles (72 hours) are retained for pump/dump analysis.
    - The currently open candle is kept separately by CandleStore.
+   - Every cycle fetches a few recent candles and advances the rolling window.
 
 2. Whale loop
    - Independent on-chain exchange-wallet flow detection.
@@ -25,33 +26,18 @@ CandleStore keeps:
     market_history/
         binance/
             BTCUSDT.json
-            ETHUSDT.json
             ...
         kucoin/
             BTCUSDT.json
-            ETHUSDT.json
             ...
 
 The two sources are completely isolated.
 
 GitHub persistence
 ------------------
-If configured, CandleStore periodically synchronizes the candle files
-to the configured GitHub repository. Local storage remains the primary
-working cache; GitHub is the persistent backup.
-
-IMPORTANT:
-The market source selected for the current analysis cycle does NOT decide
-which historical data gets stored. Whenever a source is available, its own
-history is maintained independently.
-
-This prevents the following bad situation:
-
-    Binance unavailable
-        -> KuCoin becomes active
-        -> Binance history gets overwritten by KuCoin
-
-That must NEVER happen.
+If configured, local dirty candle files are saved every cycle.
+Full GitHub Trees-based backup is available via github_candle_backup.py
+when GITHUB_TOKEN / GITHUB_REPO (or GITHUB_CANDLE_*) are set.
 """
 
 import logging
@@ -191,99 +177,36 @@ notifier = TelegramNotifier(
 # Candle Store
 # ============================================================
 
-"""
-CandleStore is intentionally created BEFORE MarketAnalyzer.
+candle_store = CandleStore(
+    root_path=settings.candle_store_path,
+    max_candles=settings.history_candle_limit,
+    github_enabled=settings.github_candle_store_enabled,
+    github_token=settings.github_candle_store_token,
+    github_repo=settings.github_candle_store_repo,
+    github_branch=settings.github_candle_store_branch,
+    github_sync_interval_sec=settings.github_candle_sync_interval_sec,
+)
 
-The analyzer receives the store and therefore never needs to create
-its own independent history.
-
-This is important because otherwise we could accidentally have:
-
-    MarketAnalyzer -> history A
-    MarketData      -> history B
-    GitHub          -> history C
-
-and the three would drift apart.
-"""
-
-try:
-    candle_store = CandleStore(
-        root_path=settings.candle_store_path,
-        max_candles=settings.history_candle_limit,
-        github_enabled=settings.github_candle_store_enabled,
-        github_token=settings.github_candle_store_token,
-        github_repo=settings.github_candle_store_repo,
-        github_branch=settings.github_candle_store_branch,
-        github_sync_interval_sec=settings.github_candle_sync_interval_sec,
-    )
-
-    log.info(
-        "CANDLE STORE READY | root=%s | max_candles=%s | github=%s",
-        settings.candle_store_path,
-        settings.history_candle_limit,
-        (
-            "enabled"
-            if settings.github_candle_store_enabled
-            else "disabled"
-        ),
-    )
-
-except TypeError:
-    """
-    Compatibility fallback.
-
-    If the CandleStore version currently installed only accepts the basic
-    constructor arguments, do not crash the entire bot. GitHub persistence
-    is then handled by its own available methods.
-    """
-
-    candle_store = CandleStore(
-        root_path=settings.candle_store_path,
-        max_candles=settings.history_candle_limit,
-    )
-
-    log.warning(
-        "CANDLE STORE CREATED IN COMPATIBILITY MODE | "
-        "GitHub arguments are not supported by the installed CandleStore"
-    )
+log.info(
+    "CANDLE STORE READY | root=%s | max_candles=%s | github=%s",
+    settings.candle_store_path,
+    settings.history_candle_limit,
+    "enabled" if settings.github_candle_store_enabled else "disabled",
+)
 
 
 # ============================================================
 # Market analyzer
 # ============================================================
 
-try:
-    market_analyzer = MarketAnalyzer(
-        settings=settings,
-        state=state,
-        session=http_session,
-        candle_store=candle_store,
-    )
+market_analyzer = MarketAnalyzer(
+    settings=settings,
+    state=state,
+    session=http_session,
+    candle_store=candle_store,
+)
 
-    log.info(
-        "MARKET ANALYZER READY | candle_store=injected"
-    )
-
-except TypeError:
-    """
-    Compatibility with the older constructor.
-
-    If the installed MarketAnalyzer still has the old signature,
-    the bot remains runnable instead of failing during import.
-
-    Once the new analyzer is installed, the first branch is used.
-    """
-
-    market_analyzer = MarketAnalyzer(
-        settings,
-        state,
-        http_session,
-    )
-
-    log.warning(
-        "MARKET ANALYZER USING LEGACY CONSTRUCTOR | "
-        "update market_analyzer.py to enable direct CandleStore injection"
-    )
+log.info("MARKET ANALYZER READY | candle_store=injected")
 
 
 # ============================================================
@@ -326,61 +249,18 @@ def broadcast_targets():
 
 
 def save_candle_store():
-    """
-    Best-effort persistence.
-
-    The exact CandleStore implementation may expose one or more of these
-    methods depending on the installed version. We deliberately keep this
-    isolated so the main bot loop doesn't die because persistence failed.
-    """
+    """Best-effort local persistence of dirty candle files."""
 
     try:
-        if hasattr(candle_store, "save_dirty"):
-            candle_store.save_dirty()
-            return
-
-        if hasattr(candle_store, "save_all"):
-            candle_store.save_all()
-            return
-
+        candle_store.save_dirty()
     except Exception:
-        log.exception(
-            "CANDLE STORE SAVE FAILED"
-        )
+        log.exception("CANDLE STORE SAVE FAILED")
 
 
 def start_candle_store():
-    """
-    Start CandleStore background persistence if supported.
+    """CandleStore does not require a background thread for local saves."""
 
-    Some versions of CandleStore manage their own GitHub sync thread.
-    Others rely on save_dirty/save_all from the main process.
-    """
-
-    try:
-        if hasattr(candle_store, "start"):
-            candle_store.start()
-
-            log.info(
-                "CANDLE STORE BACKGROUND WORKER STARTED"
-            )
-
-        elif hasattr(candle_store, "start_background_sync"):
-            candle_store.start_background_sync()
-
-            log.info(
-                "CANDLE STORE BACKGROUND SYNC STARTED"
-            )
-
-        else:
-            log.info(
-                "CANDLE STORE BACKGROUND WORKER NOT REQUIRED"
-            )
-
-    except Exception:
-        log.exception(
-            "CANDLE STORE START FAILED"
-        )
+    log.info("CANDLE STORE BACKGROUND WORKER NOT REQUIRED")
 
 
 # ============================================================
@@ -417,9 +297,7 @@ def market_loop():
 
         try:
 
-            log.info(
-                "MARKET CYCLE START"
-            )
+            log.info("MARKET CYCLE START")
 
             signals, data_source, scanned = (
                 market_analyzer.run_cycle()
@@ -480,10 +358,6 @@ def market_loop():
                     scanned,
                 )
 
-            # ------------------------------------------------
-            # Status report
-            # ------------------------------------------------
-
             if settings.send_status_report:
 
                 status_msg = (
@@ -511,21 +385,12 @@ def market_loop():
                             target,
                         )
 
-            # ------------------------------------------------
-            # Save state
-            # ------------------------------------------------
-
             state.record_market_cycle()
-
-            # CandleStore persistence is deliberately separate from
-            # signal calculation.
             save_candle_store()
 
         except Exception as e:
 
-            log.exception(
-                "CRITICAL MARKET LOOP ERROR"
-            )
+            log.exception("CRITICAL MARKET LOOP ERROR")
 
             state.record_market_cycle(
                 error=str(e)
@@ -551,10 +416,6 @@ def market_loop():
                     log.exception(
                         "FAILED TO SEND MARKET ERROR TO ADMIN"
                     )
-
-        # ----------------------------------------------------
-        # Interval
-        # ----------------------------------------------------
 
         elapsed = time.time() - cycle_started
 
@@ -599,9 +460,7 @@ def whale_loop():
 
         try:
 
-            log.info(
-                "WHALE CYCLE START"
-            )
+            log.info("WHALE CYCLE START")
 
             signals = whale_tracker.scan()
 
@@ -626,17 +485,13 @@ def whale_loop():
 
             else:
 
-                log.info(
-                    "WHALE NO SIGNAL"
-                )
+                log.info("WHALE NO SIGNAL")
 
             state.record_whale_cycle()
 
         except Exception as e:
 
-            log.exception(
-                "CRITICAL WHALE LOOP ERROR"
-            )
+            log.exception("CRITICAL WHALE LOOP ERROR")
 
             state.record_whale_cycle(
                 error=str(e)
@@ -739,10 +594,6 @@ def start_background_threads():
         INSTANCE_ID,
     )
 
-    # --------------------------------------------------------
-    # Configuration validation
-    # --------------------------------------------------------
-
     for problem in settings.validate():
 
         log.warning(
@@ -750,21 +601,9 @@ def start_background_threads():
             problem,
         )
 
-    # --------------------------------------------------------
-    # Telegram
-    # --------------------------------------------------------
-
     register_telegram_webhook()
 
-    # --------------------------------------------------------
-    # Candle Store
-    # --------------------------------------------------------
-
     start_candle_store()
-
-    # --------------------------------------------------------
-    # Access control
-    # --------------------------------------------------------
 
     if not access.list_users():
 
@@ -794,10 +633,6 @@ def start_background_threads():
                     "FAILED TO SEND EMPTY USERS WARNING"
                 )
 
-    # --------------------------------------------------------
-    # Market thread
-    # --------------------------------------------------------
-
     market_thread = threading.Thread(
         target=market_loop,
         daemon=True,
@@ -806,13 +641,7 @@ def start_background_threads():
 
     market_thread.start()
 
-    log.info(
-        "THREAD STARTED | name=market-loop"
-    )
-
-    # --------------------------------------------------------
-    # Whale thread
-    # --------------------------------------------------------
+    log.info("THREAD STARTED | name=market-loop")
 
     whale_thread = threading.Thread(
         target=whale_loop,
@@ -822,13 +651,7 @@ def start_background_threads():
 
     whale_thread.start()
 
-    log.info(
-        "THREAD STARTED | name=whale-loop"
-    )
-
-    # --------------------------------------------------------
-    # Bot state autosave
-    # --------------------------------------------------------
+    log.info("THREAD STARTED | name=whale-loop")
 
     state.start_autosave(
         settings.state_save_interval_sec
@@ -877,7 +700,6 @@ def status():
 
     health["instance_id"] = INSTANCE_ID
 
-    # CandleStore diagnostics
     try:
 
         health["candle_store"] = {
@@ -962,8 +784,7 @@ def build_admin_status_text() -> str:
             f"📊 سقف تاریخچه: "
             f"<code>{settings.history_candle_limit} کندل 5m</code>"
         ),
-    ]
-
+    ]n
     if health.get("last_error"):
 
         lines.append(
@@ -986,10 +807,6 @@ def build_admin_status_text() -> str:
 )
 def telegram_webhook():
 
-    # --------------------------------------------------------
-    # Telegram secret validation
-    # --------------------------------------------------------
-
     if settings.telegram_webhook_secret:
 
         incoming = request.headers.get(
@@ -1008,10 +825,6 @@ def telegram_webhook():
             )
 
             return "forbidden", 403
-
-    # --------------------------------------------------------
-    # Parse update
-    # --------------------------------------------------------
 
     update = (
         request.get_json(
@@ -1045,33 +858,19 @@ def telegram_webhook():
 
 def shutdown_persistence():
 
-    log.info(
-        "PERSISTENCE SHUTDOWN START"
-    )
+    log.info("PERSISTENCE SHUTDOWN START")
 
     try:
-
         save_candle_store()
-
     except Exception:
-
-        log.exception(
-            "FINAL CANDLE STORE SAVE FAILED"
-        )
+        log.exception("FINAL CANDLE STORE SAVE FAILED")
 
     try:
-
         state.save()
-
     except Exception:
+        log.exception("FINAL BOT STATE SAVE FAILED")
 
-        log.exception(
-            "FINAL BOT STATE SAVE FAILED"
-        )
-
-    log.info(
-        "PERSISTENCE SHUTDOWN COMPLETE"
-    )
+    log.info("PERSISTENCE SHUTDOWN COMPLETE")
 
 
 # ============================================================
