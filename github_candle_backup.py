@@ -8,30 +8,12 @@ Storage:
 
     market_history/
         binance/
-            BTCUSDT.json
-            ETHUSDT.json
-            ...
+        bybit/
         kucoin/
-            BTCUSDT.json
-            ETHUSDT.json
-            ...
 
 IMPORTANT
 ---------
-Binance and KuCoin histories are completely independent.
-
-This module does NOT mix, copy, or overwrite Binance history with KuCoin
-history.
-
-The backup uses the Git Trees API and optimistic concurrency control.
-
-If another process commits to the branch while this process is preparing
-its commit, GitHub can reject the branch update with:
-
-    Expected branch to point to "...", but it did not.
-
-This implementation detects that condition, refreshes the branch HEAD,
-rebuilds the tree/commit, and retries automatically.
+Binance, Bybit and KuCoin histories are completely independent.
 
 Environment variables (primary):
 
@@ -42,13 +24,6 @@ Also accepted for backward compatibility:
 
     GITHUB_CANDLE_REPO
     GITHUB_GIST_TOKEN
-
-Optional:
-
-    GITHUB_BRANCH / GITHUB_CANDLE_BRANCH = main
-    GITHUB_CANDLE_PATH = market_history
-    GITHUB_CANDLE_SYNC_INTERVAL_SEC / GITHUB_CANDLE_BACKUP_INTERVAL_SEC = 300
-    GITHUB_MAX_RETRIES / GITHUB_CANDLE_MAX_RETRIES = 5
 """
 
 import base64
@@ -71,10 +46,12 @@ DEFAULT_BACKUP_INTERVAL = 300
 DEFAULT_MAX_RETRIES = 5
 
 SOURCE_BINANCE = "binance"
+SOURCE_BYBIT = "bybit"
 SOURCE_KUCOIN = "kucoin"
 
 VALID_SOURCES = {
     SOURCE_BINANCE,
+    SOURCE_BYBIT,
     SOURCE_KUCOIN,
 }
 
@@ -94,7 +71,7 @@ class GitHubCandleBackup:
     One backup operation can contain many changed candle files but creates
     only ONE Git commit.
 
-    Binance and KuCoin always use separate directories.
+    Each exchange uses a separate directory.
     """
 
     def __init__(
@@ -157,10 +134,7 @@ class GitHubCandleBackup:
 
         self._lock = threading.RLock()
 
-        # path -> SHA256 of the latest known local content.
         self._content_hashes: Dict[str, str] = {}
-
-        # path -> JSON string waiting for GitHub backup.
         self._pending: Dict[str, str] = {}
 
         self._last_backup_at: Optional[float] = None
@@ -168,10 +142,6 @@ class GitHubCandleBackup:
         self._last_error: Optional[str] = None
 
         self._backup_in_progress = False
-
-    # =========================================================
-    # Configuration
-    # =========================================================
 
     def is_configured(self) -> bool:
         return bool(self.repo and self.token)
@@ -190,10 +160,6 @@ class GitHubCandleBackup:
                 "last_error": self._last_error,
             }
 
-    # =========================================================
-    # HTTP
-    # =========================================================
-
     def _headers(self) -> Dict[str, str]:
         return {
             "Authorization": f"Bearer {self.token}",
@@ -204,10 +170,6 @@ class GitHubCandleBackup:
 
     def _url(self, path: str) -> str:
         return f"{self.api_base}{path}"
-
-    # =========================================================
-    # Paths
-    # =========================================================
 
     @staticmethod
     def _safe_symbol(symbol: str) -> str:
@@ -242,10 +204,6 @@ class GitHubCandleBackup:
             f"{safe_symbol}.json"
         )
 
-    # =========================================================
-    # Hashing
-    # =========================================================
-
     @staticmethod
     def _hash_text(content: str) -> str:
         return hashlib.sha256(
@@ -254,22 +212,12 @@ class GitHubCandleBackup:
 
     @staticmethod
     def _normalize_payload(payload) -> str:
-        """
-        Deterministic JSON serialization.
-
-        Identical candle data therefore produces identical content.
-        """
-
         return json.dumps(
             payload,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         )
-
-    # =========================================================
-    # Queue
-    # =========================================================
 
     def queue(
         self,
@@ -339,10 +287,6 @@ class GitHubCandleBackup:
 
         return True
 
-    # =========================================================
-    # GitHub: Branch
-    # =========================================================
-
     def _get_branch(self) -> Optional[dict]:
 
         url = self._url(
@@ -382,10 +326,6 @@ class GitHubCandleBackup:
             )
 
             return None
-
-    # =========================================================
-    # GitHub: Commit tree
-    # =========================================================
 
     def _get_commit_tree_sha(
         self,
@@ -437,10 +377,6 @@ class GitHubCandleBackup:
             .get("tree", {})
             .get("sha")
         )
-
-    # =========================================================
-    # GitHub: Create Tree
-    # =========================================================
 
     def _create_tree(
         self,
@@ -512,10 +448,6 @@ class GitHubCandleBackup:
 
             return None
 
-    # =========================================================
-    # GitHub: Create Commit
-    # =========================================================
-
     def _create_commit(
         self,
         tree_sha: str,
@@ -584,23 +516,11 @@ class GitHubCandleBackup:
 
             return None
 
-    # =========================================================
-    # GitHub: Update branch
-    # =========================================================
-
     def _update_branch(
         self,
         commit_sha: str,
         expected_parent_sha: str,
     ) -> Tuple[bool, bool]:
-        """
-        Returns:
-
-            (success, conflict)
-
-        conflict=True means somebody changed the branch after we
-        read it. The caller should refresh HEAD and retry.
-        """
 
         url = self._url(
             f"/repos/{self.repo}/git/refs/heads/{self.branch}"
@@ -631,8 +551,6 @@ class GitHubCandleBackup:
 
             return True, False
 
-        # GitHub commonly returns 422 for a branch update conflict.
-        # Some configurations can return 409.
         if response.status_code in (
             409,
             422,
@@ -660,38 +578,7 @@ class GitHubCandleBackup:
 
         return False, False
 
-    # =========================================================
-    # Backup
-    # =========================================================
-
     def backup(self) -> bool:
-        """
-        Upload all currently pending files in one Git commit.
-
-        Optimistic concurrency:
-
-            read HEAD
-              ↓
-            create tree
-              ↓
-            create commit
-              ↓
-            update branch
-              ↓
-            conflict?
-              ↓
-            read new HEAD
-              ↓
-            rebuild tree
-              ↓
-            retry
-
-        This prevents the common:
-
-            Expected branch to point to X, but it did not.
-
-        error from permanently breaking backups.
-        """
 
         if not self.is_configured():
 
@@ -914,10 +801,6 @@ class GitHubCandleBackup:
             with self._lock:
                 self._backup_in_progress = False
 
-    # =========================================================
-    # Retry delay
-    # =========================================================
-
     @staticmethod
     def _sleep_retry(
         attempt: int,
@@ -939,10 +822,6 @@ class GitHubCandleBackup:
             )
 
         time.sleep(delay)
-
-    # =========================================================
-    # Download
-    # =========================================================
 
     def download(
         self,
@@ -1046,10 +925,6 @@ class GitHubCandleBackup:
 
             return None
 
-    # =========================================================
-    # Restore
-    # =========================================================
-
     def restore_symbols(
         self,
         source: str,
@@ -1102,10 +977,6 @@ class GitHubCandleBackup:
 
         return restored
 
-    # =========================================================
-    # Background loop
-    # =========================================================
-
     def start_background_loop(
         self,
         interval_sec: int = DEFAULT_BACKUP_INTERVAL,
@@ -1126,8 +997,6 @@ class GitHubCandleBackup:
                 self.branch,
             )
 
-            # Avoid hitting GitHub immediately during application
-            # startup while Binance/KuCoin history is initializing.
             time.sleep(10)
 
             while True:
@@ -1156,10 +1025,6 @@ class GitHubCandleBackup:
 
         return thread
 
-    # =========================================================
-    # Utility
-    # =========================================================
-
     def pending_count(self) -> int:
 
         with self._lock:
@@ -1182,10 +1047,6 @@ class GitHubCandleBackup:
             message,
         )
 
-
-# =============================================================
-# Factory
-# =============================================================
 
 def build_github_candle_backup(
     session: requests.Session,
