@@ -1,19 +1,5 @@
-"""
-CEX ticker-based smart-money analyzer.
-
-Fixes applied vs. the original script:
-  * No more unsynchronized module-level globals — all state goes through
-    the thread-safe BotState.
-  * `elif` between inflow/outflow branches replaced with independent checks
-    so a symbol can never silently fall through either bucket due to
-    floating point edge cases at the boundary.
-  * Division-by-zero / KeyError guards tightened (prev_price <= 0, missing
-    fields) instead of relying on bare `except Exception` deep in the loop.
-  * Baseline volume and cooldown keys are namespaced separately from the
-    on-chain tracker's keys so the two independent signal sources never
-    collide in the same dict.
-"""
 import logging
+import statistics
 import time
 from datetime import datetime, timezone
 from typing import List, Tuple
@@ -23,132 +9,486 @@ import requests
 from config import Settings
 from formatting import esc
 from market_data import MarketDataProvider
-from signals import MarketSignal, SignalDirection, TriggerType
+from signals import (
+    MarketSignal,
+    SignalDirection,
+    TriggerType,
+)
 from state import BotState
 
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
 
 class MarketAnalyzer:
-    def __init__(self, settings: Settings, state: BotState, session: requests.Session):
+
+    def __init__(
+        self,
+        settings: Settings,
+        state: BotState,
+        session: requests.Session,
+    ):
         self.settings = settings
         self.state = state
-        self.provider = MarketDataProvider(session, timeout=settings.http_timeout_sec)
 
-    def run_cycle(self) -> Tuple[List[MarketSignal], str, int]:
-        """Fetch fresh ticker data, compare to the previous cycle's snapshot,
-        and return (signals, data_source, symbols_scanned)."""
+        self.provider = MarketDataProvider(
+            session,
+            timeout=settings.http_timeout_sec,
+        )
+
+        self._bootstrapped = set()
+
+    # ---------------------------------------------------------
+    # main cycle
+    # ---------------------------------------------------------
+
+    def run_cycle(
+        self,
+    ) -> Tuple[List[MarketSignal], str, int]:
+
         ticker_stats, data_source = self.provider.fetch()
+
         if not ticker_stats:
             return [], data_source, 0
 
-        current_snapshot = {}
         signals: List[MarketSignal] = []
 
-        for full_symbol, item in ticker_stats.items():
-            symbol = full_symbol.replace("USDT", "")
-            price_usd = item["lastPrice"]
-            vol_24h_usd = item["quoteVolume"]
-            change_24h = item["priceChangePercent"]
+        current_snapshot = {}
 
-            current_snapshot[symbol] = {"price": price_usd, "vol_usd": vol_24h_usd}
+        for symbol, item in ticker_stats.items():
 
-            prev = self.state.previous_market_snapshot.get(symbol)
-            if not prev or price_usd <= 0 or prev["price"] <= 0:
-                if not prev:
-                    self._seed_baseline_if_new(symbol, full_symbol)
+            try:
+                full_symbol = item["binance_symbol"]
+
+                price = float(item["lastPrice"])
+                change_24h = float(
+                    item["priceChangePercent"]
+                )
+
+            except (KeyError, TypeError, ValueError):
                 continue
 
-            price_change = ((price_usd - prev["price"]) / prev["price"]) * 100
-            vol_inflow = vol_24h_usd - prev["vol_usd"]
-            fallback_avg_vol = vol_24h_usd / 288  # ~5min slice of a 24h rolling volume
+            if price <= 0:
+                continue
 
-            # Baseline MUST be computed from history BEFORE this cycle's
-            # sample is added to it — otherwise a genuine spike inflates its
-            # own comparison baseline and can dodge the spike-ratio check
-            # (this was a real bug present since the original script).
-            baseline_vol = self.state.get_baseline_volume(symbol, fallback_avg_vol)
-            spike_multiplier = (vol_inflow / baseline_vol) if baseline_vol > 0 else 0
+            current_snapshot[symbol] = {
+                "price": price,
+            }
 
-            if vol_inflow > 0:
-                self.state.push_volume_sample(symbol, vol_inflow)
+            # -------------------------------------------------
+            # Bootstrap 72h history
+            # -------------------------------------------------
 
-            # Compute the statistical anomaly score BEFORE pushing the
-            # current sample in, so it's measured against prior history,
-            # not against itself.
-            zscore = self.state.get_return_zscore(symbol, price_change) if self.settings.pump_zscore_enabled else None
-            self.state.push_price_return_sample(symbol, price_change)
+            if symbol not in self._bootstrapped:
 
-            is_volume_spike = vol_inflow >= (baseline_vol * self.settings.volume_spike_ratio)
-            is_significant = vol_inflow >= self.settings.min_inflow_usd_5m
+                loaded = self.state.candles.load(
+                    symbol
+                )
 
-            # Both paths require some real, meaningful volume behind the move
-            # (this is what keeps illiquid noise out) — but only the STATIC
-            # path additionally requires the full baseline-relative spike.
-            # Nesting the statistical path inside that same strict spike gate
-            # (the previous version's actual bug) meant it could almost never
-            # fire anything the static path wasn't already catching, since a
-            # real 2.5x volume spike is usually already a >1% price move too.
+                if not loaded or self.state.candles.count(
+                    symbol
+                ) < self.settings.pump_history_candles:
+
+                    self._bootstrap_symbol(
+                        symbol,
+                        full_symbol,
+                    )
+
+                self._bootstrapped.add(symbol)
+
+            # -------------------------------------------------
+            # Current live 5m candle
+            # -------------------------------------------------
+
+            candle = self.provider.fetch_current_5m_candle(
+                full_symbol
+            )
+
+            if candle is None:
+                continue
+
+            update_type = self.state.candles.update(
+                symbol,
+                candle,
+            )
+
+            # -------------------------------------------------
+            # 4-hour volume baseline
+            # -------------------------------------------------
+
+            baseline_4h = (
+                self.state.candles.average_quote_volume(
+                    symbol,
+                    self.settings.volume_baseline_candles,
+                )
+            )
+
+            if baseline_4h is None or baseline_4h <= 0:
+                continue
+
+            current_volume = candle.quote_volume
+
+            # IMPORTANT:
+            # No elapsed-time normalization.
+            # Current live volume is compared directly with
+            # the average of previous CLOSED 5m candles.
+
+            spike_multiplier = (
+                current_volume / baseline_4h
+            )
+
+            volume_inflow = (
+                current_volume - baseline_4h
+            )
+
+            # -------------------------------------------------
+            # Volume signal
+            # -------------------------------------------------
+
+            is_volume_spike = (
+                current_volume
+                >= baseline_4h
+                * self.settings.volume_spike_ratio
+            )
+
+            is_significant = (
+                volume_inflow
+                >= self.settings.min_inflow_usd_5m
+            )
+
+            # -------------------------------------------------
+            # 72h price anomaly
+            # -------------------------------------------------
+
+            zscore = None
+
+            if self.settings.pump_zscore_enabled:
+
+                zscore = self._get_price_zscore(
+                    symbol,
+                    candle,
+                )
+
+            # -------------------------------------------------
+            # price movement
+            # -------------------------------------------------
+
+            prev_candle = self._previous_closed_candle(
+                symbol
+            )
+
+            if prev_candle is None:
+                continue
+
+            if prev_candle.close <= 0:
+                continue
+
+            price_change = (
+                (candle.close - prev_candle.close)
+                / prev_candle.close
+            ) * 100
+
+            # -------------------------------------------------
+            # We need meaningful volume before any signal.
+            # -------------------------------------------------
+
             if not is_significant:
                 continue
 
             cooldown_key = f"market:{symbol}"
-            if self.state.is_in_cooldown(cooldown_key, self.settings.alert_cooldown_sec):
+
+            if self.state.is_in_cooldown(
+                cooldown_key,
+                self.settings.alert_cooldown_sec,
+            ):
                 continue
 
-            is_static_pump = is_volume_spike and (self.settings.price_pump_min <= price_change <= self.settings.price_pump_max)
-            is_static_dump = is_volume_spike and (-self.settings.price_pump_max <= price_change <= -self.settings.price_pump_min)
-            is_statistical_pump = zscore is not None and zscore >= self.settings.pump_zscore_threshold
-            is_statistical_dump = zscore is not None and zscore <= -self.settings.pump_zscore_threshold
+            # -------------------------------------------------
+            # Static pump / dump
+            # -------------------------------------------------
 
-            if is_static_pump or is_statistical_pump:
-                trigger = TriggerType.BOTH if (is_static_pump and is_statistical_pump) else (
-                    TriggerType.STATISTICAL if is_statistical_pump else TriggerType.STATIC)
-                signals.append(MarketSignal(
-                    symbol=symbol, price=price_usd, change_5m=price_change,
-                    change_24h=change_24h, inflow_usd=vol_inflow,
-                    spike_multiplier=spike_multiplier, direction=SignalDirection.INFLOW,
-                    trigger=trigger, zscore=zscore,
-                ))
-                self.state.mark_alerted(cooldown_key)
-            elif is_static_dump or is_statistical_dump:
-                trigger = TriggerType.BOTH if (is_static_dump and is_statistical_dump) else (
-                    TriggerType.STATISTICAL if is_statistical_dump else TriggerType.STATIC)
-                signals.append(MarketSignal(
-                    symbol=symbol, price=price_usd, change_5m=price_change,
-                    change_24h=change_24h, inflow_usd=vol_inflow,
-                    spike_multiplier=spike_multiplier, direction=SignalDirection.OUTFLOW,
-                    trigger=trigger, zscore=zscore,
-                ))
-                self.state.mark_alerted(cooldown_key)
+            static_pump = (
+                is_volume_spike
+                and
+                self.settings.price_pump_min
+                <= price_change
+                <= self.settings.price_pump_max
+            )
 
-        self.state.swap_snapshot(current_snapshot)
-        return signals, data_source, len(ticker_stats)
+            static_dump = (
+                is_volume_spike
+                and
+                -self.settings.price_pump_max
+                <= price_change
+                <= -self.settings.price_pump_min
+            )
 
-    def _seed_baseline_if_new(self, symbol: str, binance_symbol: str) -> None:
-        """Called the first time a symbol is ever seen (this cycle or after
-        a restart). Pulls real 5-minute candle volumes from Binance so the
-        very next cycle already has an accurate rolling baseline, instead
-        of relying on the naive 24h/288 uniform-distribution guess for the
-        first ~15 minutes. Best-effort: any failure just leaves the old
-        fallback in place, nothing breaks."""
-        try:
-            volumes = self.provider.fetch_recent_5m_volumes(binance_symbol, limit=self.settings.history_window)
-            if volumes:
-                self.state.seed_volume_history(symbol, volumes)
-        except Exception:
-            log.debug(f"seed baseline برای {symbol} ناموفق بود؛ به fallback قبلی اکتفا می‌شود.")
-        finally:
-            time.sleep(0.05)  # stay well clear of Binance's rate limit during the first-cycle burst
+            # -------------------------------------------------
+            # Statistical pump / dump
+            # -------------------------------------------------
 
-    def build_status_message(self, data_source: str, symbols_scanned: int,
-                              inflow_count: int, outflow_count: int) -> str:
+            statistical_pump = (
+                zscore is not None
+                and zscore
+                >= self.settings.pump_zscore_threshold
+            )
+
+            statistical_dump = (
+                zscore is not None
+                and zscore
+                <= -self.settings.pump_zscore_threshold
+            )
+
+            # -------------------------------------------------
+            # IN
+            # -------------------------------------------------
+
+            if static_pump or statistical_pump:
+
+                trigger = self._trigger(
+                    static_pump,
+                    statistical_pump,
+                )
+
+                signals.append(
+                    MarketSignal(
+                        symbol=symbol,
+                        price=candle.close,
+                        change_5m=price_change,
+                        change_24h=change_24h,
+                        inflow_usd=volume_inflow,
+                        spike_multiplier=spike_multiplier,
+                        direction=SignalDirection.INFLOW,
+                        trigger=trigger,
+                        zscore=zscore,
+                    )
+                )
+
+                self.state.mark_alerted(
+                    cooldown_key
+                )
+
+            # -------------------------------------------------
+            # OUT
+            # -------------------------------------------------
+
+            elif static_dump or statistical_dump:
+
+                trigger = self._trigger(
+                    static_dump,
+                    statistical_dump,
+                )
+
+                signals.append(
+                    MarketSignal(
+                        symbol=symbol,
+                        price=candle.close,
+                        change_5m=price_change,
+                        change_24h=change_24h,
+                        inflow_usd=volume_inflow,
+                        spike_multiplier=spike_multiplier,
+                        direction=SignalDirection.OUTFLOW,
+                        trigger=trigger,
+                        zscore=zscore,
+                    )
+                )
+
+                self.state.mark_alerted(
+                    cooldown_key
+                )
+
+        self.state.swap_snapshot(
+            current_snapshot
+        )
+
         return (
-            f"🟢 <b>گزارش رصد زنده مارکت</b> \n\n"
-            f"⏰ <b>زمان (UTC):</b> <code>{datetime.now(timezone.utc).strftime('%H:%M:%S')}</code>\n"
-            f"🌐 <b>منبع داده:</b> <code>{esc(data_source)}</code>\n"
-            f"🔍 <b>ارزهای آنالیز شده:</b> <code>{symbols_scanned}</code> از تمامی بازارهای نوبیتکس\n"
-            f"📥 <b>سیگنال ورود (تیکر):</b> <code>{inflow_count}</code> مورد\n"
-            f"📤 <b>سیگنال خروج (تیکر):</b> <code>{outflow_count}</code> مورد\n"
+            signals,
+            data_source,
+            len(ticker_stats),
+        )
+
+    # ---------------------------------------------------------
+    # bootstrap
+    # ---------------------------------------------------------
+
+    def _bootstrap_symbol(
+        self,
+        symbol: str,
+        binance_symbol: str,
+    ) -> None:
+
+        try:
+            candles = self.provider.fetch_5m_klines(
+                binance_symbol,
+                limit=864,
+            )
+
+            if not candles:
+                return
+
+            # The last returned candle may still be open.
+            # Keep it separate from the closed history.
+            now_ms = int(time.time() * 1000)
+
+            closed = [
+                candle
+                for candle in candles
+                if candle.close_time < now_ms
+            ]
+
+            current = candles[-1]
+
+            self.state.candles.seed(
+                symbol,
+                closed[-864:],
+            )
+
+            if current.close_time >= now_ms:
+                self.state.candles.update(
+                    symbol,
+                    current,
+                )
+
+            self.state.candles.save(symbol)
+
+            log.info(
+                "تاریخچه 5m برای %s آماده شد: %d کندل",
+                symbol,
+                len(closed[-864:]),
+            )
+
+        except Exception:
+            log.exception(
+                "bootstrap برای %s ناموفق بود",
+                symbol,
+            )
+
+    # ---------------------------------------------------------
+    # price z-score
+    # ---------------------------------------------------------
+
+    def _get_price_zscore(
+        self,
+        symbol: str,
+        current_candle,
+    ):
+
+        candles = self.state.candles.get_recent(
+            symbol,
+            self.settings.pump_history_candles,
+        )
+
+        if len(candles) < 48:
+            return None
+
+        returns = []
+
+        previous = None
+
+        for candle in candles:
+
+            if previous is not None:
+                if previous.close > 0:
+                    returns.append(
+                        (
+                            candle.close
+                            - previous.close
+                        )
+                        / previous.close
+                        * 100
+                    )
+
+            previous = candle
+
+        if not returns:
+            return None
+
+        # Current live candle return is compared
+        # against historical 72h candle returns.
+
+        if candles[-1].close <= 0:
+            return None
+
+        current_return = (
+            (
+                current_candle.close
+                - candles[-1].close
+            )
+            / candles[-1].close
+        ) * 100
+
+        if len(returns) < 20:
+            return None
+
+        mean = statistics.mean(returns)
+        stdev = statistics.pstdev(returns)
+
+        if stdev <= 0:
+            return None
+
+        return (
+            current_return - mean
+        ) / stdev
+
+    # ---------------------------------------------------------
+    # previous candle
+    # ---------------------------------------------------------
+
+    def _previous_closed_candle(
+        self,
+        symbol: str,
+    ):
+
+        candles = self.state.candles.get_recent(
+            symbol,
+            2,
+        )
+
+        if not candles:
+            return None
+
+        return candles[-1]
+
+    # ---------------------------------------------------------
+    # trigger
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _trigger(
+        static: bool,
+        statistical: bool,
+    ):
+
+        if static and statistical:
+            return TriggerType.BOTH
+
+        if statistical:
+            return TriggerType.STATISTICAL
+
+        return TriggerType.STATIC
+
+    # ---------------------------------------------------------
+    # status
+    # ---------------------------------------------------------
+
+    def build_status_message(
+        self,
+        data_source: str,
+        symbols_scanned: int,
+        inflow_count: int,
+        outflow_count: int,
+    ) -> str:
+
+        return (
+            f"🟢 <b>گزارش رصد زنده مارکت</b>\n\n"
+            f"⏰ <b>زمان (UTC):</b> "
+            f"<code>{datetime.now(timezone.utc).strftime('%H:%M:%S')}</code>\n"
+            f"🌐 <b>منبع داده:</b> "
+            f"<code>{esc(data_source)}</code>\n"
+            f"🔍 <b>ارزهای آنالیز شده:</b> "
+            f"<code>{symbols_scanned}</code>\n"
+            f"📥 <b>سیگنال ورود:</b> "
+            f"<code>{inflow_count}</code> مورد\n"
+            f"📤 <b>سیگنال خروج:</b> "
+            f"<code>{outflow_count}</code> مورد\n"
             f"📡 <b>وضعیت سیستم:</b> فعال و ۲۴ ساعته"
         )
