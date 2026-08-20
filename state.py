@@ -1,38 +1,49 @@
 """
-Thread-safe state container.
+Thread-safe bot state.
 
-The original bot mutated module-level globals (previous_market_snapshot,
-volume_history, last_alert_time) from a background thread while the Flask
-/status route (a different thread, under gunicorn/multiple workers even more
-so) could read overlapping structures without any lock — a data race. This
-version wraps every read/write behind a single RLock and additionally
-persists the parts that matter (cooldowns + dedupe set) to disk so a restart
-doesn't immediately re-fire every alert that was in cooldown.
+Market candle history is delegated to CandleStore.
+Cooldowns and transaction dedupe remain here.
 """
+
 import json
 import logging
 import os
-import statistics
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
+from candle_store import CandleStore
+
 log = logging.getLogger("smart_money_bot.state")
 
 
 class BotState:
-    def __init__(self, history_window: int, state_file_path: Optional[str] = None):
+
+    def __init__(
+        self,
+        history_window: int,
+        state_file_path: Optional[str] = None,
+        candle_store_path: str = "market_history",
+    ):
         self._lock = threading.RLock()
+
         self._history_window = history_window
         self._state_file_path = state_file_path
 
         self.previous_market_snapshot: Dict[str, dict] = {}
-        self.volume_history: Dict[str, deque] = {}
-        self.price_return_history: Dict[str, deque] = {}
+
         self.last_alert_time: Dict[str, float] = {}
-        self.seen_tx_hashes: deque = deque(maxlen=5000)
+
+        self.seen_tx_hashes = deque(
+            maxlen=5000
+        )
+
+        self.candles = CandleStore(
+            root_path=candle_store_path,
+            max_candles=864,
+        )
 
         self.health = {
             "last_market_cycle_at": None,
@@ -45,77 +56,31 @@ class BotState:
 
         self._load()
 
-    # ---------------- cooldown / alert bookkeeping ----------------
+    # ---------------------------------------------------------
+    # cooldown
+    # ---------------------------------------------------------
 
-    def is_in_cooldown(self, key: str, cooldown_sec: int) -> bool:
+    def is_in_cooldown(
+        self,
+        key: str,
+        cooldown_sec: int,
+    ) -> bool:
+
         with self._lock:
             last = self.last_alert_time.get(key)
+
         if last is None:
             return False
+
         return (time.time() - last) < cooldown_sec
 
     def mark_alerted(self, key: str) -> None:
         with self._lock:
             self.last_alert_time[key] = time.time()
 
-    # ---------------- volume baseline ----------------
-
-    def get_baseline_volume(self, symbol: str, fallback_avg: float) -> float:
-        with self._lock:
-            hist = self.volume_history.get(symbol)
-            # Require a meaningful sample count before trusting the real
-            # average over the naive fallback — with klines seeding this is
-            # usually moot (seeds in a full window immediately), but it's
-            # the safety net for the rare case seeding failed and history
-            # is accumulating one real cycle at a time.
-            if hist and len(hist) >= 10:
-                return max(statistics.mean(hist), 1.0)
-        return max(fallback_avg, 1.0)
-
-    def push_volume_sample(self, symbol: str, value: float) -> None:
-        with self._lock:
-            hist = self.volume_history.setdefault(symbol, deque(maxlen=self._history_window))
-            hist.append(value)
-
-    def seed_volume_history(self, symbol: str, samples: list) -> None:
-        """One-time seed of real per-candle volumes (from Binance klines) so
-        a symbol has an accurate baseline from its very first cycle, instead
-        of relying on the naive 24h/288 fallback for the first few cycles.
-        No-ops if this symbol already has history (never overwrites live
-        data that's already been collected)."""
-        with self._lock:
-            if symbol in self.volume_history and len(self.volume_history[symbol]) >= 10:
-                return
-            hist = deque(samples[-self._history_window:], maxlen=self._history_window)
-            self.volume_history[symbol] = hist
-
-    def push_price_return_sample(self, symbol: str, pct_change: float) -> None:
-        with self._lock:
-            hist = self.price_return_history.setdefault(symbol, deque(maxlen=self._history_window))
-            hist.append(pct_change)
-
-    def get_return_zscore(self, symbol: str, current_pct_change: float) -> Optional[float]:
-        """How many standard deviations `current_pct_change` is from this
-        symbol's own recent per-cycle price-return distribution. Returns
-        None until there's enough history (min 5 samples) to make the
-        number meaningful — with too little history a z-score is noise, not
-        signal, so callers should treat None as "can't judge yet", not "0".
-
-        This lets a coin that normally barely moves get flagged on a much
-        smaller absolute % move than a coin that's always volatile, which a
-        single fixed PRICE_PUMP_MIN/MAX threshold across every asset can't
-        do. It's a fairly short rolling window (HISTORY_WINDOW cycles), so
-        treat it as a useful second signal alongside the static thresholds,
-        not a replacement for human judgement."""
-        with self._lock:
-            hist = list(self.price_return_history.get(symbol, ()))
-        if len(hist) < 5:
-            return None
-        mean = statistics.mean(hist)
-        stdev = statistics.pstdev(hist)
-        if stdev == 0:
-            return None
-        return (current_pct_change - mean) / stdev
+    # ---------------------------------------------------------
+    # snapshots
+    # ---------------------------------------------------------
 
     def swap_snapshot(self, new_snapshot: dict) -> dict:
         with self._lock:
@@ -123,27 +88,49 @@ class BotState:
             self.previous_market_snapshot = new_snapshot
             return old
 
-    # ---------------- on-chain dedupe ----------------
+    # ---------------------------------------------------------
+    # transactions
+    # ---------------------------------------------------------
 
     def is_new_tx(self, tx_hash: str) -> bool:
+
         with self._lock:
             if tx_hash in self.seen_tx_hashes:
                 return False
+
             self.seen_tx_hashes.append(tx_hash)
+
             return True
 
-    # ---------------- health / status ----------------
+    # ---------------------------------------------------------
+    # health
+    # ---------------------------------------------------------
 
-    def record_market_cycle(self, error: Optional[str] = None) -> None:
+    def record_market_cycle(
+        self,
+        error: Optional[str] = None,
+    ) -> None:
+
         with self._lock:
-            self.health["last_market_cycle_at"] = datetime.now(timezone.utc).isoformat()
+            self.health["last_market_cycle_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+
             self.health["market_cycles_completed"] += 1
             self.health["last_error"] = error
 
-    def record_whale_cycle(self, error: Optional[str] = None) -> None:
+    def record_whale_cycle(
+        self,
+        error: Optional[str] = None,
+    ) -> None:
+
         with self._lock:
-            self.health["last_whale_cycle_at"] = datetime.now(timezone.utc).isoformat()
+            self.health["last_whale_cycle_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+
             self.health["whale_cycles_completed"] += 1
+
             if error:
                 self.health["last_error"] = error
 
@@ -151,45 +138,109 @@ class BotState:
         with self._lock:
             return dict(self.health)
 
-    # ---------------- persistence ----------------
+    # ---------------------------------------------------------
+    # persistence
+    # ---------------------------------------------------------
 
     def _load(self) -> None:
-        if not self._state_file_path or not os.path.exists(self._state_file_path):
+
+        if (
+            not self._state_file_path
+            or not os.path.exists(self._state_file_path)
+        ):
             return
+
         try:
-            with open(self._state_file_path, "r", encoding="utf-8") as f:
+            with open(
+                self._state_file_path,
+                "r",
+                encoding="utf-8",
+            ) as f:
                 data = json.load(f)
+
             with self._lock:
-                self.last_alert_time = data.get("last_alert_time", {})
-                self.seen_tx_hashes = deque(data.get("seen_tx_hashes", []), maxlen=5000)
-            log.info("وضعیت قبلی از دیسک بازیابی شد.")
+                self.last_alert_time = data.get(
+                    "last_alert_time",
+                    {},
+                )
+
+                self.seen_tx_hashes = deque(
+                    data.get("seen_tx_hashes", []),
+                    maxlen=5000,
+                )
+
         except (OSError, json.JSONDecodeError) as e:
-            log.warning(f"بازیابی وضعیت از دیسک ناموفق بود: {e}")
+            log.warning(
+                "بازیابی state ناموفق بود: %s",
+                e,
+            )
 
     def save(self) -> None:
+
         if not self._state_file_path:
             return
+
         with self._lock:
             payload = {
                 "last_alert_time": self.last_alert_time,
-                "seen_tx_hashes": list(self.seen_tx_hashes),
-                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "seen_tx_hashes": list(
+                    self.seen_tx_hashes
+                ),
+                "saved_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
             }
-        tmp_path = f"{self._state_file_path}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
-            os.replace(tmp_path, self._state_file_path)
-        except OSError as e:
-            log.warning(f"ذخیره وضعیت روی دیسک ناموفق بود: {e}")
 
-    def start_autosave(self, interval_sec: int) -> None:
-        if not self._state_file_path or interval_sec <= 0:
+        tmp_path = f"{self._state_file_path}.tmp"
+
+        try:
+            with open(
+                tmp_path,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    payload,
+                    f,
+                    ensure_ascii=False,
+                )
+
+            os.replace(
+                tmp_path,
+                self._state_file_path,
+            )
+
+        except OSError as e:
+            log.warning(
+                "ذخیره state ناموفق بود: %s",
+                e,
+            )
+
+    def save_market_history(self) -> None:
+        self.candles.save_dirty()
+
+    def start_autosave(
+        self,
+        interval_sec: int,
+    ) -> None:
+
+        if interval_sec <= 0:
             return
 
         def _loop():
             while True:
                 time.sleep(interval_sec)
-                self.save()
 
-        threading.Thread(target=_loop, daemon=True).start()
+                try:
+                    self.save()
+                    self.save_market_history()
+
+                except Exception:
+                    log.exception(
+                        "خطا در autosave"
+                    )
+
+        threading.Thread(
+            target=_loop,
+            daemon=True,
+        ).start()
