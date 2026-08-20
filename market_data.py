@@ -8,9 +8,17 @@ Rules
 - Each exchange maintains its own candle history.
 - Analysis priority for the active cycle:
     Binance → Bybit → KuCoin
+
+Binance ban handling
+--------------------
+HTTP 429 = rate limit (back off).
+HTTP 418 = IP ban after repeated 429s (2 min … 3 days).
+We honor Retry-After and stop all Binance calls until it expires
+so the ban is not extended by continued traffic.
 """
 
 import logging
+import time
 from typing import Dict, Optional, Tuple
 
 import requests
@@ -46,6 +54,11 @@ KUCOIN_KLINES_ENDPOINT = (
     "https://api.kucoin.com/api/v1/market/candles"
 )
 
+# Fallback when Binance omits Retry-After
+DEFAULT_429_COOLDOWN_SEC = 60
+DEFAULT_418_COOLDOWN_SEC = 120  # official minimum ban is 2 minutes
+MAX_COOLDOWN_SEC = 3 * 24 * 3600  # 3 days (official max ban)
+
 
 class MarketDataProvider:
 
@@ -57,11 +70,182 @@ class MarketDataProvider:
         self.session = session
         self.timeout = max(1, int(timeout))
 
+        # Unix timestamp until which Binance must not be called.
+        self._binance_cooldown_until: float = 0.0
+        self._binance_cooldown_reason: str = ""
+
+    # =========================================================
+    # BINANCE BAN / RATE-LIMIT COOLDOWN
+    # =========================================================
+
+    def binance_cooldown_remaining(self) -> float:
+        """Seconds left on Binance cooldown (0 if clear)."""
+        remaining = self._binance_cooldown_until - time.time()
+        return max(0.0, remaining)
+
+    def binance_is_cooling(self) -> bool:
+        return self.binance_cooldown_remaining() > 0
+
+    def _set_binance_cooldown(
+        self,
+        seconds: float,
+        reason: str,
+    ) -> None:
+        seconds = max(1.0, min(float(seconds), MAX_COOLDOWN_SEC))
+        until = time.time() + seconds
+
+        # Never shorten an existing longer cooldown.
+        if until <= self._binance_cooldown_until:
+            return
+
+        self._binance_cooldown_until = until
+        self._binance_cooldown_reason = reason
+
+        log.warning(
+            "BINANCE COOLDOWN SET | reason=%s | "
+            "seconds=%.0f | until_in=%.0fs",
+            reason,
+            seconds,
+            seconds,
+        )
+
+    def _parse_retry_after_seconds(
+        self,
+        response: requests.Response,
+    ) -> Optional[float]:
+        """
+        Binance may send:
+          - Retry-After header: seconds to wait
+          - body.data.retryAfter: unix ms timestamp when ban lifts
+          - body.msg containing "until <ms>"
+        """
+
+        # 1) Header (preferred)
+        header = response.headers.get("Retry-After")
+        if header:
+            try:
+                value = float(header.strip())
+                # Header is usually seconds; if huge, treat as epoch ms.
+                if value > 1_000_000_000_000:  # ms timestamp
+                    return max(0.0, (value / 1000.0) - time.time())
+                if value > 1_000_000_000:  # sec timestamp
+                    return max(0.0, value - time.time())
+                return max(0.0, value)
+            except (TypeError, ValueError):
+                pass
+
+        # 2) JSON body
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        # Nested data.retryAfter (ms)
+        data = payload.get("data")
+        if isinstance(data, dict):
+            retry_ms = data.get("retryAfter")
+            if retry_ms is not None:
+                try:
+                    ts = float(retry_ms)
+                    if ts > 1_000_000_000_000:
+                        return max(0.0, (ts / 1000.0) - time.time())
+                    if ts > 1_000_000_000:
+                        return max(0.0, ts - time.time())
+                    return max(0.0, ts)
+                except (TypeError, ValueError):
+                    pass
+
+        # Top-level retryAfter
+        retry = payload.get("retryAfter")
+        if retry is not None:
+            try:
+                ts = float(retry)
+                if ts > 1_000_000_000_000:
+                    return max(0.0, (ts / 1000.0) - time.time())
+                if ts > 1_000_000_000:
+                    return max(0.0, ts - time.time())
+                return max(0.0, ts)
+            except (TypeError, ValueError):
+                pass
+
+        return None
+
+    def _handle_binance_limit_response(
+        self,
+        response: requests.Response,
+        context: str,
+    ) -> None:
+        """
+        Apply cooldown for 418 (ban) / 429 (rate limit).
+        Other non-200 statuses do not set a long cooldown.
+        """
+
+        status = response.status_code
+
+        if status == 418:
+            seconds = self._parse_retry_after_seconds(response)
+            if seconds is None or seconds < 1:
+                seconds = float(DEFAULT_418_COOLDOWN_SEC)
+            self._set_binance_cooldown(
+                seconds,
+                reason=f"418_IP_BAN:{context}",
+            )
+            return
+
+        if status == 429:
+            seconds = self._parse_retry_after_seconds(response)
+            if seconds is None or seconds < 1:
+                seconds = float(DEFAULT_429_COOLDOWN_SEC)
+            self._set_binance_cooldown(
+                seconds,
+                reason=f"429_RATE_LIMIT:{context}",
+            )
+            return
+
+        # Soft note for other errors — no long ban
+        log.warning(
+            "BINANCE HTTP ERROR | status=%s context=%s",
+            status,
+            context,
+        )
+
+    def _binance_guard(self, context: str) -> bool:
+        """
+        Return True if Binance may be called.
+        Return False if still in cooldown (and log once-style message).
+        """
+
+        remaining = self.binance_cooldown_remaining()
+
+        if remaining <= 0:
+            if self._binance_cooldown_reason:
+                log.info(
+                    "BINANCE COOLDOWN ENDED | previous_reason=%s",
+                    self._binance_cooldown_reason,
+                )
+                self._binance_cooldown_reason = ""
+            return True
+
+        log.info(
+            "BINANCE SKIPPED | cooldown active | "
+            "remaining=%.0fs | reason=%s | context=%s",
+            remaining,
+            self._binance_cooldown_reason or "unknown",
+            context,
+        )
+        return False
+
     # =========================================================
     # TICKERS
     # =========================================================
 
     def fetch_binance(self) -> Dict[str, dict]:
+
+        if not self._binance_guard("ticker"):
+            return {}
 
         log.info("BINANCE TICKER FETCH START")
 
@@ -72,6 +256,13 @@ class MarketDataProvider:
                     endpoint,
                     timeout=self.timeout,
                 )
+
+                if response.status_code in (418, 429):
+                    self._handle_binance_limit_response(
+                        response,
+                        context="ticker",
+                    )
+                    return {}
 
                 if response.status_code != 200:
                     log.warning(
@@ -161,12 +352,6 @@ class MarketDataProvider:
         return {}
 
     def fetch_bybit(self) -> Dict[str, dict]:
-        """
-        Bybit v5 spot tickers (public, no auth).
-
-        price24hPcnt is a ratio (e.g. 0.05 = +5%).
-        turnover24h is quote volume in USDT for spot.
-        """
 
         log.info("BYBIT TICKER FETCH START")
 
@@ -222,7 +407,6 @@ class MarketDataProvider:
                 try:
                     canonical = resolve_alias(symbol)
 
-                    # price24hPcnt is decimal ratio → percent
                     pct = float(item.get("price24hPcnt", 0.0)) * 100.0
 
                     result[canonical] = {
@@ -366,6 +550,9 @@ class MarketDataProvider:
         limit: int = 864,
     ) -> Optional[list]:
 
+        if not self._binance_guard(f"klines:{symbol}"):
+            return None
+
         limit = max(1, min(int(limit), 1000))
 
         params = {
@@ -382,6 +569,13 @@ class MarketDataProvider:
                     params=params,
                     timeout=self.timeout,
                 )
+
+                if response.status_code in (418, 429):
+                    self._handle_binance_limit_response(
+                        response,
+                        context=f"klines:{symbol}",
+                    )
+                    return None
 
                 if response.status_code != 200:
                     log.warning(
@@ -432,12 +626,6 @@ class MarketDataProvider:
         symbol: str,
         limit: int = 864,
     ) -> Optional[list]:
-        """
-        Bybit v5 kline (spot).
-
-        Response list is newest-first:
-        [startTime, open, high, low, close, volume, turnover]
-        """
 
         limit = max(1, min(int(limit), 1000))
 
@@ -492,7 +680,6 @@ class MarketDataProvider:
             if not isinstance(raw, list):
                 return None
 
-            # Newest-first → oldest-first
             raw = list(reversed(raw))
             raw = raw[-limit:]
 
@@ -569,7 +756,6 @@ class MarketDataProvider:
             if not isinstance(raw, list):
                 return None
 
-            # KuCoin commonly returns newest-first.
             raw = list(reversed(raw))
 
             raw = raw[-limit:]
@@ -720,6 +906,8 @@ class MarketDataProvider:
     ]:
         """
         Returns (binance, bybit, kucoin) tickers independently.
+
+        Binance is skipped entirely while a cooldown is active.
         """
 
         binance = self.fetch_binance()
@@ -728,10 +916,12 @@ class MarketDataProvider:
 
         log.info(
             "MARKET SOURCES | "
-            "binance=%s | bybit=%s | kucoin=%s",
+            "binance=%s | bybit=%s | kucoin=%s | "
+            "binance_cooldown=%.0fs",
             len(binance),
             len(bybit),
             len(kucoin),
+            self.binance_cooldown_remaining(),
         )
 
         return binance, bybit, kucoin
