@@ -1,13 +1,8 @@
-"""Exchange-aware market analysis using closed 5m candles only.
-
-The detector reports observable volume/price anomalies.  It intentionally does
-not claim that exchange candle volume proves "smart money" or net cash inflow.
-"""
+"""Exchange-aware market analysis using closed 5m candles only."""
 
 from __future__ import annotations
 
 import logging
-import math
 import statistics
 import time
 from datetime import datetime, timezone
@@ -36,12 +31,7 @@ def _candles_from_payload(data: dict) -> List[Candle]:
         if not isinstance(item, dict):
             continue
         try:
-            candle = Candle(
-                open_time=int(item["open_time"]), close_time=int(item["close_time"]),
-                open=float(item["open"]), high=float(item["high"]), low=float(item["low"]),
-                close=float(item["close"]), volume=float(item["volume"]),
-                quote_volume=float(item["quote_volume"]), trades=int(item.get("trades", 0)),
-            )
+            candle = Candle(int(item["open_time"]), int(item["close_time"]), float(item["open"]), float(item["high"]), float(item["low"]), float(item["close"]), float(item["volume"]), float(item["quote_volume"]), int(item.get("trades", 0)))
             if candle.close_time < now_ms:
                 parsed.append(candle)
         except (KeyError, TypeError, ValueError):
@@ -50,12 +40,10 @@ def _candles_from_payload(data: dict) -> List[Candle]:
 
 
 def _robust_zscore(values: List[float], current: float) -> Optional[float]:
-    """Robust z-score using median/MAD; less sensitive to crypto outliers."""
     if len(values) < 20:
         return None
     median = statistics.median(values)
-    deviations = [abs(x - median) for x in values]
-    mad = statistics.median(deviations)
+    mad = statistics.median([abs(x - median) for x in values])
     if mad > 0:
         return (current - median) / (1.4826 * mad)
     stdev = statistics.pstdev(values)
@@ -104,7 +92,7 @@ class MarketAnalyzer:
                         payload = github_backup.download(source, symbol)
                         restored = _candles_from_payload(payload) if payload else []
                         if restored:
-                            self.candle_store.seed(source, symbol, restored)
+                            self.candle_store.seed(source, symbol, restored, mark_dirty=False)
                             count = self.candle_store.count(source, symbol)
                             if count >= target_count:
                                 stats["github"] += 1
@@ -112,7 +100,7 @@ class MarketAnalyzer:
                                 continue
                     candles = self.provider.fetch_candles(source, symbol, target_count)
                     if candles:
-                        self.candle_store.seed(source, symbol, candles)
+                        self.candle_store.seed(source, symbol, candles, mark_dirty=True)
                         stats["api"] += 1
                         source_stats["seeded"] += 1
                     else:
@@ -138,16 +126,13 @@ class MarketAnalyzer:
         except Exception:
             log.exception("MARKET TICKER FETCH FAILED")
             return [], "none", 0
-
         for source in enabled:
             self._maintain_history(source, source_tickers.get(source, {}))
         for source in enabled:
             self._live_update_candles(source, source_tickers.get(source, {}))
-
         active_source, ticker_stats = self._select_active_source(source_tickers)
         if not active_source:
             return [], "none", 0
-
         signals: List[MarketSignal] = []
         for symbol, ticker in ticker_stats.items():
             try:
@@ -180,7 +165,7 @@ class MarketAnalyzer:
                     continue
                 candles = self.provider.fetch_candles(source, symbol, target)
                 if candles:
-                    self.candle_store.seed(source, symbol, candles)
+                    self.candle_store.seed(source, symbol, candles, mark_dirty=True)
             except Exception:
                 log.exception("HISTORY MAINTENANCE ERROR | source=%s symbol=%s", source, symbol)
 
@@ -190,8 +175,7 @@ class MarketAnalyzer:
         closed = 0
         for symbol in tickers:
             try:
-                candles = self.provider.fetch_candles(source, symbol, LIVE_UPDATE_LIMIT)
-                closed += self.candle_store.apply_recent(source, symbol, candles)
+                closed += self.candle_store.apply_recent(source, symbol, self.provider.fetch_candles(source, symbol, LIVE_UPDATE_LIMIT))
             except Exception:
                 log.exception("LIVE UPDATE ERROR | source=%s symbol=%s", source, symbol)
         log.info("LIVE UPDATE | source=%s symbols=%s new_closed=%s", source, len(tickers), closed)
@@ -205,22 +189,18 @@ class MarketAnalyzer:
 
     @staticmethod
     def _price_change(open_price: float, close_price: float) -> Optional[float]:
-        if open_price <= 0:
-            return None
-        return (close_price - open_price) / open_price * 100.0
+        return (close_price - open_price) / open_price * 100.0 if open_price > 0 else None
 
     def _analyze_symbol(self, source: str, symbol: str, ticker: dict) -> Optional[MarketSignal]:
         history = self.candle_store.get_closed(source, symbol)
         minimum = max(self.settings.volume_baseline_candles + 1, self.settings.pump_min_history_candles)
         if len(history) < minimum:
             return None
-
         current = history[-1]
         key = f"{source}:{symbol}"
         if self._last_analyzed_open_time.get(key) == current.open_time:
             return None
         self._last_analyzed_open_time[key] = current.open_time
-
         if current.quote_volume <= 0 or current.open <= 0 or current.close <= 0:
             return None
         change = self._price_change(current.open, current.close)
@@ -229,37 +209,21 @@ class MarketAnalyzer:
 
         baseline_48 = self._previous_volume_mean(history, self.settings.volume_baseline_candles)
         spike_48 = current.quote_volume / baseline_48 if baseline_48 else None
-        volume_anomaly = bool(
-            self.settings.volume_signal_enabled and baseline_48 and
-            current.quote_volume >= baseline_48 * self.settings.volume_signal_multiplier
-        )
+        volume_anomaly = bool(self.settings.volume_signal_enabled and baseline_48 and current.quote_volume >= baseline_48 * self.settings.volume_signal_multiplier)
 
-        # 864 closed candles is the complete 72h window. Because the current
-        # signal candle must be excluded from the baseline, the maximum prior
-        # baseline is 863 candles when the store is capped at 864.
         pump_window = history[-self.settings.pump_history_candles:]
         prior_pump = pump_window[:-1]
-        if prior_pump:
-            pump_values = [c.quote_volume for c in prior_pump if c.quote_volume > 0]
-            pump_baseline = sum(pump_values) / len(pump_values) if pump_values else None
-        else:
-            pump_baseline = None
+        pump_values = [c.quote_volume for c in prior_pump if c.quote_volume > 0]
+        pump_baseline = sum(pump_values) / len(pump_values) if pump_values else None
         pump_spike = current.quote_volume / pump_baseline if pump_baseline else None
-        pump_volume_anomaly = bool(
-            pump_baseline and current.quote_volume >= pump_baseline * self.settings.volume_spike_ratio
-        )
+        pump_volume_anomaly = bool(pump_baseline and current.quote_volume >= pump_baseline * self.settings.volume_spike_ratio)
 
-        current_return = None
         returns: List[float] = []
         for previous, candle in zip(pump_window, pump_window[1:]):
             if previous.close > 0:
-                value = (candle.close - previous.close) / previous.close * 100.0
-                returns.append(value)
-        if returns:
-            current_return = returns[-1]
-        zscore = None
-        if self.settings.pump_zscore_enabled and len(returns) >= self.settings.pump_min_history_candles:
-            zscore = _robust_zscore(returns[:-1], current_return) if current_return is not None else None
+                returns.append((candle.close - previous.close) / previous.close * 100.0)
+        current_return = returns[-1] if returns else None
+        zscore = _robust_zscore(returns[:-1], current_return) if self.settings.pump_zscore_enabled and current_return is not None and len(returns) > self.settings.pump_min_history_candles else None
 
         static_pump = pump_volume_anomaly and self.settings.price_pump_min <= change <= self.settings.price_pump_max
         static_dump = pump_volume_anomaly and -self.settings.price_pump_max <= change <= -self.settings.price_pump_min
@@ -269,52 +233,31 @@ class MarketAnalyzer:
         if static_pump or statistical_pump:
             direction = SignalDirection.INFLOW
             trigger = TriggerType.BOTH if static_pump and statistical_pump else TriggerType.STATISTICAL if statistical_pump else TriggerType.STATIC
-            path = "pump_dump_72h"
-            baseline = pump_baseline or 0.0
-            spike = pump_spike or 0.0
+            path, baseline, spike = "pump_dump_72h", pump_baseline or 0.0, pump_spike or 0.0
         elif static_dump or statistical_dump:
             direction = SignalDirection.OUTFLOW
             trigger = TriggerType.BOTH if static_dump and statistical_dump else TriggerType.STATISTICAL if statistical_dump else TriggerType.STATIC
-            path = "pump_dump_72h"
-            baseline = pump_baseline or 0.0
-            spike = pump_spike or 0.0
+            path, baseline, spike = "pump_dump_72h", pump_baseline or 0.0, pump_spike or 0.0
         elif volume_anomaly and abs(change) > 0:
             direction = SignalDirection.INFLOW if change > 0 else SignalDirection.OUTFLOW
             trigger = TriggerType.STATIC
-            path = "volume_anomaly_48"
-            baseline = baseline_48 or 0.0
-            spike = spike_48 or 0.0
+            path, baseline, spike = "volume_anomaly_48", baseline_48 or 0.0, spike_48 or 0.0
         else:
             return None
 
         cooldown_key = f"market:{source}:{symbol}"
         if self.state.is_in_cooldown(cooldown_key, self.settings.alert_cooldown_sec):
             return None
-
-        # This is excess quote volume versus the selected baseline, not proof
-        # of net cash inflow. The field name is retained for API compatibility.
         excess_volume = max(0.0, current.quote_volume - baseline)
         try:
             change_24h = float(ticker.get("priceChangePercent", 0.0))
         except (TypeError, ValueError):
             change_24h = 0.0
-        signal = MarketSignal(
-            symbol=symbol, price=current.close, change_5m=change, change_24h=change_24h,
-            inflow_usd=excess_volume, spike_multiplier=spike,
-            direction=direction, trigger=trigger, zscore=zscore,
-            source=source, path=path,
-        )
+        signal = MarketSignal(symbol, current.close, change, change_24h, excess_volume, spike, direction, trigger, zscore, source, path)
         self.state.mark_alerted(cooldown_key)
         return signal
 
     def build_status_message(self, data_source: str, symbols_scanned: int, inflow_count: int, outflow_count: int) -> str:
         label = {"binance": "Binance", "bybit": "Bybit", "kucoin": "KuCoin", "none": "هیچ‌کدام"}.get(data_source, data_source)
         now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        return (
-            "📡 <b>وضعیت رصد</b>\n\n"
-            f"⏰ <code>{now_utc}</code> UTC\n"
-            f"🌐 منبع: <code>{esc(label)}</code>\n"
-            f"🔍 نمادها: <code>{symbols_scanned}</code>\n"
-            f"🟢 سیگنال صعودی: <code>{inflow_count}</code>  "
-            f"🔴 سیگنال نزولی: <code>{outflow_count}</code>"
-        )
+        return f"📡 <b>وضعیت رصد</b>\n\n⏰ <code>{now_utc}</code> UTC\n🌐 منبع: <code>{esc(label)}</code>\n🔍 نمادها: <code>{symbols_scanned}</code>\n🟢 سیگنال صعودی: <code>{inflow_count}</code>  🔴 سیگنال نزولی: <code>{outflow_count}</code>"
