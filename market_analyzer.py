@@ -667,10 +667,32 @@ class MarketAnalyzer:
             and candle_price_change < 0
         )
 
-        baseline_72h = self._baseline_mean(
-            history,
+        # KuCoin (and any other exchange) may cap how many historical
+        # candles a single API call can return — in practice KuCoin has
+        # been observed returning around 100 candles, far short of the
+        # full PUMP_HISTORY_CANDLES (864 / 72h) window. Requiring exactly
+        # 864 candles before ever computing a pump/dump baseline meant
+        # pump/dump detection silently never fired at all for symbols
+        # sourced from an exchange with a shorter history cap — even
+        # though plenty of usable history existed.
+        #
+        # Instead, use as much history as is actually available (capped
+        # at PUMP_HISTORY_CANDLES), as long as it meets a configurable
+        # minimum (PUMP_MIN_HISTORY_CANDLES, default 48 — same floor as
+        # the smart-money baseline). Smart money (48-candle baseline)
+        # above is unaffected by this and keeps its existing behavior.
+        pump_baseline_count = min(
             PUMP_HISTORY_CANDLES,
+            len(history) - 1,
         )
+
+        baseline_72h = None
+
+        if pump_baseline_count >= self.settings.pump_min_history_candles:
+            baseline_72h = self._baseline_mean(
+                history,
+                pump_baseline_count,
+            )
 
         pump_spike = None
 
