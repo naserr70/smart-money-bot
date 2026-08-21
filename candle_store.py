@@ -235,7 +235,27 @@ class CandleStore:
                 )
 
                 if current:
-                    self._current[source][symbol] = current
+                    # A "current" candle is only meaningful if it's strictly
+                    # newer than the latest CLOSED candle we just loaded. A
+                    # stale current (e.g. saved right before a restart, while
+                    # the closed history on disk is from further back) must
+                    # never be kept — update() would later append it onto the
+                    # end of the closed deque as if it were the newest candle,
+                    # silently breaking chronological order and corrupting
+                    # every baseline/z-score calculation downstream.
+                    last_closed = parsed[-1] if parsed else None
+                    if last_closed is not None and current.open_time <= last_closed.open_time:
+                        log.warning(
+                            "HISTORY LOAD | source=%s symbol=%s "
+                            "stale current candle discarded "
+                            "(current_open_time=%s <= last_closed_open_time=%s)",
+                            source,
+                            symbol,
+                            current.open_time,
+                            last_closed.open_time,
+                        )
+                    else:
+                        self._current[source][symbol] = current
 
             log.info(
                 "HISTORY LOADED | source=%s symbol=%s candles=%s/%s current=%s",
@@ -295,6 +315,15 @@ class CandleStore:
                 maxlen=self.max_candles,
             )
 
+            # seed() wholesale-replaces the closed history (bootstrap /
+            # GitHub restore / fresh API fetch). Any previously-tracked
+            # "current" candle was relative to the OLD history and its
+            # relationship to this new history is not guaranteed — keeping
+            # it around risks update() later appending a stale/out-of-order
+            # candle onto the end of the freshly-seeded deque. Drop it; the
+            # next live tick will establish a correct new current.
+            self._current[source].pop(symbol, None)
+
             self._dirty[source].add(symbol)
 
         log.info(
@@ -345,6 +374,26 @@ class CandleStore:
             if candle.open_time > current.open_time:
 
                 closed_candle = current
+
+                # Defensive guard: never append a candle that would break
+                # the deque's strictly-increasing open_time ordering (e.g.
+                # a stale "current" left over from a restart/restore race).
+                # Every downstream calculation (_baseline_mean slicing,
+                # z-score, candle_price_change) assumes this history is in
+                # chronological order — silently violating it corrupts
+                # signals without raising any error.
+                if history and closed_candle.open_time <= history[-1].open_time:
+                    log.warning(
+                        "CANDLE DISCARDED OUT_OF_ORDER | source=%s symbol=%s "
+                        "stale_current_open_time=%s <= last_closed_open_time=%s",
+                        source,
+                        symbol,
+                        closed_candle.open_time,
+                        history[-1].open_time,
+                    )
+                    self._current[source][symbol] = candle
+                    self._dirty[source].add(symbol)
+                    return "current"
 
                 history.append(closed_candle)
 
