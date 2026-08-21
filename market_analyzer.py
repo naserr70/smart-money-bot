@@ -111,6 +111,8 @@ class MarketAnalyzer:
         self.provider = MarketDataProvider(
             session=session,
             timeout=settings.http_timeout_sec,
+            binance_enabled=settings.binance_enabled,
+            kucoin_enabled=settings.kucoin_enabled,
         )
 
         self.candle_store = candle_store
