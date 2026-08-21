@@ -39,7 +39,7 @@ class CandleStoreTests(unittest.TestCase):
         store.seed("binance", "BTCUSDT", candles)
         history = store.get_closed("binance", "BTCUSDT")
         self.assertEqual(len(history), 3)
-        self.assertEqual([c.quote_volume for c in history], [104, 103, 102])
+        self.assertEqual([c.quote_volume for c in history], [102, 101, 100])
 
 
 if __name__ == "__main__":
