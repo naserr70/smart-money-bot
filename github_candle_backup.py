@@ -1,14 +1,12 @@
-"""GitHub-backed persistence for rolling candle JSON files.
-
-The backup worker batches queued files into one Git Trees API commit. It is
-safe to call queue() from the market thread while the worker is committing.
-"""
+"""GitHub-backed persistence for rolling candle JSON files."""
 
 import base64
+import hashlib
+import json
 import logging
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import requests
 
@@ -28,6 +26,7 @@ class GitHubCandleBackup:
         self.max_retries = max(0, int(max_retries))
         self._lock = threading.RLock()
         self._pending: Dict[str, str] = {}
+        self._committed_hashes: Dict[str, str] = {}
         self._worker_started = False
         self._last_backup_ok = None
         self._last_backup_at = None
@@ -53,13 +52,19 @@ class GitHubCandleBackup:
         safe = "".join(c for c in symbol if c.isalnum() or c in ("_", "-"))
         return f"{root_path}/{source}/{safe}.json"
 
+    @staticmethod
+    def _hash(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
     def queue(self, source: str, symbol: str, payload: dict) -> bool:
         if not self.is_configured() or not source or not symbol or not isinstance(payload, dict):
             return False
-        import json
         path = self._path(source, symbol, self.root_path)
         content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        digest = self._hash(content)
         with self._lock:
+            if self._committed_hashes.get(path) == digest:
+                return False
             changed = self._pending.get(path) != content
             self._pending[path] = content
         return changed
@@ -99,7 +104,7 @@ class GitHubCandleBackup:
         try:
             data = response.json()
             encoded = data.get("content", "").replace("\n", "")
-            return __import__("json").loads(base64.b64decode(encoded).decode("utf-8"))
+            return json.loads(base64.b64decode(encoded).decode("utf-8"))
         except (ValueError, TypeError, KeyError, base64.binascii.Error, UnicodeDecodeError) as exc:
             log.warning("GITHUB DOWNLOAD INVALID | path=%s error=%s", path, exc)
             return None
@@ -152,6 +157,7 @@ class GitHubCandleBackup:
                 for path, content in items:
                     if self._pending.get(path) == content:
                         self._pending.pop(path, None)
+                    self._committed_hashes[path] = self._hash(content)
                 self._last_commit_sha = commit_sha
                 self._last_backup_ok = True
                 self._last_backup_at = time.time()
