@@ -144,3 +144,4 @@ class TelegramNotifier:
     def broadcast_chunked(self, messages: List[str], chat_ids: List[str], max_len: int = 3500) -> None:
         for target in dict.fromkeys(chat_ids):
             self.send_chunked(messages, max_len=max_len, chat_id=target)
+
