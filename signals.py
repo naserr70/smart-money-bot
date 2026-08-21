@@ -210,7 +210,7 @@ class ExchangeFlowSignal:
             title_fa = "واریز نهنگ به صرافی"
             title_en = "EXCHANGE INFLOW"
             advice = (
-                "افزایش احتمال فشار فروش؛ "
+                "احتمال افزایش  فشار فروش؛ "
                 "دارایی وارد کیف صرافی شده است."
             )
         else:
