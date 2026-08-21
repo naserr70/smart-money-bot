@@ -53,8 +53,19 @@ class GitHubCandleBackup:
         return f"{root_path}/{source}/{safe}.json"
 
     @staticmethod
-    def _hash(content: str) -> str:
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    def _semantic_content(content: str) -> str:
+        try:
+            payload = json.loads(content)
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload.pop("updated_at", None)
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError):
+            return content
+
+    @classmethod
+    def _hash(cls, content: str) -> str:
+        return hashlib.sha256(cls._semantic_content(content).encode("utf-8")).hexdigest()
 
     def queue(self, source: str, symbol: str, payload: dict) -> bool:
         if not self.is_configured() or not source or not symbol or not isinstance(payload, dict):
@@ -65,9 +76,11 @@ class GitHubCandleBackup:
         with self._lock:
             if self._committed_hashes.get(path) == digest:
                 return False
-            changed = self._pending.get(path) != content
+            previous = self._pending.get(path)
+            if previous is not None and self._hash(previous) == digest:
+                return False
             self._pending[path] = content
-        return changed
+        return True
 
     def pending_count(self) -> int:
         with self._lock:
