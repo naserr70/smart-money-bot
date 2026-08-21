@@ -78,20 +78,9 @@ class MarketSignal:
     trigger: TriggerType = TriggerType.STATIC
     zscore: Optional[float] = None
 
-    # Internal / optional display helpers
+    # Internal only (not shown in Telegram).
     source: str = ""
-    # "smart_money_48" | "pump_dump_72h"
     path: str = ""
-
-    def _baseline_label(self) -> str:
-
-        if self.path == "pump_dump_72h":
-            return "میانگین ۷۲ ساعت"
-
-        if self.path == "smart_money_48":
-            return "میانگین ۴ ساعت (۴۸ کندل)"
-
-        return "میانگین اخیر"
 
     def _kind_meta(self) -> tuple:
         """
@@ -152,17 +141,7 @@ class MarketSignal:
         change_5m_txt = f"{self.change_5m:+.2f}%"
         change_24h_txt = f"{self.change_24h:+.2f}%"
 
-        source_label = {
-            "binance": "Binance",
-            "bybit": "Bybit",
-            "kucoin": "KuCoin",
-        }.get((self.source or "").lower(), "")
-
-        trigger_label = {
-            TriggerType.STATIC: "حجمی",
-            TriggerType.STATISTICAL: "آماری",
-            TriggerType.BOTH: "حجمی + آماری",
-        }.get(self.trigger, "—")
+        tv = _tradingview_url(self.symbol, self.source)
 
         lines = [
             f"{emoji} <b>{esc(title_fa)}</b>",
@@ -184,44 +163,17 @@ class MarketSignal:
                 f"<code>{self.spike_multiplier:.2f}×</code>"
             ),
             (
-                f"📐 <b>مرجع:</b> "
-                f"{esc(self._baseline_label())}"
-            ),
-            (
                 f"💰 <b>{esc(flow_label)}:</b> "
                 f"<code>{_fmt_usd_flow(self.inflow_usd)}</code>"
             ),
+            "",
+            (
+                f'🔗 <a href="{esc(tv)}">'
+                "چارت TradingView</a>"
+            ),
+            "",
+            f"🎯 <b>نکته:</b> {esc(advice)}",
         ]
-
-        if self.zscore is not None:
-            lines.append(
-                f"📉 <b>Z-Score:</b> "
-                f"<code>{self.zscore:+.2f}</code>"
-            )
-
-        lines.append(
-            f"🧪 <b>نوع تشخیص:</b> {esc(trigger_label)}"
-        )
-
-        if source_label:
-            lines.append(
-                f"🌐 <b>منبع داده:</b> {esc(source_label)}"
-            )
-
-        tv = _tradingview_url(self.symbol, self.source)
-
-        lines.extend(
-            [
-                "",
-                (
-                    f'🔗 <a href="{esc(tv)}">'
-                    "چارت TradingView</a>"
-                ),
-                "",
-                f"🎯 <b>نکته:</b> {esc(advice)}",
-                "<i>نوبیتکس · تحلیل حجم ۵م</i>",
-            ]
-        )
 
         return "\n".join(lines)
 
@@ -296,7 +248,6 @@ class ExchangeFlowSignal:
             f'🔗 <a href="{esc(link)}">مشاهده تراکنش</a>',
             "",
             f"🎯 <b>نکته:</b> {esc(advice)}",
-            "<i>ردیابی آن‌چین · ولت‌های صرافی</i>",
         ]
 
         return "\n".join(lines)
