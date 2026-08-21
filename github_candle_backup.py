@@ -1,4 +1,14 @@
-"""GitHub-backed persistence for rolling candle JSON files."""
+"""GitHub-backed persistence for rolling candle JSON files.
+
+Persistence contract:
+- Each source/symbol remains independent.
+- Exactly the latest 864 CLOSED 5m candles are persisted when history is full.
+- The open/current candle is never counted in the 864 closed candles.
+- Closed candles are additionally grouped by UTC calendar date inside the
+  persisted JSON so history is date-partitioned without multiplying startup
+  HTTP requests across hundreds of files.
+- Legacy flat ``candles`` payloads remain readable for backward compatibility.
+"""
 
 import base64
 import hashlib
@@ -6,11 +16,14 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 import requests
 
 log = logging.getLogger("smart_money_bot.github_backup")
+
+CANDLE_LIMIT = 864
 
 
 class GitHubCandleBackup:
@@ -57,6 +70,56 @@ class GitHubCandleBackup:
         return f"{root_path}/{source}/{safe}.json"
 
     @staticmethod
+    def _date_key(open_time_ms: int) -> str:
+        return datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    @classmethod
+    def _partition_payload(cls, payload: dict) -> dict:
+        """Return one canonical payload with date-partitioned closed history.
+
+        ``candles`` is deliberately retained as a compatibility projection;
+        ``candles_by_date`` is the authoritative date-partitioned representation.
+        Both are generated from the same deduplicated, chronologically sorted
+        set, capped at exactly the latest 864 closed candles.
+        """
+        if not isinstance(payload, dict):
+            return payload
+
+        candles = payload.get("candles") or []
+        parsed = []
+        for item in candles:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed.append({
+                    "open_time": int(item["open_time"]),
+                    "close_time": int(item["close_time"]),
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
+                    "volume": float(item["volume"]),
+                    "quote_volume": float(item["quote_volume"]),
+                    "trades": int(item.get("trades", 0)),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        unique = {item["open_time"]: item for item in parsed}
+        ordered = sorted(unique.values(), key=lambda item: item["open_time"])
+        closed = ordered[-CANDLE_LIMIT:]
+
+        by_date: Dict[str, list] = {}
+        for item in closed:
+            by_date.setdefault(cls._date_key(item["open_time"]), []).append(item)
+
+        payload["candles"] = closed
+        payload["candles_by_date"] = by_date
+        payload["max_candles"] = CANDLE_LIMIT
+        payload["history_count"] = len(closed)
+        return payload
+
+    @staticmethod
     def _semantic_content(content: str) -> str:
         try:
             payload = json.loads(content)
@@ -74,9 +137,15 @@ class GitHubCandleBackup:
     def queue(self, source: str, symbol: str, payload: dict) -> bool:
         if not self.is_configured() or not source or not symbol or not isinstance(payload, dict):
             return False
+
+        canonical = self._partition_payload(dict(payload))
+        # A runtime timestamp must not make an unchanged rolling window dirty.
+        canonical.pop("updated_at", None)
+        canonical["updated_at"] = int(time.time() * 1000)
         path = self._path(source, symbol, self.root_path)
-        content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        content = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         digest = self._hash(content)
+
         with self._lock:
             if self._committed_hashes.get(path) == digest:
                 return False
@@ -108,12 +177,24 @@ class GitHubCandleBackup:
             return last
         raise last if isinstance(last, Exception) else RuntimeError("GitHub request failed")
 
-    @staticmethod
-    def _normalize_payload(payload: dict) -> Optional[dict]:
+    @classmethod
+    def _normalize_payload(cls, payload: dict) -> Optional[dict]:
         if not isinstance(payload, dict):
             return None
-        now_ms = int(time.time() * 1000)
+
+        # New date-partitioned format is authoritative. Fall back to the
+        # legacy flat array when reading files written by older versions.
         raw_candles = payload.get("candles") or []
+        by_date = payload.get("candles_by_date") or {}
+        if isinstance(by_date, dict):
+            flattened = []
+            for items in by_date.values():
+                if isinstance(items, list):
+                    flattened.extend(items)
+            if flattened:
+                raw_candles = flattened
+
+        now_ms = int(time.time() * 1000)
         parsed = []
         for item in raw_candles:
             if not isinstance(item, dict):
@@ -135,7 +216,7 @@ class GitHubCandleBackup:
 
         unique = {item["open_time"]: item for item in parsed}
         parsed = sorted(unique.values(), key=lambda item: item["open_time"])
-        closed = [item for item in parsed if item["close_time"] < now_ms]
+        closed = [item for item in parsed if item["close_time"] < now_ms][-CANDLE_LIMIT:]
         active = [item for item in parsed if item["close_time"] >= now_ms]
 
         current = payload.get("current")
@@ -162,9 +243,14 @@ class GitHubCandleBackup:
             if current is None or newest_active["open_time"] > current["open_time"]:
                 current = newest_active
 
-        payload["candles"] = closed[-864:]
+        payload["candles"] = closed
+        grouped: Dict[str, list] = {}
+        for item in closed:
+            grouped.setdefault(cls._date_key(item["open_time"]), []).append(item)
+        payload["candles_by_date"] = grouped
         payload["current"] = current
-        payload["max_candles"] = 864
+        payload["max_candles"] = CANDLE_LIMIT
+        payload["history_count"] = len(closed)
         return payload
 
     def download(self, source: str, symbol: str) -> Optional[dict]:
@@ -172,9 +258,6 @@ class GitHubCandleBackup:
             return None
         path = self._path(source, symbol, self.root_path)
 
-        # Candle history is public repository data. Prefer raw.githubusercontent.com
-        # so startup restoration does not consume GitHub REST API rate-limit budget.
-        # This is critical on Render where a restart may restore hundreds of files.
         raw_url = self._raw_url(source, symbol)
         try:
             response = self.session.get(
@@ -195,10 +278,7 @@ class GitHubCandleBackup:
         except requests.RequestException as exc:
             log.warning("GITHUB RAW DOWNLOAD ERROR | path=%s error=%s", path, exc)
 
-        # Fallback for private repositories or transient raw-CDN failures.
-        response = self._request(
-            "GET", self._url(f"contents/{path}"), params={"ref": self.branch}
-        )
+        response = self._request("GET", self._url(f"contents/{path}"), params={"ref": self.branch})
         if response.status_code == 404:
             return None
         if response.status_code != 200:
@@ -255,7 +335,7 @@ class GitHubCandleBackup:
             new_commit = self._request(
                 "POST", self._url("git/commits"),
                 json={
-                    "message": f"chore: persist candle history ({len(items)} files)",
+                    "message": f"chore: persist date-partitioned candle history ({len(items)} files)",
                     "tree": tree_sha,
                     "parents": [head_sha],
                 },
