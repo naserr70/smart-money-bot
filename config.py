@@ -788,7 +788,8 @@ class Settings:
             and not self.kucoin_enabled
         ):
             problems.append(
-                "هر دو منبع Binance و KuCoin غیرفعال هستند."
+                "منابع Binance و KuCoin هر دو غیرفعال هستند؛ "
+                "فقط Bybit (که سوییچ غیرفعال‌سازی ندارد) به عنوان تنها منبع باقی می‌ماند."
             )
 
         if self.preferred_market_source not in (
