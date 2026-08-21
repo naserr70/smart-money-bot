@@ -730,6 +730,20 @@ class MarketDataProvider:
         params = {
             "symbol": symbol,
             "type": "5min",
+            # KuCoin does NOT default startAt/endAt to "now" when they're
+            # omitted — per their docs and reference clients, it falls
+            # back to a fixed window (e.g. start of the current UTC day),
+            # not a rolling "most recent N candles" window. For the
+            # bootstrap fetch that's mostly harmless, but for the live
+            # per-cycle refresh (limit=5) it meant every cycle re-fetched
+            # the exact same stale window — candles that were already
+            # closed in history — so they got discarded every single
+            # cycle and live updates for KuCoin symbols never advanced.
+            # Anchor explicitly to wall-clock "now" (KuCoin uses Unix
+            # SECONDS here, not milliseconds) so we always ask for the
+            # most recent `limit` candles.
+            "startAt": int(time.time()) - (limit + 1) * 300,
+            "endAt": int(time.time()),
         }
 
         try:
