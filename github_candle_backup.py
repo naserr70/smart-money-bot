@@ -24,6 +24,7 @@ import requests
 log = logging.getLogger("smart_money_bot.github_backup")
 
 CANDLE_LIMIT = 864
+DEFAULT_BACKUP_BATCH_SIZE = 25
 
 
 class GitHubCandleBackup:
@@ -139,7 +140,6 @@ class GitHubCandleBackup:
             return False
 
         canonical = self._partition_payload(dict(payload))
-        # A runtime timestamp must not make an unchanged rolling window dirty.
         canonical.pop("updated_at", None)
         canonical["updated_at"] = int(time.time() * 1000)
         path = self._path(source, symbol, self.root_path)
@@ -182,8 +182,6 @@ class GitHubCandleBackup:
         if not isinstance(payload, dict):
             return None
 
-        # New date-partitioned format is authoritative. Fall back to the
-        # legacy flat array when reading files written by older versions.
         raw_candles = payload.get("candles") or []
         by_date = payload.get("candles_by_date") or {}
         if isinstance(by_date, dict):
@@ -293,16 +291,17 @@ class GitHubCandleBackup:
             log.warning("GITHUB DOWNLOAD INVALID | path=%s error=%s", path, exc)
             return None
 
-    def backup(self) -> bool:
-        """Persist every queued candle file in one Git tree commit."""
+    def backup(self, max_files: int = DEFAULT_BACKUP_BATCH_SIZE) -> bool:
+        """Persist a bounded batch so GitHub I/O never blocks market startup."""
         if not self.is_configured():
             return False
+        max_files = max(1, int(max_files))
         with self._lock:
             if not self._pending:
                 self._last_backup_ok = True
                 self._last_backup_at = time.time()
                 return True
-            items = list(self._pending.items())
+            items = list(self._pending.items())[:max_files]
 
         try:
             ref = self._request("GET", self._url(f"git/ref/heads/{self.branch}"))
@@ -382,7 +381,13 @@ class GitHubCandleBackup:
             while True:
                 time.sleep(interval_sec)
                 try:
-                    self.backup()
+                    # Drain the queue in bounded commits. This keeps each
+                    # commit small while ensuring a large startup queue does
+                    # not remain pending for hours.
+                    while self.pending_count() > 0:
+                        if not self.backup(DEFAULT_BACKUP_BATCH_SIZE):
+                            break
+                        time.sleep(0.5)
                 except Exception:
                     log.exception("GITHUB BACKUP WORKER ERROR")
 
