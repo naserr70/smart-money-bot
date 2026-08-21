@@ -1,28 +1,6 @@
-"""
-Independent exchange-aware market analyzer.
+"""Exchange-aware market analysis using closed 5m candles only."""
 
-Signal logic
-------------
-1. Smart money (inflow / outflow):
-   Latest CLOSED 5m quote_volume vs mean of the previous 48 CLOSED
-   5m candles from the SAME exchange.
-   Direction follows candle price change (up = inflow, down = outflow).
-
-2. Pump / Dump:
-   Volume anomaly vs mean of the previous candles inside the rolling
-   864-candle window (72 hours), plus static price band and/or z-score.
-
-3. Active analysis priority:
-   Binance → Bybit → KuCoin
-
-4. Histories are NEVER mixed across exchanges.
-
-Startup bootstrap
------------------
-Restores candle history from GitHub when available, otherwise downloads
-the last 864 closed 5m candles from each live exchange and persists
-them locally + to GitHub so ephemeral hosts (e.g. Render) keep state.
-"""
+from __future__ import annotations
 
 import logging
 import statistics
@@ -33,967 +11,253 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from assets import NOBITEX_ALL_ASSETS
-from candle_store import (
-    Candle,
-    CandleStore,
-    SMART_MONEY_BASELINE_CANDLES,
-    PUMP_HISTORY_CANDLES,
-    VALID_SOURCES,
-)
+from candle_store import Candle, CandleStore, SMART_MONEY_BASELINE_CANDLES, PUMP_HISTORY_CANDLES, VALID_SOURCES
 from config import Settings
 from formatting import esc
 from market_data import MarketDataProvider
-from signals import (
-    MarketSignal,
-    SignalDirection,
-    TriggerType,
-)
+from signals import MarketSignal, SignalDirection, TriggerType
 from state import BotState
 
-
 log = logging.getLogger("smart_money_bot.market_analyzer")
-
-LIVE_UPDATE_LIMIT = 5
+LIVE_UPDATE_LIMIT = 3
 
 
 def _candles_from_payload(data: dict) -> List[Candle]:
-    """Parse a stored / GitHub JSON payload into Candle objects."""
-
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not isinstance(data.get("candles"), list):
         return []
-
-    raw_list = data.get("candles") or []
-
-    if not isinstance(raw_list, list):
-        return []
-
-    parsed: List[Candle] = []
-
-    for item in raw_list:
-
+    parsed = []
+    now_ms = int(time.time() * 1000)
+    for item in data["candles"]:
         if not isinstance(item, dict):
             continue
-
         try:
-            parsed.append(
-                Candle(
-                    open_time=int(item["open_time"]),
-                    close_time=int(item["close_time"]),
-                    open=float(item["open"]),
-                    high=float(item["high"]),
-                    low=float(item["low"]),
-                    close=float(item["close"]),
-                    volume=float(item["volume"]),
-                    quote_volume=float(item["quote_volume"]),
-                    trades=int(item.get("trades", 0)),
-                )
-            )
+            candle = Candle(int(item["open_time"]), int(item["close_time"]), float(item["open"]), float(item["high"]), float(item["low"]), float(item["close"]), float(item["volume"]), float(item["quote_volume"]), int(item.get("trades", 0)))
+            if candle.close_time < now_ms:
+                parsed.append(candle)
         except (KeyError, TypeError, ValueError):
             continue
+    return sorted({c.open_time: c for c in parsed}.values(), key=lambda c: c.open_time)
 
-    parsed.sort(key=lambda c: c.open_time)
-    return parsed
+
+def _robust_zscore(values: List[float], current: float) -> Optional[float]:
+    if len(values) < 20:
+        return None
+    median = statistics.median(values)
+    mad = statistics.median([abs(x - median) for x in values])
+    if mad > 0:
+        return (current - median) / (1.4826 * mad)
+    stdev = statistics.pstdev(values)
+    return (current - statistics.mean(values)) / stdev if stdev > 0 else None
 
 
 class MarketAnalyzer:
-
-    def __init__(
-        self,
-        settings: Settings,
-        state: BotState,
-        session: requests.Session,
-        candle_store: CandleStore,
-    ):
+    def __init__(self, settings: Settings, state: BotState, session: requests.Session, candle_store: CandleStore):
         self.settings = settings
         self.state = state
         self.session = session
-
-        self.provider = MarketDataProvider(
-            session=session,
-            timeout=settings.http_timeout_sec,
-        )
-
+        self.provider = MarketDataProvider(session=session, timeout=settings.http_timeout_sec)
         self.candle_store = candle_store
-
-        self._last_signaled_open_time: Dict[str, int] = {}
+        self._last_analyzed_open_time: Dict[str, int] = {}
         self._startup_bootstrap_done = False
 
-    def bootstrap_histories(
-        self,
-        github_backup=None,
-        symbols: Optional[List[str]] = None,
-        target_count: int = PUMP_HISTORY_CANDLES,
-    ) -> dict:
+    def _enabled_sources(self) -> List[str]:
+        return self.settings.enabled_market_sources()
 
+    def bootstrap_histories(self, github_backup=None, symbols: Optional[List[str]] = None, target_count: int = PUMP_HISTORY_CANDLES) -> dict:
         if self._startup_bootstrap_done:
-            log.info("STARTUP BOOTSTRAP SKIPPED | already completed")
             return {"skipped": True}
-
-        target_count = max(1, int(target_count))
+        target_count = min(self.settings.candle_history_limit, max(1, int(target_count)))
         symbol_list = list(symbols or NOBITEX_ALL_ASSETS)
-
-        log.info(
-            "STARTUP BOOTSTRAP START | symbols=%s target=%s github=%s",
-            len(symbol_list),
-            target_count,
-            bool(github_backup and github_backup.is_configured()),
-        )
-
         started = time.time()
-
+        stats = {"local": 0, "github": 0, "api": 0, "failed": 0, "sources": {}}
+        enabled = self._enabled_sources()
         try:
-            binance_t, bybit_t, kucoin_t = self.provider.fetch_all_sources()
+            source_tickers = dict(zip(VALID_SOURCES, self.provider.fetch_all_sources(enabled)))
         except Exception:
-            log.exception("STARTUP BOOTSTRAP TICKER FETCH FAILED")
-            binance_t, bybit_t, kucoin_t = {}, {}, {}
+            log.exception("STARTUP TICKER FETCH FAILED")
+            source_tickers = {source: {} for source in VALID_SOURCES}
 
-        source_tickers = {
-            "binance": binance_t,
-            "bybit": bybit_t,
-            "kucoin": kucoin_t,
-        }
-
-        stats = {
-            "local_ok": 0,
-            "github_restored": 0,
-            "api_seeded": 0,
-            "failed": 0,
-            "already_full": 0,
-            "sources": {},
-        }
-
-        for source, tickers in source_tickers.items():
-
-            if not tickers:
-                log.warning(
-                    "STARTUP BOOTSTRAP SOURCE SKIP | source=%s no_tickers",
-                    source,
-                )
-                stats["sources"][source] = {"symbols": 0, "seeded": 0}
-                continue
-
-            symbols_for_source = [
-                s for s in symbol_list if s in tickers
-            ]
-
-            seeded = 0
-
-            log.info(
-                "STARTUP BOOTSTRAP SOURCE | source=%s symbols=%s",
-                source,
-                len(symbols_for_source),
-            )
-
-            for symbol in symbols_for_source:
-
+        for source in enabled:
+            tickers = source_tickers.get(source, {})
+            source_stats = {"symbols": 0, "restored": 0, "seeded": 0, "failed": 0}
+            for symbol in [s for s in symbol_list if s in tickers]:
+                source_stats["symbols"] += 1
                 try:
                     self.candle_store.load(source, symbol)
                     count = self.candle_store.count(source, symbol)
-
                     if count >= target_count:
-                        stats["already_full"] += 1
-                        stats["local_ok"] += 1
+                        stats["local"] += 1
                         continue
-
-                    if count > 0:
-                        stats["local_ok"] += 1
-
-                    if (
-                        count < target_count
-                        and github_backup is not None
-                        and github_backup.is_configured()
-                    ):
-                        try:
-                            payload = github_backup.download(
-                                source,
-                                symbol,
-                            )
-                        except Exception:
-                            log.exception(
-                                "GITHUB RESTORE ERROR | "
-                                "source=%s symbol=%s",
-                                source,
-                                symbol,
-                            )
-                            payload = None
-
-                        if payload:
-                            restored = _candles_from_payload(payload)
-
-                            if restored:
-                                self.candle_store.seed(
-                                    source,
-                                    symbol,
-                                    restored,
-                                )
-                                count = self.candle_store.count(
-                                    source,
-                                    symbol,
-                                )
-                                stats["github_restored"] += 1
-
-                                log.info(
-                                    "GITHUB RESTORE OK | "
-                                    "source=%s symbol=%s candles=%s",
-                                    source,
-                                    symbol,
-                                    count,
-                                )
-
-                    if count >= target_count:
-                        continue
-
-                    candles = self.provider.fetch_candles(
-                        source=source,
-                        symbol=symbol,
-                        limit=target_count,
-                    )
-
-                    if not candles:
+                    if github_backup and github_backup.is_configured():
+                        payload = github_backup.download(source, symbol)
+                        restored = _candles_from_payload(payload) if payload else []
+                        if restored:
+                            self.candle_store.seed(source, symbol, restored, mark_dirty=False)
+                            count = self.candle_store.count(source, symbol)
+                            if count >= target_count:
+                                stats["github"] += 1
+                                source_stats["restored"] += 1
+                                continue
+                    candles = self.provider.fetch_candles(source, symbol, target_count)
+                    if candles:
+                        self.candle_store.seed(source, symbol, candles, mark_dirty=True)
+                        stats["api"] += 1
+                        source_stats["seeded"] += 1
+                    else:
                         stats["failed"] += 1
-                        log.warning(
-                            "STARTUP API SEED FAILED | "
-                            "source=%s symbol=%s",
-                            source,
-                            symbol,
-                        )
-                        continue
-
-                    self.candle_store.seed(
-                        source,
-                        symbol,
-                        candles,
-                    )
-
-                    seeded += 1
-                    stats["api_seeded"] += 1
-
-                    log.info(
-                        "STARTUP API SEED OK | "
-                        "source=%s symbol=%s candles=%s",
-                        source,
-                        symbol,
-                        self.candle_store.count(source, symbol),
-                    )
-
-                    time.sleep(0.05)
-
+                        source_stats["failed"] += 1
                 except Exception:
                     stats["failed"] += 1
-                    log.exception(
-                        "STARTUP BOOTSTRAP SYMBOL ERROR | "
-                        "source=%s symbol=%s",
-                        source,
-                        symbol,
-                    )
-
-            stats["sources"][source] = {
-                "symbols": len(symbols_for_source),
-                "seeded": seeded,
-            }
+                    source_stats["failed"] += 1
+                    log.exception("BOOTSTRAP SYMBOL ERROR | source=%s symbol=%s", source, symbol)
+            stats["sources"][source] = source_stats
 
         self.candle_store.save_dirty()
-
-        elapsed = time.time() - started
         self._startup_bootstrap_done = True
-
-        log.info(
-            "STARTUP BOOTSTRAP COMPLETE | "
-            "local_ok=%s github_restored=%s api_seeded=%s "
-            "already_full=%s failed=%s elapsed=%.1fs",
-            stats["local_ok"],
-            stats["github_restored"],
-            stats["api_seeded"],
-            stats["already_full"],
-            stats["failed"],
-            elapsed,
-        )
-
+        stats["elapsed_sec"] = round(time.time() - started, 2)
+        log.info("STARTUP BOOTSTRAP COMPLETE | %s", stats)
         return stats
 
-    def run_cycle(
-        self,
-    ) -> Tuple[List[MarketSignal], str, int]:
-
-        log.info("MARKET FETCH START")
-
+    def run_cycle(self) -> Tuple[List[MarketSignal], str, int]:
+        enabled = self._enabled_sources()
         try:
-            binance_tickers, bybit_tickers, kucoin_tickers = (
-                self.provider.fetch_all_sources()
-            )
+            raw = self.provider.fetch_all_sources(enabled)
+            source_tickers = dict(zip(VALID_SOURCES, raw))
         except Exception:
             log.exception("MARKET TICKER FETCH FAILED")
             return [], "none", 0
-
-        sources_tickers = {
-            "binance": binance_tickers,
-            "bybit": bybit_tickers,
-            "kucoin": kucoin_tickers,
-        }
-
-        for source, tickers in sources_tickers.items():
-            self._maintain_history(source=source, tickers=tickers)
-
-        for source, tickers in sources_tickers.items():
-            self._live_update_candles(source=source, tickers=tickers)
-
-        if binance_tickers:
-            active_source = "binance"
-            ticker_stats = binance_tickers
-            log.info("ACTIVE MARKET SOURCE | Binance PRIMARY")
-        elif bybit_tickers:
-            active_source = "bybit"
-            ticker_stats = bybit_tickers
-            log.warning(
-                "ACTIVE MARKET SOURCE | Bybit FALLBACK | "
-                "Binance unavailable"
-            )
-        elif kucoin_tickers:
-            active_source = "kucoin"
-            ticker_stats = kucoin_tickers
-            log.warning(
-                "ACTIVE MARKET SOURCE | KuCoin FALLBACK | "
-                "Binance and Bybit unavailable"
-            )
-        else:
-            log.error(
-                "ACTIVE MARKET SOURCE FAILED | "
-                "Binance, Bybit and KuCoin unavailable"
-            )
+        for source in enabled:
+            self._maintain_history(source, source_tickers.get(source, {}))
+        for source in enabled:
+            self._live_update_candles(source, source_tickers.get(source, {}))
+        active_source, ticker_stats = self._select_active_source(source_tickers)
+        if not active_source:
             return [], "none", 0
-
-        log.info(
-            "ANALYSIS START | source=%s symbols=%s",
-            active_source,
-            len(ticker_stats),
-        )
-
         signals: List[MarketSignal] = []
-
         for symbol, ticker in ticker_stats.items():
-
             try:
-                signal = self._analyze_symbol(
-                    source=active_source,
-                    symbol=symbol,
-                    ticker=ticker,
-                )
-
-                if signal is not None:
+                signal = self._analyze_symbol(active_source, symbol, ticker)
+                if signal:
                     signals.append(signal)
-
             except Exception:
-                log.exception(
-                    "ANALYSIS ERROR | source=%s symbol=%s",
-                    active_source,
-                    symbol,
-                )
+                log.exception("ANALYSIS ERROR | source=%s symbol=%s", active_source, symbol)
+        return signals, active_source, len(ticker_stats)
 
-        log.info(
-            "ANALYSIS COMPLETE | source=%s signals=%s symbols=%s",
-            active_source,
-            len(signals),
-            len(ticker_stats),
-        )
+    def _select_active_source(self, source_tickers: Dict[str, Dict[str, dict]]) -> Tuple[str, Dict[str, dict]]:
+        order = [self.settings.preferred_market_source]
+        for source in ("binance", "bybit", "kucoin"):
+            if source not in order:
+                order.append(source)
+        for source in order:
+            tickers = source_tickers.get(source) or {}
+            if source in self._enabled_sources() and tickers:
+                return source, tickers
+        return "", {}
 
-        return (
-            signals,
-            active_source,
-            len(ticker_stats),
-        )
-
-    def _maintain_history(
-        self,
-        source: str,
-        tickers: Dict[str, dict],
-    ) -> None:
-
-        if source not in VALID_SOURCES:
-            raise ValueError(
-                f"Unsupported market source: {source}"
-            )
-
-        if not tickers:
-            log.info(
-                "HISTORY MAINTENANCE SKIPPED | "
-                "source=%s | reason=no_tickers",
-                source,
-            )
-            return
-
-        log.info(
-            "HISTORY MAINTENANCE | source=%s symbols=%s",
-            source,
-            len(tickers),
-        )
-
-        for symbol in tickers:
-
-            try:
-                current_count = self.candle_store.count(
-                    source,
-                    symbol,
-                )
-
-                if current_count >= PUMP_HISTORY_CANDLES:
-                    continue
-
-                self.candle_store.load(
-                    source,
-                    symbol,
-                )
-
-                current_count = self.candle_store.count(
-                    source,
-                    symbol,
-                )
-
-                if current_count >= PUMP_HISTORY_CANDLES:
-                    continue
-
-                candles = self.provider.fetch_candles(
-                    source=source,
-                    symbol=symbol,
-                    limit=PUMP_HISTORY_CANDLES,
-                )
-
-                if not candles:
-                    log.warning(
-                        "HISTORY BOOTSTRAP FAILED | "
-                        "source=%s symbol=%s",
-                        source,
-                        symbol,
-                    )
-                    continue
-
-                self.candle_store.seed(
-                    source,
-                    symbol,
-                    candles,
-                )
-
-                stored_count = self.candle_store.count(
-                    source,
-                    symbol,
-                )
-
-                log.info(
-                    "HISTORY BOOTSTRAP OK | "
-                    "source=%s symbol=%s candles=%s/%s",
-                    source,
-                    symbol,
-                    stored_count,
-                    PUMP_HISTORY_CANDLES,
-                )
-
-            except Exception:
-                log.exception(
-                    "HISTORY MAINTENANCE ERROR | "
-                    "source=%s symbol=%s",
-                    source,
-                    symbol,
-                )
-
-    def _live_update_candles(
-        self,
-        source: str,
-        tickers: Dict[str, dict],
-    ) -> None:
-
+    def _maintain_history(self, source: str, tickers: Dict[str, dict]) -> None:
         if not tickers:
             return
-
-        updated = 0
-        closed_total = 0
-
+        target = min(self.settings.candle_history_limit, PUMP_HISTORY_CANDLES)
         for symbol in tickers:
-
             try:
-                if self.candle_store.count(source, symbol) == 0:
-                    self.candle_store.load(source, symbol)
-
-                candles = self.provider.fetch_candles(
-                    source=source,
-                    symbol=symbol,
-                    limit=LIVE_UPDATE_LIMIT,
-                )
-
-                if not candles:
+                self.candle_store.load(source, symbol)
+                if self.candle_store.count(source, symbol) >= target:
                     continue
-
-                closed = self.candle_store.apply_recent(
-                    source,
-                    symbol,
-                    candles,
-                )
-
-                updated += 1
-                closed_total += closed
-
+                candles = self.provider.fetch_candles(source, symbol, target)
+                if candles:
+                    self.candle_store.seed(source, symbol, candles, mark_dirty=True)
             except Exception:
-                log.exception(
-                    "LIVE UPDATE ERROR | source=%s symbol=%s",
-                    source,
-                    symbol,
-                )
+                log.exception("HISTORY MAINTENANCE ERROR | source=%s symbol=%s", source, symbol)
 
-        log.info(
-            "LIVE UPDATE DONE | source=%s symbols=%s newly_closed=%s",
-            source,
-            updated,
-            closed_total,
-        )
+    def _live_update_candles(self, source: str, tickers: Dict[str, dict]) -> None:
+        if not tickers:
+            return
+        closed = 0
+        for symbol in tickers:
+            try:
+                closed += self.candle_store.apply_recent(source, symbol, self.provider.fetch_candles(source, symbol, LIVE_UPDATE_LIMIT))
+            except Exception:
+                log.exception("LIVE UPDATE ERROR | source=%s symbol=%s", source, symbol)
+        log.info("LIVE UPDATE | source=%s symbols=%s new_closed=%s", source, len(tickers), closed)
 
     @staticmethod
-    def _baseline_mean(
-        candles: List,
-        count: int,
-    ) -> Optional[float]:
+    def _previous_volume_mean(history: List[Candle], count: int) -> Optional[float]:
+        if count <= 0 or len(history) < count + 1:
+            return None
+        values = [c.quote_volume for c in history[-(count + 1):-1] if c.quote_volume > 0]
+        return sum(values) / count if len(values) == count else None
 
-        if count <= 0 or len(candles) < count + 1:
+    @staticmethod
+    def _price_change(open_price: float, close_price: float) -> Optional[float]:
+        return (close_price - open_price) / open_price * 100.0 if open_price > 0 else None
+
+    def _analyze_symbol(self, source: str, symbol: str, ticker: dict) -> Optional[MarketSignal]:
+        history = self.candle_store.get_closed(source, symbol)
+        minimum = max(self.settings.volume_baseline_candles + 1, self.settings.pump_min_history_candles)
+        if len(history) < minimum:
+            return None
+        current = history[-1]
+        key = f"{source}:{symbol}"
+        if self._last_analyzed_open_time.get(key) == current.open_time:
+            return None
+        self._last_analyzed_open_time[key] = current.open_time
+        if current.quote_volume <= 0 or current.open <= 0 or current.close <= 0:
+            return None
+        change = self._price_change(current.open, current.close)
+        if change is None:
             return None
 
-        prior = candles[-(count + 1):-1]
-
-        if len(prior) != count:
-            return None
-
-        values = [
-            float(c.quote_volume)
-            for c in prior
-            if c.quote_volume > 0
-        ]
-
-        if len(values) != count:
-            return None
-
-        return sum(values) / len(values)
-
-    def _analyze_symbol(
-        self,
-        source: str,
-        symbol: str,
-        ticker: dict,
-    ) -> Optional[MarketSignal]:
-
-        history = self.candle_store.get_closed(
-            source,
-            symbol,
-        )
-
-        minimum_smart = SMART_MONEY_BASELINE_CANDLES + 1
-
-        if len(history) < minimum_smart:
-
-            log.warning(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=INSUFFICIENT_VOLUME_HISTORY "
-                "history=%s/%s",
-                source,
-                symbol,
-                len(history),
-                minimum_smart,
-            )
-
-            return None
-
-        current_candle = history[-1]
-
-        signal_key = f"{source}:{symbol}"
-        last_ot = self._last_signaled_open_time.get(signal_key)
-
-        if last_ot is not None and current_candle.open_time <= last_ot:
-            return None
-
-        current_volume = float(current_candle.quote_volume)
-
-        if current_volume <= 0:
-            log.warning(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=INVALID_VOLUME",
-                source,
-                symbol,
-            )
-            return None
-
-        if current_candle.open <= 0:
-            log.warning(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=INVALID_OPEN_PRICE",
-                source,
-                symbol,
-            )
-            return None
-
-        candle_price_change = (
-            (
-                current_candle.close
-                - current_candle.open
-            )
-            / current_candle.open
-        ) * 100.0
-
-        baseline_48 = self._baseline_mean(
-            history,
-            SMART_MONEY_BASELINE_CANDLES,
-        )
-
-        smart_spike = None
-        smart_inflow = 0.0
-
-        if baseline_48 is not None and baseline_48 > 0:
-
-            smart_spike = current_volume / baseline_48
-            smart_inflow = max(0.0, current_volume - baseline_48)
-
-            is_smart_volume_spike = (
-                current_volume
-                >= baseline_48 * self.settings.volume_spike_ratio
-            )
-
-        else:
-
-            is_smart_volume_spike = False
-
-        smart_inflow_signal = (
-            is_smart_volume_spike
-            and candle_price_change > 0
-        )
-
-        smart_outflow_signal = (
-            is_smart_volume_spike
-            and candle_price_change < 0
-        )
-
-        baseline_72h = self._baseline_mean(
-            history,
-            PUMP_HISTORY_CANDLES,
-        )
-
-        pump_spike = None
-
-        if baseline_72h is not None and baseline_72h > 0:
-
-            pump_spike = current_volume / baseline_72h
-
-            is_pump_volume_spike = (
-                current_volume
-                >= baseline_72h * self.settings.volume_spike_ratio
-            )
-
-        else:
-
-            is_pump_volume_spike = False
-
-        long_history = history[-PUMP_HISTORY_CANDLES:]
-
-        current_close_to_close = None
-
-        if len(long_history) >= 2:
-
-            previous_candle = long_history[-2]
-
-            if previous_candle.close > 0:
-                current_close_to_close = (
-                    (
-                        current_candle.close
-                        - previous_candle.close
-                    )
-                    / previous_candle.close
-                ) * 100.0
-
-        long_returns: List[float] = []
-
-        for previous, current in zip(
-            long_history,
-            long_history[1:],
-        ):
-
-            if previous.close <= 0:
-                continue
-
-            long_returns.append(
-                (
-                    (
-                        current.close
-                        - previous.close
-                    )
-                    / previous.close
-                ) * 100.0
-            )
-
-        zscore = None
-
-        if (
-            self.settings.pump_zscore_enabled
-            and current_close_to_close is not None
-            and len(long_returns) >= 100
-        ):
-
-            baseline_returns = long_returns[:-1]
-
-            if len(baseline_returns) >= 99:
-
-                mean = statistics.mean(
-                    baseline_returns
-                )
-
-                stdev = statistics.pstdev(
-                    baseline_returns
-                )
-
-                if stdev > 0:
-                    zscore = (
-                        current_close_to_close - mean
-                    ) / stdev
-
-        static_pump = (
-            is_pump_volume_spike
-            and self.settings.price_pump_min
-            <= candle_price_change
-            <= self.settings.price_pump_max
-        )
-
-        static_dump = (
-            is_pump_volume_spike
-            and -self.settings.price_pump_max
-            <= candle_price_change
-            <= -self.settings.price_pump_min
-        )
-
-        statistical_pump = (
-            zscore is not None
-            and zscore
-            >= self.settings.pump_zscore_threshold
-            and is_pump_volume_spike
-        )
-
-        statistical_dump = (
-            zscore is not None
-            and zscore
-            <= -self.settings.pump_zscore_threshold
-            and is_pump_volume_spike
-        )
-
-        is_pump = static_pump or statistical_pump
-        is_dump = static_dump or statistical_dump
-
-        if is_pump or is_dump:
-
-            if is_pump:
-
-                direction = SignalDirection.INFLOW
-
-                if static_pump and statistical_pump:
-                    trigger = TriggerType.BOTH
-                elif statistical_pump:
-                    trigger = TriggerType.STATISTICAL
-                else:
-                    trigger = TriggerType.STATIC
-
-            else:
-
-                direction = SignalDirection.OUTFLOW
-
-                if static_dump and statistical_dump:
-                    trigger = TriggerType.BOTH
-                elif statistical_dump:
-                    trigger = TriggerType.STATISTICAL
-                else:
-                    trigger = TriggerType.STATIC
-
-            spike_multiplier = (
-                pump_spike if pump_spike is not None else 0.0
-            )
-
-            estimated_inflow = max(
-                0.0,
-                current_volume - (baseline_72h or 0.0),
-            )
-
-            baseline_used = baseline_72h or 0.0
-            path = "pump_dump_72h"
-
-        elif smart_inflow_signal or smart_outflow_signal:
-
-            direction = (
-                SignalDirection.INFLOW
-                if smart_inflow_signal
-                else SignalDirection.OUTFLOW
-            )
-
+        baseline_48 = self._previous_volume_mean(history, self.settings.volume_baseline_candles)
+        spike_48 = current.quote_volume / baseline_48 if baseline_48 else None
+        volume_anomaly = bool(self.settings.volume_signal_enabled and baseline_48 and current.quote_volume >= baseline_48 * self.settings.volume_signal_multiplier)
+
+        pump_window = history[-self.settings.pump_history_candles:]
+        prior_pump = pump_window[:-1]
+        pump_values = [c.quote_volume for c in prior_pump if c.quote_volume > 0]
+        pump_baseline = sum(pump_values) / len(pump_values) if pump_values else None
+        pump_spike = current.quote_volume / pump_baseline if pump_baseline else None
+        pump_volume_anomaly = bool(pump_baseline and current.quote_volume >= pump_baseline * self.settings.volume_spike_ratio)
+
+        returns: List[float] = []
+        for previous, candle in zip(pump_window, pump_window[1:]):
+            if previous.close > 0:
+                returns.append((candle.close - previous.close) / previous.close * 100.0)
+        current_return = returns[-1] if returns else None
+        zscore = _robust_zscore(returns[:-1], current_return) if self.settings.pump_zscore_enabled and current_return is not None and len(returns) > self.settings.pump_min_history_candles else None
+
+        static_pump = pump_volume_anomaly and self.settings.price_pump_min <= change <= self.settings.price_pump_max
+        static_dump = pump_volume_anomaly and -self.settings.price_pump_max <= change <= -self.settings.price_pump_min
+        statistical_pump = pump_volume_anomaly and zscore is not None and zscore >= self.settings.pump_zscore_threshold
+        statistical_dump = pump_volume_anomaly and zscore is not None and zscore <= -self.settings.pump_zscore_threshold
+
+        if static_pump or statistical_pump:
+            direction = SignalDirection.INFLOW
+            trigger = TriggerType.BOTH if static_pump and statistical_pump else TriggerType.STATISTICAL if statistical_pump else TriggerType.STATIC
+            path, baseline, spike = "pump_dump_72h", pump_baseline or 0.0, pump_spike or 0.0
+        elif static_dump or statistical_dump:
+            direction = SignalDirection.OUTFLOW
+            trigger = TriggerType.BOTH if static_dump and statistical_dump else TriggerType.STATISTICAL if statistical_dump else TriggerType.STATIC
+            path, baseline, spike = "pump_dump_72h", pump_baseline or 0.0, pump_spike or 0.0
+        elif volume_anomaly and abs(change) > 0:
+            direction = SignalDirection.INFLOW if change > 0 else SignalDirection.OUTFLOW
             trigger = TriggerType.STATIC
-
-            spike_multiplier = (
-                smart_spike if smart_spike is not None else 0.0
-            )
-
-            estimated_inflow = smart_inflow
-            baseline_used = baseline_48 or 0.0
-            path = "smart_money_48"
-
+            path, baseline, spike = "volume_anomaly_48", baseline_48 or 0.0, spike_48 or 0.0
         else:
-
-            self._last_signaled_open_time[signal_key] = (
-                current_candle.open_time
-            )
-
-            log.info(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=THRESHOLD_NOT_MET "
-                "vol=%.2f baseline48=%s spike48=%s "
-                "baseline72h=%s spike72h=%s "
-                "required=%.2fX price=%.2f%% zscore=%s",
-                source,
-                symbol,
-                current_volume,
-                (
-                    f"{baseline_48:.2f}"
-                    if baseline_48 is not None
-                    else "N/A"
-                ),
-                (
-                    f"{smart_spike:.2f}X"
-                    if smart_spike is not None
-                    else "N/A"
-                ),
-                (
-                    f"{baseline_72h:.2f}"
-                    if baseline_72h is not None
-                    else "N/A"
-                ),
-                (
-                    f"{pump_spike:.2f}X"
-                    if pump_spike is not None
-                    else "N/A"
-                ),
-                self.settings.volume_spike_ratio,
-                candle_price_change,
-                (
-                    f"{zscore:.2f}"
-                    if zscore is not None
-                    else "N/A"
-                ),
-            )
-
             return None
 
-        cooldown_key = (
-            f"market:{source}:{symbol}"
-        )
-
-        if self.state.is_in_cooldown(
-            cooldown_key,
-            self.settings.alert_cooldown_sec,
-        ):
-
-            self._last_signaled_open_time[signal_key] = (
-                current_candle.open_time
-            )
-
-            log.info(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=COOLDOWN",
-                source,
-                symbol,
-            )
-
+        cooldown_key = f"market:{source}:{symbol}"
+        if self.state.is_in_cooldown(cooldown_key, self.settings.alert_cooldown_sec):
             return None
-
+        excess_volume = max(0.0, current.quote_volume - baseline)
         try:
-            price = float(current_candle.close)
-        except (TypeError, ValueError):
-            log.warning(
-                "NO_SIGNAL | source=%s symbol=%s "
-                "reason=INVALID_CLOSE_PRICE",
-                source,
-                symbol,
-            )
-            return None
-
-        try:
-            change_24h = float(
-                ticker.get(
-                    "priceChangePercent",
-                    0.0,
-                )
-            )
+            change_24h = float(ticker.get("priceChangePercent", 0.0))
         except (TypeError, ValueError):
             change_24h = 0.0
-
-        signal = MarketSignal(
-            symbol=symbol,
-            price=price,
-            change_5m=candle_price_change,
-            change_24h=change_24h,
-            inflow_usd=estimated_inflow,
-            spike_multiplier=spike_multiplier,
-            direction=direction,
-            trigger=trigger,
-            zscore=zscore,
-            source=source,
-            path=path,
-        )
-
-        self.state.mark_alerted(
-            cooldown_key
-        )
-
-        self._last_signaled_open_time[signal_key] = (
-            current_candle.open_time
-        )
-
-        log.warning(
-            "SIGNAL FIRED | source=%s symbol=%s path=%s "
-            "direction=%s trigger=%s "
-            "volume=%.2f baseline=%.2f spike=%.2fX "
-            "inflow=%.2f price=%.2f%% zscore=%s",
-            source,
-            symbol,
-            path,
-            direction.value,
-            trigger.value,
-            current_volume,
-            baseline_used,
-            spike_multiplier,
-            estimated_inflow,
-            candle_price_change,
-            (
-                f"{zscore:.2f}"
-                if zscore is not None
-                else "N/A"
-            ),
-        )
-
+        signal = MarketSignal(symbol, current.close, change, change_24h, excess_volume, spike, direction, trigger, zscore, source, path)
+        self.state.mark_alerted(cooldown_key)
         return signal
 
-    def build_status_message(
-        self,
-        data_source: str,
-        symbols_scanned: int,
-        inflow_count: int,
-        outflow_count: int,
-    ) -> str:
-
-        source_label = {
-            "binance": "Binance",
-            "bybit": "Bybit",
-            "kucoin": "KuCoin",
-            "none": "هیچ‌کدام",
-        }.get(
-            data_source,
-            data_source,
-        )
-
-        now_utc = datetime.now(
-            timezone.utc
-        ).strftime("%H:%M:%S")
-
-        return (
-            "📡 <b>وضعیت رصد</b>\n\n"
-            f"⏰ <code>{now_utc}</code> UTC\n"
-            f"🌐 منبع: <code>{esc(source_label)}</code>\n"
-            f"🔍 نمادها: <code>{symbols_scanned}</code>\n"
-            f"🟢 ورود: <code>{inflow_count}</code>  "
-            f"🔴 خروج: <code>{outflow_count}</code>"
-        )
+    def build_status_message(self, data_source: str, symbols_scanned: int, inflow_count: int, outflow_count: int) -> str:
+        label = {"binance": "Binance", "bybit": "Bybit", "kucoin": "KuCoin", "none": "هیچ‌کدام"}.get(data_source, data_source)
+        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        return f"📡 <b>وضعیت رصد</b>\n\n⏰ <code>{now_utc}</code> UTC\n🌐 منبع: <code>{esc(label)}</code>\n🔍 نمادها: <code>{symbols_scanned}</code>\n🟢 سیگنال صعودی: <code>{inflow_count}</code>  🔴 سیگنال نزولی: <code>{outflow_count}</code>"
