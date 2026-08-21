@@ -123,6 +123,14 @@ class GitHubCandleBackup:
             return None
 
     def backup(self) -> bool:
+        """Persist every queued candle file in one Git tree commit.
+
+        The previous implementation committed only the first 20 queued files.
+        On an ephemeral Render restart the in-memory remainder was lost, which
+        caused the next boot to download those histories from the exchanges
+        again. A startup backup must drain the complete pending queue before
+        reporting success.
+        """
         if not self.is_configured():
             return False
         with self._lock:
@@ -130,12 +138,14 @@ class GitHubCandleBackup:
                 self._last_backup_ok = True
                 self._last_backup_at = time.time()
                 return True
-            items = list(self._pending.items())[:20]
+            items = list(self._pending.items())
+
         try:
             ref = self._request("GET", self._url(f"git/ref/heads/{self.branch}"))
             if ref.status_code != 200:
                 raise RuntimeError(f"ref lookup HTTP {ref.status_code}: {ref.text[:200]}")
             head_sha = ref.json()["object"]["sha"]
+
             commit = self._request("GET", self._url(f"git/commits/{head_sha}"))
             if commit.status_code != 200:
                 raise RuntimeError(f"commit lookup HTTP {commit.status_code}: {commit.text[:200]}")
@@ -143,26 +153,47 @@ class GitHubCandleBackup:
 
             tree_entries = []
             for path, content in items:
-                blob = self._request("POST", self._url("git/blobs"), json={"content": content, "encoding": "utf-8"})
+                blob = self._request(
+                    "POST",
+                    self._url("git/blobs"),
+                    json={"content": content, "encoding": "utf-8"},
+                )
                 if blob.status_code not in (200, 201):
                     raise RuntimeError(f"blob create HTTP {blob.status_code}: {blob.text[:200]}")
-                tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]})
+                tree_entries.append({
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob.json()["sha"],
+                })
 
-            tree = self._request("POST", self._url("git/trees"), json={"base_tree": base_tree, "tree": tree_entries})
+            tree = self._request(
+                "POST",
+                self._url("git/trees"),
+                json={"base_tree": base_tree, "tree": tree_entries},
+            )
             if tree.status_code not in (200, 201):
                 raise RuntimeError(f"tree create HTTP {tree.status_code}: {tree.text[:200]}")
             tree_sha = tree.json()["sha"]
 
-            new_commit = self._request("POST", self._url("git/commits"), json={
-                "message": f"chore: persist candle history ({len(items)} files)",
-                "tree": tree_sha,
-                "parents": [head_sha],
-            })
+            new_commit = self._request(
+                "POST",
+                self._url("git/commits"),
+                json={
+                    "message": f"chore: persist candle history ({len(items)} files)",
+                    "tree": tree_sha,
+                    "parents": [head_sha],
+                },
+            )
             if new_commit.status_code not in (200, 201):
                 raise RuntimeError(f"commit create HTTP {new_commit.status_code}: {new_commit.text[:200]}")
             commit_sha = new_commit.json()["sha"]
 
-            update = self._request("PATCH", self._url(f"git/refs/heads/{self.branch}"), json={"sha": commit_sha, "force": False})
+            update = self._request(
+                "PATCH",
+                self._url(f"git/refs/heads/{self.branch}"),
+                json={"sha": commit_sha, "force": False},
+            )
             if update.status_code != 200:
                 raise RuntimeError(f"ref update HTTP {update.status_code}: {update.text[:200]}")
 
@@ -175,8 +206,15 @@ class GitHubCandleBackup:
                 self._last_backup_ok = True
                 self._last_backup_at = time.time()
                 self._last_error = ""
-            log.info("GITHUB BACKUP OK | files=%s commit=%s pending=%s", len(items), commit_sha[:12], self.pending_count())
+
+            log.info(
+                "GITHUB BACKUP OK | files=%s commit=%s pending=%s",
+                len(items),
+                commit_sha[:12],
+                self.pending_count(),
+            )
             return True
+
         except Exception as exc:
             with self._lock:
                 self._last_backup_ok = False
