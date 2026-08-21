@@ -209,6 +209,18 @@ class CandleStore:
 
             parsed.sort(key=lambda c: c.open_time)
 
+            # Same invariant `seed()` already enforces: candles must be
+            # unique by open_time. `load()` reads straight from a local
+            # disk file, which — unlike seed()'s in-memory path — has no
+            # guarantee of uniqueness (an older code version, a manual
+            # edit, or any other on-disk corruption could leave two
+            # entries with the same open_time). Dedupe defensively here
+            # too, keeping the last-seen entry for any repeated open_time.
+            deduped = {}
+            for candle in parsed:
+                deduped[candle.open_time] = candle
+            parsed = sorted(deduped.values(), key=lambda c: c.open_time)
+
             current = None
             raw_current = data.get("current")
 
