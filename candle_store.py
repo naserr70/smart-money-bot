@@ -7,6 +7,7 @@ IMPORTANT:
 - The currently-open candle is NOT part of the closed history.
 - A new closed candle replaces the oldest candle automatically.
 - Signal calculations must use closed candles only.
+- Local, GitHub and API history are MERGED by open_time.
 """
 
 import json
@@ -56,12 +57,11 @@ class Candle:
     @classmethod
     def from_bybit(cls, raw: list) -> "Candle":
         """
-        Bybit v5 kline list item (already oldest-first after reverse):
+        Bybit v5 kline:
         [startTime, open, high, low, close, volume, turnover]
-
-        startTime is ms. turnover is quote volume (USDT for spot).
         """
         open_ms = int(float(raw[0]))
+
         return cls(
             open_time=open_ms,
             close_time=open_ms + 5 * 60 * 1000 - 1,
@@ -77,12 +77,13 @@ class Candle:
     @classmethod
     def from_kucoin(cls, raw: list) -> "Candle":
         """
-        KuCoin kline format (official):
+        KuCoin kline:
         [time, open, close, high, low, volume, turnover]
 
-        time is in seconds (unix).
+        time is seconds.
         """
         open_ms = int(float(raw[0]) * 1000)
+
         return cls(
             open_time=open_ms,
             close_time=open_ms + 5 * 60 * 1000 - 1,
@@ -105,6 +106,18 @@ class CandleStore:
         market_history/kucoin/...
 
     NEVER mix sources.
+
+    History loading/restore policy:
+
+        Local + GitHub + API
+                    ↓
+              merge by open_time
+                    ↓
+              remove duplicates
+                    ↓
+          remove currently-open candles
+                    ↓
+              newest 864 candles
     """
 
     def __init__(
@@ -136,30 +149,57 @@ class CandleStore:
             src: set() for src in VALID_SOURCES
         }
 
-        self.github_enabled = bool(github_enabled and github_token and github_repo)
+        self.github_enabled = bool(
+            github_enabled
+            and github_token
+            and github_repo
+        )
+
         self.github_token = github_token or ""
         self.github_repo = github_repo or ""
         self.github_branch = github_branch or "main"
-        self.github_sync_interval_sec = max(60, int(github_sync_interval_sec))
 
-        os.makedirs(self.root_path, exist_ok=True)
+        self.github_sync_interval_sec = max(
+            60,
+            int(github_sync_interval_sec),
+        )
+
+        os.makedirs(
+            self.root_path,
+            exist_ok=True,
+        )
+
         for src in VALID_SOURCES:
-            os.makedirs(os.path.join(self.root_path, src), exist_ok=True)
+            os.makedirs(
+                os.path.join(
+                    self.root_path,
+                    src,
+                ),
+                exist_ok=True,
+            )
 
     @staticmethod
     def normalize_source(source: str) -> str:
         source = source.lower().strip()
 
         if source not in VALID_SOURCES:
-            raise ValueError(f"Unsupported candle source: {source}")
+            raise ValueError(
+                f"Unsupported candle source: {source}"
+            )
 
         return source
 
-    def _path(self, source: str, symbol: str) -> str:
+    def _path(
+        self,
+        source: str,
+        symbol: str,
+    ) -> str:
+
         source = self.normalize_source(source)
 
         safe = "".join(
-            c for c in symbol
+            c
+            for c in symbol
             if c.isalnum() or c in ("_", "-")
         )
 
@@ -169,23 +209,38 @@ class CandleStore:
             f"{safe}.json",
         )
 
-    def load(self, source: str, symbol: str) -> bool:
+    def load(
+        self,
+        source: str,
+        symbol: str,
+    ) -> bool:
+
         source = self.normalize_source(source)
 
         with self._lock:
             if symbol in self._closed[source]:
                 return True
 
-        path = self._path(source, symbol)
+        path = self._path(
+            source,
+            symbol,
+        )
 
         if not os.path.exists(path):
             return False
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as f:
                 data = json.load(f)
 
-            candles = data.get("candles", [])
+            candles = data.get(
+                "candles",
+                [],
+            )
 
             parsed = []
 
@@ -193,84 +248,159 @@ class CandleStore:
                 try:
                     parsed.append(
                         Candle(
-                            open_time=int(item["open_time"]),
-                            close_time=int(item["close_time"]),
-                            open=float(item["open"]),
-                            high=float(item["high"]),
-                            low=float(item["low"]),
-                            close=float(item["close"]),
-                            volume=float(item["volume"]),
-                            quote_volume=float(item["quote_volume"]),
-                            trades=int(item.get("trades", 0)),
+                            open_time=int(
+                                item["open_time"]
+                            ),
+                            close_time=int(
+                                item["close_time"]
+                            ),
+                            open=float(
+                                item["open"]
+                            ),
+                            high=float(
+                                item["high"]
+                            ),
+                            low=float(
+                                item["low"]
+                            ),
+                            close=float(
+                                item["close"]
+                            ),
+                            volume=float(
+                                item["volume"]
+                            ),
+                            quote_volume=float(
+                                item["quote_volume"]
+                            ),
+                            trades=int(
+                                item.get(
+                                    "trades",
+                                    0,
+                                )
+                            ),
                         )
                     )
-                except (KeyError, TypeError, ValueError):
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
                     continue
 
-            parsed.sort(key=lambda c: c.open_time)
+            parsed.sort(
+                key=lambda c: c.open_time
+            )
 
-            # Same invariant `seed()` already enforces: candles must be
-            # unique by open_time. `load()` reads straight from a local
-            # disk file, which — unlike seed()'s in-memory path — has no
-            # guarantee of uniqueness (an older code version, a manual
-            # edit, or any other on-disk corruption could leave two
-            # entries with the same open_time). Dedupe defensively here
-            # too, keeping the last-seen entry for any repeated open_time.
+            # Defensive deduplication.
             deduped = {}
+
             for candle in parsed:
                 deduped[candle.open_time] = candle
-            parsed = sorted(deduped.values(), key=lambda c: c.open_time)
+
+            parsed = sorted(
+                deduped.values(),
+                key=lambda c: c.open_time,
+            )
+
+            # Only closed candles belong to history.
+            now_ms = int(
+                time.time() * 1000
+            )
+
+            parsed = [
+                candle
+                for candle in parsed
+                if candle.close_time < now_ms
+            ]
 
             current = None
-            raw_current = data.get("current")
+
+            raw_current = data.get(
+                "current"
+            )
 
             if raw_current:
+
                 try:
                     current = Candle(
-                        open_time=int(raw_current["open_time"]),
-                        close_time=int(raw_current["close_time"]),
-                        open=float(raw_current["open"]),
-                        high=float(raw_current["high"]),
-                        low=float(raw_current["low"]),
-                        close=float(raw_current["close"]),
-                        volume=float(raw_current["volume"]),
-                        quote_volume=float(raw_current["quote_volume"]),
-                        trades=int(raw_current.get("trades", 0)),
+                        open_time=int(
+                            raw_current["open_time"]
+                        ),
+                        close_time=int(
+                            raw_current["close_time"]
+                        ),
+                        open=float(
+                            raw_current["open"]
+                        ),
+                        high=float(
+                            raw_current["high"]
+                        ),
+                        low=float(
+                            raw_current["low"]
+                        ),
+                        close=float(
+                            raw_current["close"]
+                        ),
+                        volume=float(
+                            raw_current["volume"]
+                        ),
+                        quote_volume=float(
+                            raw_current["quote_volume"]
+                        ),
+                        trades=int(
+                            raw_current.get(
+                                "trades",
+                                0,
+                            )
+                        ),
                     )
-                except (KeyError, TypeError, ValueError):
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
                     current = None
 
             with self._lock:
+
                 self._closed[source][symbol] = deque(
                     parsed[-self.max_candles:],
                     maxlen=self.max_candles,
                 )
 
                 if current:
-                    # A "current" candle is only meaningful if it's strictly
-                    # newer than the latest CLOSED candle we just loaded. A
-                    # stale current (e.g. saved right before a restart, while
-                    # the closed history on disk is from further back) must
-                    # never be kept — update() would later append it onto the
-                    # end of the closed deque as if it were the newest candle,
-                    # silently breaking chronological order and corrupting
-                    # every baseline/z-score calculation downstream.
-                    last_closed = parsed[-1] if parsed else None
-                    if last_closed is not None and current.open_time <= last_closed.open_time:
+
+                    last_closed = (
+                        parsed[-1]
+                        if parsed
+                        else None
+                    )
+
+                    if (
+                        last_closed is not None
+                        and current.open_time
+                        <= last_closed.open_time
+                    ):
+
                         log.warning(
                             "HISTORY LOAD | source=%s symbol=%s "
                             "stale current candle discarded "
-                            "(current_open_time=%s <= last_closed_open_time=%s)",
+                            "(current_open_time=%s <= "
+                            "last_closed_open_time=%s)",
                             source,
                             symbol,
                             current.open_time,
                             last_closed.open_time,
                         )
+
                     else:
                         self._current[source][symbol] = current
 
             log.info(
-                "HISTORY LOADED | source=%s symbol=%s candles=%s/%s current=%s",
+                "HISTORY LOADED | source=%s symbol=%s "
+                "candles=%s/%s current=%s",
                 source,
                 symbol,
                 len(parsed),
@@ -280,13 +410,18 @@ class CandleStore:
 
             return True
 
-        except (OSError, json.JSONDecodeError) as e:
+        except (
+            OSError,
+            json.JSONDecodeError,
+        ) as e:
+
             log.warning(
                 "HISTORY LOAD FAILED | source=%s symbol=%s error=%s",
                 source,
                 symbol,
                 e,
             )
+
             return False
 
     def seed(
@@ -295,8 +430,27 @@ class CandleStore:
         symbol: str,
         candles: List[Candle],
     ) -> None:
+        """
+        MERGE Local + incoming history.
 
-        source = self.normalize_source(source)
+        Incoming history can come from:
+        - GitHub restore
+        - Binance API
+        - Bybit API
+        - KuCoin API
+
+        IMPORTANT:
+        This function NEVER wholesale-replaces existing local history.
+
+        Candles are uniquely identified by open_time.
+
+        Final result:
+            newest max_candles CLOSED candles.
+        """
+
+        source = self.normalize_source(
+            source
+        )
 
         if not candles:
             log.warning(
@@ -306,43 +460,133 @@ class CandleStore:
             )
             return
 
-        candles = sorted(
-            candles,
-            key=lambda c: c.open_time,
-        )
-
-        unique = {}
-
-        for candle in candles:
-            unique[candle.open_time] = candle
-
-        candles = sorted(
-            unique.values(),
-            key=lambda c: c.open_time,
+        now_ms = int(
+            time.time() * 1000
         )
 
         with self._lock:
+
+            # ---------------------------------------------------------
+            # 1. Existing Local history
+            # ---------------------------------------------------------
+
+            existing = list(
+                self._closed[source].get(
+                    symbol,
+                    deque(),
+                )
+            )
+
+            # ---------------------------------------------------------
+            # 2. Build merged dictionary.
+            #
+            # open_time is the unique candle ID.
+            # ---------------------------------------------------------
+
+            merged = {}
+
+            for candle in existing:
+
+                if candle.open_time <= 0:
+                    continue
+
+                # Never keep an open candle in closed history.
+                if candle.close_time >= now_ms:
+                    continue
+
+                merged[candle.open_time] = candle
+
+            # ---------------------------------------------------------
+            # 3. Merge GitHub/API history.
+            #
+            # If the same candle exists in both sources, the incoming
+            # candle replaces the old copy.
+            # ---------------------------------------------------------
+
+            incoming_count = 0
+
+            for candle in candles:
+
+                if candle.open_time <= 0:
+                    continue
+
+                # Never store current/open candle.
+                if candle.close_time >= now_ms:
+                    continue
+
+                merged[candle.open_time] = candle
+                incoming_count += 1
+
+            # ---------------------------------------------------------
+            # 4. Sort chronologically.
+            # ---------------------------------------------------------
+
+            ordered = sorted(
+                merged.values(),
+                key=lambda c: c.open_time,
+            )
+
+            # ---------------------------------------------------------
+            # 5. Keep ONLY newest max_candles.
+            # ---------------------------------------------------------
+
+            if len(ordered) > self.max_candles:
+                ordered = ordered[
+                    -self.max_candles:
+                ]
+
+            # ---------------------------------------------------------
+            # 6. Replace in-memory deque with the MERGED result.
+            # This is safe because the merge happened above.
+            # ---------------------------------------------------------
+
             self._closed[source][symbol] = deque(
-                candles[-self.max_candles:],
+                ordered,
                 maxlen=self.max_candles,
             )
 
-            # seed() wholesale-replaces the closed history (bootstrap /
-            # GitHub restore / fresh API fetch). Any previously-tracked
-            # "current" candle was relative to the OLD history and its
-            # relationship to this new history is not guaranteed — keeping
-            # it around risks update() later appending a stale/out-of-order
-            # candle onto the end of the freshly-seeded deque. Drop it; the
-            # next live tick will establish a correct new current.
-            self._current[source].pop(symbol, None)
+            # ---------------------------------------------------------
+            # 7. Current candle protection.
+            # ---------------------------------------------------------
 
-            self._dirty[source].add(symbol)
+            current = self._current[source].get(
+                symbol
+            )
+
+            if current is not None:
+
+                if (
+                    ordered
+                    and current.open_time
+                    <= ordered[-1].open_time
+                ):
+
+                    self._current[source].pop(
+                        symbol,
+                        None,
+                    )
+
+            # ---------------------------------------------------------
+            # 8. Mark dirty so local/GitHub backup can persist it.
+            # ---------------------------------------------------------
+
+            self._dirty[source].add(
+                symbol
+            )
+
+            final_count = len(
+                ordered
+            )
 
         log.info(
-            "HISTORY SEEDED | source=%s symbol=%s candles=%s/%s",
+            "HISTORY SEEDED/MERGED | source=%s "
+            "symbol=%s existing=%s incoming=%s "
+            "merged=%s/%s",
             source,
             symbol,
-            len(candles[-self.max_candles:]),
+            len(existing),
+            incoming_count,
+            final_count,
             self.max_candles,
         )
 
@@ -353,23 +597,30 @@ class CandleStore:
         candle: Candle,
     ) -> str:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
 
             history = self._closed[source].setdefault(
                 symbol,
-                deque(maxlen=self.max_candles),
+                deque(
+                    maxlen=self.max_candles
+                ),
             )
 
-            current = self._current[source].get(symbol)
+            current = self._current[source].get(
+                symbol
+            )
 
             if current is None:
 
                 self._current[source][symbol] = candle
 
                 log.debug(
-                    "CURRENT CANDLE CREATED | source=%s symbol=%s open_time=%s",
+                    "CURRENT CANDLE CREATED | source=%s "
+                    "symbol=%s open_time=%s",
                     source,
                     symbol,
                     candle.open_time,
@@ -387,34 +638,46 @@ class CandleStore:
 
                 closed_candle = current
 
-                # Defensive guard: never append a candle that would break
-                # the deque's strictly-increasing open_time ordering (e.g.
-                # a stale "current" left over from a restart/restore race).
-                # Every downstream calculation (_baseline_mean slicing,
-                # z-score, candle_price_change) assumes this history is in
-                # chronological order — silently violating it corrupts
-                # signals without raising any error.
-                if history and closed_candle.open_time <= history[-1].open_time:
+                if (
+                    history
+                    and closed_candle.open_time
+                    <= history[-1].open_time
+                ):
+
                     log.warning(
-                        "CANDLE DISCARDED OUT_OF_ORDER | source=%s symbol=%s "
-                        "stale_current_open_time=%s <= last_closed_open_time=%s",
+                        "CANDLE DISCARDED OUT_OF_ORDER | "
+                        "source=%s symbol=%s "
+                        "stale_current_open_time=%s "
+                        "<= last_closed_open_time=%s",
                         source,
                         symbol,
                         closed_candle.open_time,
                         history[-1].open_time,
                     )
+
                     self._current[source][symbol] = candle
-                    self._dirty[source].add(symbol)
+
+                    self._dirty[source].add(
+                        symbol
+                    )
+
                     return "current"
 
-                history.append(closed_candle)
+                history.append(
+                    closed_candle
+                )
 
                 self._current[source][symbol] = candle
 
-                self._dirty[source].add(symbol)
+                self._dirty[source].add(
+                    symbol
+                )
 
                 log.info(
-                    "CANDLE CLOSED | source=%s symbol=%s open_time=%s quote_volume=%.2f history=%s/%s",
+                    "CANDLE CLOSED | source=%s "
+                    "symbol=%s open_time=%s "
+                    "quote_volume=%.2f "
+                    "history=%s/%s",
                     source,
                     symbol,
                     closed_candle.open_time,
@@ -426,7 +689,8 @@ class CandleStore:
                 return "closed"
 
             log.warning(
-                "CANDLE IGNORED OUT_OF_ORDER | source=%s symbol=%s incoming=%s current=%s",
+                "CANDLE IGNORED OUT_OF_ORDER | "
+                "source=%s symbol=%s incoming=%s current=%s",
                 source,
                 symbol,
                 candle.open_time,
@@ -442,28 +706,49 @@ class CandleStore:
         candle: Candle,
     ) -> bool:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
+
+        now_ms = int(
+            time.time() * 1000
+        )
+
+        # Never add an open candle to closed history.
+        if candle.close_time >= now_ms:
+            return False
 
         with self._lock:
 
             history = self._closed[source].setdefault(
                 symbol,
-                deque(maxlen=self.max_candles),
+                deque(
+                    maxlen=self.max_candles
+                ),
             )
 
             if history:
 
                 if candle.open_time == history[-1].open_time:
+
                     history[-1] = candle
-                    self._dirty[source].add(symbol)
+
+                    self._dirty[source].add(
+                        symbol
+                    )
+
                     return True
 
                 if candle.open_time < history[-1].open_time:
                     return False
 
-            history.append(candle)
+            history.append(
+                candle
+            )
 
-            self._dirty[source].add(symbol)
+            self._dirty[source].add(
+                symbol
+            )
 
             return True
 
@@ -473,14 +758,25 @@ class CandleStore:
         symbol: str,
         candles: List[Candle],
     ) -> int:
+
         if not candles:
             return 0
 
-        candles = sorted(candles, key=lambda c: c.open_time)
+        candles = sorted(
+            candles,
+            key=lambda c: c.open_time,
+        )
+
         closed_count = 0
 
         for candle in candles:
-            result = self.update(source, symbol, candle)
+
+            result = self.update(
+                source,
+                symbol,
+                candle,
+            )
+
             if result == "closed":
                 closed_count += 1
 
@@ -492,10 +788,15 @@ class CandleStore:
         symbol: str,
     ) -> Optional[Candle]:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
-            return self._current[source].get(symbol)
+
+            return self._current[source].get(
+                symbol
+            )
 
     def get_closed(
         self,
@@ -503,11 +804,17 @@ class CandleStore:
         symbol: str,
     ) -> List[Candle]:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
+
             return list(
-                self._closed[source].get(symbol, ())
+                self._closed[source].get(
+                    symbol,
+                    (),
+                )
             )
 
     def get_recent(
@@ -520,10 +827,16 @@ class CandleStore:
         if count <= 0:
             return []
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
-            history = self._closed[source].get(symbol, ())
+
+            history = self._closed[source].get(
+                symbol,
+                (),
+            )
 
             return list(history)[-count:]
 
@@ -533,11 +846,17 @@ class CandleStore:
         symbol: str,
     ) -> int:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
+
             return len(
-                self._closed[source].get(symbol, ())
+                self._closed[source].get(
+                    symbol,
+                    (),
+                )
             )
 
     def average_quote_volume(
@@ -618,7 +937,10 @@ class CandleStore:
                 continue
 
             change = (
-                (current.close - previous.close)
+                (
+                    current.close
+                    - previous.close
+                )
                 / previous.close
             ) * 100
 
@@ -626,12 +948,20 @@ class CandleStore:
 
         return returns
 
-    def dirty_symbols(self, source: str) -> List[str]:
+    def dirty_symbols(
+        self,
+        source: str,
+    ) -> List[str]:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
-            return list(self._dirty[source])
+
+            return list(
+                self._dirty[source]
+            )
 
     def to_payload(
         self,
@@ -639,22 +969,31 @@ class CandleStore:
         symbol: str,
     ) -> dict:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         with self._lock:
 
             history = list(
-                self._closed[source].get(symbol, ())
+                self._closed[source].get(
+                    symbol,
+                    (),
+                )
             )
 
-            current = self._current[source].get(symbol)
+            current = self._current[source].get(
+                symbol
+            )
 
         return {
             "source": source,
             "symbol": symbol,
             "interval": "5m",
             "max_candles": self.max_candles,
-            "updated_at": int(time.time() * 1000),
+            "updated_at": int(
+                time.time() * 1000
+            ),
             "candles": [
                 asdict(c)
                 for c in history
@@ -672,7 +1011,9 @@ class CandleStore:
         symbol: str,
     ) -> None:
 
-        source = self.normalize_source(source)
+        source = self.normalize_source(
+            source
+        )
 
         payload = self.to_payload(
             source,
@@ -707,12 +1048,16 @@ class CandleStore:
             )
 
             with self._lock:
-                self._dirty[source].discard(symbol)
+
+                self._dirty[source].discard(
+                    symbol
+                )
 
         except OSError as e:
 
             log.warning(
-                "HISTORY LOCAL SAVE FAILED | source=%s symbol=%s error=%s",
+                "HISTORY LOCAL SAVE FAILED | "
+                "source=%s symbol=%s error=%s",
                 source,
                 symbol,
                 e,
@@ -724,7 +1069,11 @@ class CandleStore:
     ) -> None:
 
         sources = (
-            [self.normalize_source(source)]
+            [
+                self.normalize_source(
+                    source
+                )
+            ]
             if source
             else list(VALID_SOURCES)
         )
@@ -732,16 +1081,25 @@ class CandleStore:
         for src in sources:
 
             for symbol in self.dirty_symbols(src):
-                self.save(src, symbol)
+
+                self.save(
+                    src,
+                    symbol,
+                )
 
     def save_all(self) -> None:
 
         for source in VALID_SOURCES:
 
             with self._lock:
+
                 symbols = list(
                     self._closed[source].keys()
                 )
 
             for symbol in symbols:
-                self.save(source, symbol)
+
+                self.save(
+                    source,
+                    symbol,
+                )
