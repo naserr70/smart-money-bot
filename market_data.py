@@ -48,6 +48,7 @@ KUCOIN_KLINES_ENDPOINT = "https://api.kucoin.com/api/v1/market/candles"
 DEFAULT_429_COOLDOWN_SEC = 60
 DEFAULT_418_COOLDOWN_SEC = 120
 MAX_COOLDOWN_SEC = 3 * 24 * 3600
+KUCOIN_CANDLE_BATCH = 100
 
 
 class MarketDataProvider:
@@ -265,13 +266,7 @@ class MarketDataProvider:
             return {}
 
     def fetch_binance_klines(self, symbol: str, limit: int = 864) -> Optional[list]:
-        """Fetch Binance klines without retrying deterministic 4xx errors.
-
-        A 400/404 for one symbol means that symbol is not usable by this
-        history endpoint (delisted, unsupported, wrong market, etc.). Trying
-        api1/api2/api3/api.binance for the same deterministic request only
-        creates four useless requests and can contribute to rate limiting.
-        """
+        """Fetch Binance klines without retrying deterministic 4xx errors."""
         if not self._binance_guard(f"klines:{symbol}"):
             return None
         limit = max(1, min(int(limit), 1000))
@@ -327,32 +322,99 @@ class MarketDataProvider:
             return None
 
     def fetch_kucoin_klines(self, symbol: str, limit: int = 864) -> Optional[list]:
+        """Fetch KuCoin 5m candles with backward pagination.
+
+        KuCoin's candle endpoint is limited per response. We therefore walk
+        backwards in time using endAt until enough candles have been collected.
+        The returned rows are oldest -> newest and contain at most ``limit``
+        rows. The current/open candle is allowed here and is removed later by
+        fetch_candles(), exactly as for the other exchanges.
+        """
         limit = max(1, int(limit))
         if "-" not in symbol and symbol.endswith("USDT"):
             symbol = symbol[:-4] + "-USDT"
-        now_sec = int(time.time())
-        params = {"symbol": symbol, "type": "5min",
-                  "startAt": now_sec - (limit + 1) * 300, "endAt": now_sec}
-        try:
-            response = self.session.get(KUCOIN_KLINES_ENDPOINT, params=params, timeout=self.timeout + 2)
-            if response.status_code != 200:
-                log.warning("KUCOIN HISTORY HTTP ERROR | symbol=%s status=%s", symbol, response.status_code)
+
+        target = min(limit, 1000)
+        collected = {}
+        end_at = int(time.time())
+        request_count = 0
+        max_requests = max(2, (target + KUCOIN_CANDLE_BATCH - 1) // KUCOIN_CANDLE_BATCH + 2)
+
+        while len(collected) < target and request_count < max_requests:
+            remaining = target - len(collected)
+            batch_size = min(KUCOIN_CANDLE_BATCH, remaining)
+            # KuCoin uses inclusive Unix-second boundaries. Move the window
+            # back by one candle after every page to avoid duplicate edges.
+            start_at = end_at - (batch_size + 2) * 300
+            params = {
+                "symbol": symbol,
+                "type": "5min",
+                "startAt": start_at,
+                "endAt": end_at,
+            }
+            request_count += 1
+            try:
+                response = self.session.get(
+                    KUCOIN_KLINES_ENDPOINT,
+                    params=params,
+                    timeout=self.timeout + 2,
+                )
+            except requests.RequestException as exc:
+                log.warning("KUCOIN HISTORY ERROR | symbol=%s page=%s error=%s",
+                            symbol, request_count, exc)
                 return None
+
+            if response.status_code != 200:
+                log.warning("KUCOIN HISTORY HTTP ERROR | symbol=%s page=%s status=%s",
+                            symbol, request_count, response.status_code)
+                return None
+
             try:
                 payload = response.json()
             except ValueError:
+                log.warning("KUCOIN HISTORY INVALID JSON | symbol=%s page=%s",
+                            symbol, request_count)
                 return None
+
             if not isinstance(payload, dict):
                 return None
             raw = payload.get("data", [])
-            if not isinstance(raw, list):
-                return None
-            raw = list(reversed(raw))[-limit:]
-            log.info("KUCOIN HISTORY OK | symbol=%s candles=%s/%s", symbol, len(raw), limit)
-            return raw
-        except requests.RequestException as exc:
-            log.warning("KUCOIN HISTORY ERROR | symbol=%s error=%s", symbol, exc)
-            return None
+            if not isinstance(raw, list) or not raw:
+                break
+
+            page_times = []
+            for row in raw:
+                if not isinstance(row, (list, tuple)) or len(row) < 7:
+                    continue
+                try:
+                    # KuCoin candle rows use the first field as epoch seconds.
+                    open_sec = int(float(row[0]))
+                    page_times.append(open_sec)
+                    collected[open_sec] = row
+                except (TypeError, ValueError):
+                    continue
+
+            if not page_times:
+                break
+
+            oldest = min(page_times)
+            if oldest >= end_at:
+                break
+            end_at = oldest - 1
+
+            log.info("KUCOIN HISTORY PAGE | symbol=%s page=%s candles=%s collected=%s/%s",
+                     symbol, request_count, len(page_times), len(collected), target)
+
+            if len(page_times) < max(1, batch_size // 2) and len(collected) < target:
+                # Do not spin on an exchange response that contains no further
+                # historical range.
+                break
+
+        raw = [collected[key] for key in sorted(collected)]
+        raw = raw[-target:]
+        log.info("KUCOIN HISTORY OK | symbol=%s candles=%s/%s requests=%s",
+                 symbol, len(raw), target, request_count)
+        return raw or None
 
     def fetch_binance_candles(self, symbol: str, limit: int = 864):
         from candle_store import Candle
