@@ -66,9 +66,13 @@ class MarketDataProvider:
         self,
         session: requests.Session,
         timeout: int = 10,
+        binance_enabled: bool = True,
+        kucoin_enabled: bool = True,
     ):
         self.session = session
         self.timeout = max(1, int(timeout))
+        self.binance_enabled = binance_enabled
+        self.kucoin_enabled = kucoin_enabled
 
         # Unix timestamp until which Binance must not be called.
         self._binance_cooldown_until: float = 0.0
@@ -243,6 +247,9 @@ class MarketDataProvider:
     # =========================================================
 
     def fetch_binance(self) -> Dict[str, dict]:
+
+        if not self.binance_enabled:
+            return {}
 
         if not self._binance_guard("ticker"):
             return {}
@@ -441,6 +448,9 @@ class MarketDataProvider:
             return {}
 
     def fetch_kucoin(self) -> Dict[str, dict]:
+
+        if not self.kucoin_enabled:
+            return {}
 
         log.info("KUCOIN TICKER FETCH START")
 
