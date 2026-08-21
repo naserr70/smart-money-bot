@@ -47,6 +47,10 @@ class GitHubCandleBackup:
     def _url(self, suffix: str) -> str:
         return f"https://api.github.com/repos/{self.repo}/{suffix.lstrip('/')}"
 
+    def _raw_url(self, source: str, symbol: str) -> str:
+        path = self._path(source, symbol, self.root_path)
+        return f"https://raw.githubusercontent.com/{self.repo}/{self.branch}/{path}"
+
     @staticmethod
     def _path(source: str, symbol: str, root_path: str) -> str:
         safe = "".join(c for c in symbol if c.isalnum() or c in ("_", "-"))
@@ -104,11 +108,97 @@ class GitHubCandleBackup:
             return last
         raise last if isinstance(last, Exception) else RuntimeError("GitHub request failed")
 
+    @staticmethod
+    def _normalize_payload(payload: dict) -> Optional[dict]:
+        if not isinstance(payload, dict):
+            return None
+        now_ms = int(time.time() * 1000)
+        raw_candles = payload.get("candles") or []
+        parsed = []
+        for item in raw_candles:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed.append({
+                    "open_time": int(item["open_time"]),
+                    "close_time": int(item["close_time"]),
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
+                    "volume": float(item["volume"]),
+                    "quote_volume": float(item["quote_volume"]),
+                    "trades": int(item.get("trades", 0)),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        unique = {item["open_time"]: item for item in parsed}
+        parsed = sorted(unique.values(), key=lambda item: item["open_time"])
+        closed = [item for item in parsed if item["close_time"] < now_ms]
+        active = [item for item in parsed if item["close_time"] >= now_ms]
+
+        current = payload.get("current")
+        if isinstance(current, dict):
+            try:
+                current = {
+                    "open_time": int(current["open_time"]),
+                    "close_time": int(current["close_time"]),
+                    "open": float(current["open"]),
+                    "high": float(current["high"]),
+                    "low": float(current["low"]),
+                    "close": float(current["close"]),
+                    "volume": float(current["volume"]),
+                    "quote_volume": float(current["quote_volume"]),
+                    "trades": int(current.get("trades", 0)),
+                }
+            except (KeyError, TypeError, ValueError):
+                current = None
+        else:
+            current = None
+
+        if active:
+            newest_active = max(active, key=lambda item: item["open_time"])
+            if current is None or newest_active["open_time"] > current["open_time"]:
+                current = newest_active
+
+        payload["candles"] = closed[-864:]
+        payload["current"] = current
+        payload["max_candles"] = 864
+        return payload
+
     def download(self, source: str, symbol: str) -> Optional[dict]:
         if not self.is_configured():
             return None
         path = self._path(source, symbol, self.root_path)
-        response = self._request("GET", self._url(f"contents/{path}"), params={"ref": self.branch})
+
+        # Candle history is public repository data. Prefer raw.githubusercontent.com
+        # so startup restoration does not consume GitHub REST API rate-limit budget.
+        # This is critical on Render where a restart may restore hundreds of files.
+        raw_url = self._raw_url(source, symbol)
+        try:
+            response = self.session.get(
+                raw_url,
+                timeout=self.timeout,
+                headers={"User-Agent": "SmartMoneyBot/2.0", "Accept": "application/json"},
+            )
+            if response.status_code == 200:
+                try:
+                    payload = json.loads(response.text)
+                    normalized = self._normalize_payload(payload)
+                    if normalized is not None:
+                        return normalized
+                except (ValueError, TypeError):
+                    log.warning("GITHUB RAW DOWNLOAD INVALID | path=%s", path)
+            elif response.status_code not in (404, 403):
+                log.warning("GITHUB RAW DOWNLOAD FAILED | path=%s status=%s", path, response.status_code)
+        except requests.RequestException as exc:
+            log.warning("GITHUB RAW DOWNLOAD ERROR | path=%s error=%s", path, exc)
+
+        # Fallback for private repositories or transient raw-CDN failures.
+        response = self._request(
+            "GET", self._url(f"contents/{path}"), params={"ref": self.branch}
+        )
         if response.status_code == 404:
             return None
         if response.status_code != 200:
@@ -118,78 +208,13 @@ class GitHubCandleBackup:
             data = response.json()
             encoded = data.get("content", "").replace("\n", "")
             payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
-            if not isinstance(payload, dict):
-                return None
-
-            # Normalize old persisted files: only CLOSED candles belong in
-            # `candles`; the currently-open 5m candle belongs in `current`.
-            # This also repairs histories written by older bot versions.
-            now_ms = int(time.time() * 1000)
-            raw_candles = payload.get("candles") or []
-            parsed = []
-            for item in raw_candles:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    parsed.append({
-                        "open_time": int(item["open_time"]),
-                        "close_time": int(item["close_time"]),
-                        "open": float(item["open"]),
-                        "high": float(item["high"]),
-                        "low": float(item["low"]),
-                        "close": float(item["close"]),
-                        "volume": float(item["volume"]),
-                        "quote_volume": float(item["quote_volume"]),
-                        "trades": int(item.get("trades", 0)),
-                    })
-                except (KeyError, TypeError, ValueError):
-                    continue
-
-            unique = {item["open_time"]: item for item in parsed}
-            parsed = sorted(unique.values(), key=lambda item: item["open_time"])
-            closed = [item for item in parsed if item["close_time"] < now_ms]
-            active = [item for item in parsed if item["close_time"] >= now_ms]
-
-            current = payload.get("current")
-            if isinstance(current, dict):
-                try:
-                    current = {
-                        "open_time": int(current["open_time"]),
-                        "close_time": int(current["close_time"]),
-                        "open": float(current["open"]),
-                        "high": float(current["high"]),
-                        "low": float(current["low"]),
-                        "close": float(current["close"]),
-                        "volume": float(current["volume"]),
-                        "quote_volume": float(current["quote_volume"]),
-                        "trades": int(current.get("trades", 0)),
-                    }
-                except (KeyError, TypeError, ValueError):
-                    current = None
-            else:
-                current = None
-
-            if active:
-                newest_active = max(active, key=lambda item: item["open_time"])
-                if current is None or newest_active["open_time"] > current["open_time"]:
-                    current = newest_active
-
-            payload["candles"] = closed[-864:]
-            payload["current"] = current
-            payload["max_candles"] = 864
-            return payload
+            return self._normalize_payload(payload)
         except (ValueError, TypeError, KeyError, base64.binascii.Error, UnicodeDecodeError) as exc:
             log.warning("GITHUB DOWNLOAD INVALID | path=%s error=%s", path, exc)
             return None
 
     def backup(self) -> bool:
-        """Persist every queued candle file in one Git tree commit.
-
-        The old implementation committed only the first 20 queued files.
-        On an ephemeral Render restart the in-memory remainder disappeared,
-        so the next boot downloaded those histories again. A successful
-        startup backup now drains the complete queue.
-        """
+        """Persist every queued candle file in one Git tree commit."""
         if not self.is_configured():
             return False
         with self._lock:
@@ -217,9 +242,7 @@ class GitHubCandleBackup:
                 )
                 if blob.status_code not in (200, 201):
                     raise RuntimeError(f"blob create HTTP {blob.status_code}: {blob.text[:200]}")
-                tree_entries.append({
-                    "path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]
-                })
+                tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]})
 
             tree = self._request(
                 "POST", self._url("git/trees"),
@@ -258,10 +281,7 @@ class GitHubCandleBackup:
                 self._last_backup_at = time.time()
                 self._last_error = ""
 
-            log.info(
-                "GITHUB BACKUP OK | files=%s commit=%s pending=%s",
-                len(items), commit_sha[:12], self.pending_count(),
-            )
+            log.info("GITHUB BACKUP OK | files=%s commit=%s pending=%s", len(items), commit_sha[:12], self.pending_count())
             return True
         except Exception as exc:
             with self._lock:
