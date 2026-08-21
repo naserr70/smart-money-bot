@@ -4,31 +4,35 @@ Independent exchange-aware market analyzer.
 Signal logic
 ------------
 1. Smart money:
-   Latest CLOSED 5m quote_volume vs mean of the previous 48 CLOSED
+   Latest CLOSED 5m quote_volume vs mean of previous 48 CLOSED
    5m candles from the SAME exchange.
 
 2. Pump / Dump:
    Rolling volume anomaly + price/z-score checks.
 
 3. Active analysis priority:
-   Binance -> Bybit -> KuCoin.
+   Binance → Bybit → KuCoin.
 
 4. Histories are NEVER mixed across exchanges.
 
-Startup bootstrap
+History lifecycle
 -----------------
-History restoration is performed BEFORE ticker discovery.
+Startup:
+    local filesystem
+        ↓
+    GitHub backup
+        ↓
+    exchange API ONLY if still incomplete
+        ↓
+    save locally
 
-Priority:
-    LOCAL -> GITHUB -> API
+Runtime:
+    NEVER re-download the full 864-candle history.
+    ONLY update the latest closed candles.
 
-IMPORTANT:
-- API history is used ONLY during startup bootstrap for incomplete
-  source/symbol histories.
-- run_cycle() NEVER calls the 864-candle history endpoint.
-- Normal cycles fetch only a very small recent candle window.
-- KuCoin pagination therefore cannot repeatedly download 864 candles
-  every cycle.
+This is important on Render because the filesystem is ephemeral
+and Binance rate limits / KuCoin pagination must not be triggered
+repeatedly on every market cycle.
 """
 
 import logging
@@ -56,27 +60,14 @@ from state import BotState
 
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
-
-# ---------------------------------------------------------------------------
-# IMPORTANT
-# ---------------------------------------------------------------------------
-# This is ONLY for live candle updates.
-#
-# DO NOT increase this to PUMP_HISTORY_CANDLES.
-#
-# History bootstrap belongs exclusively to bootstrap_histories().
-# ---------------------------------------------------------------------------
-
+# Only recent candles are requested during normal runtime.
 LIVE_UPDATE_LIMIT = 5
 
 
 def _candles_from_payload(data: dict) -> List[Candle]:
     """
-    Convert GitHub/local backup payload into Candle objects.
-
-    Only CLOSED candles are expected here.
+    Convert GitHub candle-store JSON payload into Candle objects.
     """
-
     if not isinstance(data, dict):
         return []
 
@@ -105,23 +96,12 @@ def _candles_from_payload(data: dict) -> List[Candle]:
                     trades=int(item.get("trades", 0)),
                 )
             )
-
         except (KeyError, TypeError, ValueError):
             continue
 
-    # Sort chronologically.
     parsed.sort(key=lambda c: c.open_time)
 
-    # Defensive deduplication.
-    unique: Dict[int, Candle] = {}
-
-    for candle in parsed:
-        unique[candle.open_time] = candle
-
-    return sorted(
-        unique.values(),
-        key=lambda c: c.open_time,
-    )
+    return parsed
 
 
 class MarketAnalyzer:
@@ -146,16 +126,15 @@ class MarketAnalyzer:
 
         self.candle_store = candle_store
 
-        # source:symbol -> last candle open_time for which a signal
-        # was already processed.
+        # source:symbol -> last candle that produced a signal
         self._last_signaled_open_time: Dict[str, int] = {}
 
-        # Prevent bootstrap from running twice during the same process.
+        # Bootstrap must execute once per process.
         self._startup_bootstrap_done = False
 
-    # ======================================================================
+    # ------------------------------------------------------------------
     # STARTUP HISTORY BOOTSTRAP
-    # ======================================================================
+    # ------------------------------------------------------------------
 
     def bootstrap_histories(
         self,
@@ -164,35 +143,30 @@ class MarketAnalyzer:
         target_count: int = PUMP_HISTORY_CANDLES,
     ) -> dict:
         """
-        Restore histories in this exact order:
+        Restore histories BEFORE normal ticker discovery.
 
-            1. Local disk
-            2. GitHub
-            3. Exchange API ONLY if still incomplete
+        Order:
 
-        This method is intentionally separate from run_cycle().
+            local
+              ↓
+            GitHub
+              ↓
+            Exchange API only for incomplete histories
 
         IMPORTANT:
-        run_cycle() must NEVER call fetch_candles(..., 864).
+        This method is the ONLY place where full historical bootstrap
+        is performed.
 
-        This prevents Render restarts / normal market cycles from
-        repeatedly triggering KuCoin pagination.
+        run_cycle() MUST NOT call full history bootstrap again.
         """
 
         if self._startup_bootstrap_done:
-
             log.info(
                 "STARTUP BOOTSTRAP SKIPPED | already completed"
             )
+            return {"skipped": True}
 
-            return {
-                "skipped": True,
-            }
-
-        target_count = max(
-            1,
-            int(target_count),
-        )
+        target_count = max(1, int(target_count))
 
         symbol_list = list(
             symbols or NOBITEX_ALL_ASSETS
@@ -221,13 +195,12 @@ class MarketAnalyzer:
             "sources": {},
         }
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # PHASE 1
+        # Local + GitHub restoration
         #
-        # Restore every exchange independently.
-        #
-        # NEVER use ticker discovery here.
-        # ------------------------------------------------------------------
+        # DO NOT call ticker APIs here.
+        # --------------------------------------------------------------
 
         incomplete: Dict[str, List[str]] = {
             source: []
@@ -247,10 +220,7 @@ class MarketAnalyzer:
 
                 try:
 
-                    # ------------------------------------------------------
-                    # LOCAL
-                    # ------------------------------------------------------
-
+                    # Load existing local history.
                     self.candle_store.load(
                         source,
                         symbol,
@@ -261,24 +231,35 @@ class MarketAnalyzer:
                         symbol,
                     )
 
+                    # --------------------------------------------------
+                    # Already complete
+                    # --------------------------------------------------
+
                     if count >= target_count:
 
                         stats["already_full"] += 1
                         stats["local_ok"] += 1
 
+                        log.debug(
+                            "STARTUP HISTORY COMPLETE LOCAL | "
+                            "source=%s symbol=%s candles=%s/%s",
+                            source,
+                            symbol,
+                            count,
+                            target_count,
+                        )
+
                         continue
 
+                    # Existing but incomplete.
                     if count > 0:
                         stats["local_ok"] += 1
 
-                    # ------------------------------------------------------
-                    # GITHUB
-                    # ------------------------------------------------------
+                    # --------------------------------------------------
+                    # GitHub restore
+                    # --------------------------------------------------
 
-                    if (
-                        github_backup is not None
-                        and github_backup.is_configured()
-                    ):
+                    if github_configured:
 
                         try:
 
@@ -312,9 +293,11 @@ class MarketAnalyzer:
                                     restored,
                                 )
 
-                                count = self.candle_store.count(
-                                    source,
-                                    symbol,
+                                count = (
+                                    self.candle_store.count(
+                                        source,
+                                        symbol,
+                                    )
                                 )
 
                                 if count >= target_count:
@@ -332,23 +315,17 @@ class MarketAnalyzer:
                                         target_count,
                                     )
 
-                    # ------------------------------------------------------
-                    # STILL INCOMPLETE
-                    # ------------------------------------------------------
+                    # --------------------------------------------------
+                    # Still incomplete
+                    # --------------------------------------------------
 
-                    count = self.candle_store.count(
-                        source,
-                        symbol,
-                    )
+                    if count < target_count:
 
-                    if count >= target_count:
-                        continue
+                        incomplete[source].append(
+                            symbol
+                        )
 
-                    incomplete[source].append(
-                        symbol
-                    )
-
-                    source_stats["incomplete"] += 1
+                        source_stats["incomplete"] += 1
 
                 except Exception:
 
@@ -363,33 +340,27 @@ class MarketAnalyzer:
 
             stats["sources"][source] = source_stats
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # PHASE 2
         #
-        # ONLY incomplete histories may access exchange APIs.
-        # ------------------------------------------------------------------
+        # Only now contact exchange ticker APIs.
+        #
+        # This phase is ONLY for incomplete histories.
+        # --------------------------------------------------------------
 
         missing_total = sum(
             len(symbols)
             for symbols in incomplete.values()
         )
 
-        if missing_total == 0:
+        if missing_total:
 
             log.info(
-                "STARTUP API HISTORY FETCH SKIPPED | "
-                "all source histories already complete"
-            )
-
-        else:
-
-            log.info(
-                "STARTUP API HISTORY REQUIRED | "
+                "STARTUP HISTORY INCOMPLETE | "
                 "missing_source_symbols=%s",
                 missing_total,
             )
 
-            # Fetch ticker availability only now.
             try:
 
                 (
@@ -414,9 +385,9 @@ class MarketAnalyzer:
                 "kucoin": kucoin_tickers,
             }
 
-            # --------------------------------------------------------------
-            # Fetch only source/symbol combinations that are incomplete.
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Seed each source independently.
+            # ----------------------------------------------------------
 
             for source in VALID_SOURCES:
 
@@ -425,10 +396,7 @@ class MarketAnalyzer:
                     {},
                 )
 
-                missing_symbols = incomplete.get(
-                    source,
-                    [],
-                )
+                missing_symbols = incomplete[source]
 
                 if not missing_symbols:
                     continue
@@ -446,9 +414,11 @@ class MarketAnalyzer:
 
                 for symbol in missing_symbols:
 
-                    # ------------------------------------------------------
-                    # Exact symbol check.
-                    # ------------------------------------------------------
+                    # --------------------------------------------------
+                    # IMPORTANT:
+                    # ticker existence does NOT guarantee candle
+                    # endpoint support.
+                    # --------------------------------------------------
 
                     if symbol not in tickers:
 
@@ -490,10 +460,6 @@ class MarketAnalyzer:
 
                             continue
 
-                        # --------------------------------------------------
-                        # Seed the CLOSED history.
-                        # --------------------------------------------------
-
                         self.candle_store.seed(
                             source,
                             symbol,
@@ -508,10 +474,7 @@ class MarketAnalyzer:
                         if stored >= target_count:
 
                             stats["api_seeded"] += 1
-
-                            stats["sources"][source][
-                                "seeded"
-                            ] += 1
+                            stats["sources"][source]["seeded"] += 1
 
                             log.info(
                                 "STARTUP API SEED OK | "
@@ -537,7 +500,7 @@ class MarketAnalyzer:
                                 target_count,
                             )
 
-                        # Small delay to avoid hammering APIs.
+                        # Small delay to reduce pressure on APIs.
                         time.sleep(0.05)
 
                     except Exception:
@@ -551,11 +514,23 @@ class MarketAnalyzer:
                             symbol,
                         )
 
-        # ------------------------------------------------------------------
-        # Save anything changed during bootstrap.
-        # ------------------------------------------------------------------
+        else:
 
-        self.candle_store.save_dirty()
+            log.info(
+                "STARTUP API HISTORY FETCH SKIPPED | "
+                "all source histories already complete"
+            )
+
+        # --------------------------------------------------------------
+        # Persist dirty local histories.
+        # --------------------------------------------------------------
+
+        try:
+            self.candle_store.save_dirty()
+        except Exception:
+            log.exception(
+                "STARTUP HISTORY SAVE FAILED"
+            )
 
         elapsed = time.time() - started
 
@@ -576,9 +551,9 @@ class MarketAnalyzer:
 
         return stats
 
-    # ======================================================================
+    # ------------------------------------------------------------------
     # NORMAL MARKET CYCLE
-    # ======================================================================
+    # ------------------------------------------------------------------
 
     def run_cycle(
         self,
@@ -610,29 +585,16 @@ class MarketAnalyzer:
             "kucoin": kucoin_tickers,
         }
 
-        # ==============================================================
-        # IMPORTANT FIX
-        # ==============================================================
+        # --------------------------------------------------------------
+        # IMPORTANT
         #
-        # DO NOT call _maintain_history() here.
+        # DO NOT CALL _maintain_history() HERE.
         #
-        # That old path did:
+        # Full 864-candle history belongs exclusively to startup
+        # bootstrap.
         #
-        #     fetch_candles(..., 864)
-        #
-        # on every cycle for incomplete histories.
-        #
-        # With KuCoin pagination this caused:
-        #
-        #     KUCOIN HISTORY PAGE 1
-        #     KUCOIN HISTORY PAGE 2
-        #     ...
-        #
-        # to happen repeatedly.
-        #
-        # Startup bootstrap is now the ONLY place where long history
-        # can be downloaded.
-        # ==============================================================
+        # Runtime only updates the latest candles.
+        # --------------------------------------------------------------
 
         for source, tickers in sources_tickers.items():
 
@@ -641,9 +603,11 @@ class MarketAnalyzer:
                 tickers,
             )
 
-        # ------------------------------------------------------------------
-        # Active source priority
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Select active analysis source.
+        #
+        # Binance → Bybit → KuCoin
+        # --------------------------------------------------------------
 
         if binance_tickers:
 
@@ -683,10 +647,6 @@ class MarketAnalyzer:
             )
 
             return [], "none", 0
-
-        # ------------------------------------------------------------------
-        # Analyze only the selected active exchange.
-        # ------------------------------------------------------------------
 
         log.info(
             "ANALYSIS START | source=%s symbols=%s",
@@ -732,9 +692,9 @@ class MarketAnalyzer:
             len(ticker_stats),
         )
 
-    # ======================================================================
-    # LIVE CANDLE UPDATE
-    # ======================================================================
+    # ------------------------------------------------------------------
+    # RUNTIME LIVE UPDATE
+    # ------------------------------------------------------------------
 
     def _live_update_candles(
         self,
@@ -752,10 +712,7 @@ class MarketAnalyzer:
 
             try:
 
-                # ----------------------------------------------------------
-                # Load local history if it has not already been loaded.
-                # ----------------------------------------------------------
-
+                # Load local history only if not already loaded.
                 if self.candle_store.count(
                     source,
                     symbol,
@@ -766,13 +723,11 @@ class MarketAnalyzer:
                         symbol,
                     )
 
-                # ----------------------------------------------------------
-                # IMPORTANT:
+                # ------------------------------------------------------
+                # ONLY 5 recent candles.
                 #
-                # Only fetch the latest few candles.
-                #
-                # NEVER request PUMP_HISTORY_CANDLES here.
-                # ----------------------------------------------------------
+                # No 864-candle history download here.
+                # ------------------------------------------------------
 
                 candles = self.provider.fetch_candles(
                     source,
@@ -809,28 +764,9 @@ class MarketAnalyzer:
             closed_total,
         )
 
-    # ======================================================================
-    # REMOVED OLD HISTORY MAINTENANCE PATH
-    # ======================================================================
-    #
-    # _maintain_history() intentionally does NOT exist anymore.
-    #
-    # It was the source of repeated 864-candle downloads during normal
-    # cycles.
-    #
-    # If history is incomplete:
-    #
-    #     startup -> bootstrap_histories()
-    #
-    # NOT:
-    #
-    #     run_cycle() -> _maintain_history()
-    #
-    # ======================================================================
-
-    # ======================================================================
-    # SMART MONEY BASELINE
-    # ======================================================================
+    # ------------------------------------------------------------------
+    # BASELINE
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _baseline_mean(
@@ -838,12 +774,6 @@ class MarketAnalyzer:
         count: int,
     ) -> Optional[float]:
 
-        # Need:
-        #
-        # previous 48 candles
-        # +
-        # latest candle
-        #
         if count <= 0:
             return None
 
@@ -868,9 +798,9 @@ class MarketAnalyzer:
 
         return sum(values) / len(values)
 
-    # ======================================================================
+    # ------------------------------------------------------------------
     # SYMBOL ANALYSIS
-    # ======================================================================
+    # ------------------------------------------------------------------
 
     def _analyze_symbol(
         self,
@@ -891,8 +821,7 @@ class MarketAnalyzer:
         if len(history) < minimum_smart:
 
             log.warning(
-                "NO_SIGNAL | "
-                "source=%s symbol=%s "
+                "NO_SIGNAL | source=%s symbol=%s "
                 "reason=INSUFFICIENT_VOLUME_HISTORY "
                 "history=%s/%s",
                 source,
@@ -903,15 +832,16 @@ class MarketAnalyzer:
 
             return None
 
-        # Latest CLOSED candle only.
         current_candle = history[-1]
 
         signal_key = (
             f"{source}:{symbol}"
         )
 
-        last_ot = self._last_signaled_open_time.get(
-            signal_key
+        last_ot = (
+            self._last_signaled_open_time.get(
+                signal_key
+            )
         )
 
         if (
@@ -930,10 +860,6 @@ class MarketAnalyzer:
         ):
             return None
 
-        # --------------------------------------------------------------
-        # 5m price change
-        # --------------------------------------------------------------
-
         candle_price_change = (
             (
                 current_candle.close
@@ -942,9 +868,9 @@ class MarketAnalyzer:
             / current_candle.open
         ) * 100.0
 
-        # ==============================================================
-        # SMART MONEY — PREVIOUS 48 CLOSED CANDLES
-        # ==============================================================
+        # --------------------------------------------------------------
+        # SMART MONEY — previous 48 CLOSED candles
+        # --------------------------------------------------------------
 
         baseline_48 = self._baseline_mean(
             history,
@@ -971,10 +897,8 @@ class MarketAnalyzer:
 
             is_smart_volume_spike = (
                 current_volume
-                >= (
-                    baseline_48
-                    * self.settings.volume_spike_ratio
-                )
+                >= baseline_48
+                * self.settings.volume_spike_ratio
             )
 
         else:
@@ -991,9 +915,9 @@ class MarketAnalyzer:
             and candle_price_change < 0
         )
 
-        # ==============================================================
-        # PUMP / DUMP — LONG HISTORY
-        # ==============================================================
+        # --------------------------------------------------------------
+        # PUMP / DUMP
+        # --------------------------------------------------------------
 
         pump_baseline_count = min(
             PUMP_HISTORY_CANDLES,
@@ -1026,19 +950,13 @@ class MarketAnalyzer:
 
             is_pump_volume_spike = (
                 current_volume
-                >= (
-                    baseline_72h
-                    * self.settings.volume_spike_ratio
-                )
+                >= baseline_72h
+                * self.settings.volume_spike_ratio
             )
 
         else:
 
             is_pump_volume_spike = False
-
-        # --------------------------------------------------------------
-        # Long history price movement
-        # --------------------------------------------------------------
 
         long_history = history[
             -PUMP_HISTORY_CANDLES:
@@ -1058,10 +976,6 @@ class MarketAnalyzer:
                 )
                 / long_history[-2].close
             ) * 100.0
-
-        # --------------------------------------------------------------
-        # Returns
-        # --------------------------------------------------------------
 
         long_returns: List[float] = []
 
@@ -1083,7 +997,7 @@ class MarketAnalyzer:
                 )
 
         # --------------------------------------------------------------
-        # Z-score
+        # Z-SCORE
         # --------------------------------------------------------------
 
         zscore = None
@@ -1113,9 +1027,9 @@ class MarketAnalyzer:
                         - mean
                     ) / stdev
 
-        # ==============================================================
-        # PUMP / DUMP CONDITIONS
-        # ==============================================================
+        # --------------------------------------------------------------
+        # STATIC PUMP / DUMP
+        # --------------------------------------------------------------
 
         static_pump = (
             is_pump_volume_spike
@@ -1155,9 +1069,9 @@ class MarketAnalyzer:
             or statistical_dump
         )
 
-        # ==============================================================
-        # SIGNAL SELECTION
-        # ==============================================================
+        # --------------------------------------------------------------
+        # SIGNAL CLASSIFICATION
+        # --------------------------------------------------------------
 
         if is_pump or is_dump:
 
@@ -1167,20 +1081,15 @@ class MarketAnalyzer:
                     SignalDirection.INFLOW
                 )
 
-                if (
-                    static_pump
-                    and statistical_pump
-                ):
-
-                    trigger = TriggerType.BOTH
-
-                elif statistical_pump:
-
-                    trigger = TriggerType.STATISTICAL
-
-                else:
-
-                    trigger = TriggerType.STATIC
+                trigger = (
+                    TriggerType.BOTH
+                    if static_pump and statistical_pump
+                    else (
+                        TriggerType.STATISTICAL
+                        if statistical_pump
+                        else TriggerType.STATIC
+                    )
+                )
 
             else:
 
@@ -1188,20 +1097,15 @@ class MarketAnalyzer:
                     SignalDirection.OUTFLOW
                 )
 
-                if (
-                    static_dump
-                    and statistical_dump
-                ):
-
-                    trigger = TriggerType.BOTH
-
-                elif statistical_dump:
-
-                    trigger = TriggerType.STATISTICAL
-
-                else:
-
-                    trigger = TriggerType.STATIC
+                trigger = (
+                    TriggerType.BOTH
+                    if static_dump and statistical_dump
+                    else (
+                        TriggerType.STATISTICAL
+                        if statistical_dump
+                        else TriggerType.STATIC
+                    )
+                )
 
             spike_multiplier = (
                 pump_spike
@@ -1255,17 +1159,11 @@ class MarketAnalyzer:
             ] = current_candle.open_time
 
             log.info(
-                "NO_SIGNAL | "
-                "source=%s symbol=%s "
+                "NO_SIGNAL | source=%s symbol=%s "
                 "reason=THRESHOLD_NOT_MET "
-                "vol=%.2f "
-                "baseline48=%s "
-                "spike48=%s "
-                "baseline72h=%s "
-                "spike72h=%s "
-                "required=%.2fX "
-                "price=%.2f%% "
-                "zscore=%s",
+                "vol=%.2f baseline48=%s spike48=%s "
+                "baseline72h=%s spike72h=%s "
+                "required=%.2fX price=%.2f%% zscore=%s",
                 source,
                 symbol,
                 current_volume,
@@ -1300,9 +1198,9 @@ class MarketAnalyzer:
 
             return None
 
-        # ==============================================================
+        # --------------------------------------------------------------
         # COOLDOWN
-        # ==============================================================
+        # --------------------------------------------------------------
 
         cooldown_key = (
             f"market:{source}:{symbol}"
@@ -1319,9 +1217,9 @@ class MarketAnalyzer:
 
             return None
 
-        # ==============================================================
-        # SIGNAL DATA
-        # ==============================================================
+        # --------------------------------------------------------------
+        # PRICE
+        # --------------------------------------------------------------
 
         try:
 
@@ -1345,6 +1243,10 @@ class MarketAnalyzer:
         except (TypeError, ValueError):
 
             change_24h = 0.0
+
+        # --------------------------------------------------------------
+        # CREATE SIGNAL
+        # --------------------------------------------------------------
 
         signal = MarketSignal(
             symbol=symbol,
@@ -1370,8 +1272,8 @@ class MarketAnalyzer:
 
         log.warning(
             "SIGNAL FIRED | "
-            "source=%s symbol=%s "
-            "path=%s direction=%s trigger=%s "
+            "source=%s symbol=%s path=%s "
+            "direction=%s trigger=%s "
             "volume=%.2f baseline=%.2f "
             "spike=%.2fX inflow=%.2f "
             "price=%.2f%% zscore=%s",
@@ -1394,9 +1296,9 @@ class MarketAnalyzer:
 
         return signal
 
-    # ======================================================================
+    # ------------------------------------------------------------------
     # STATUS
-    # ======================================================================
+    # ------------------------------------------------------------------
 
     def build_status_message(
         self,
