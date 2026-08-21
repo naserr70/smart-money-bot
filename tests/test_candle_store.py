@@ -37,8 +37,9 @@ class CandleStoreTests(unittest.TestCase):
         store = CandleStore(tempfile.mkdtemp(), max_candles=3)
         candles = [self.candle(60 + i * 5, 100 + i) for i in range(5)]
         store.seed("binance", "BTCUSDT", candles)
-        self.assertEqual(store.count("binance", "BTCUSDT"), 3)
-        self.assertEqual(store.get_closed("binance", "BTCUSDT")[-1].quote_volume, 104)
+        history = store.get_closed("binance", "BTCUSDT")
+        self.assertEqual(len(history), 3)
+        self.assertEqual([c.quote_volume for c in history], [104, 103, 102])
 
 
 if __name__ == "__main__":
