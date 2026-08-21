@@ -211,7 +211,7 @@ class Settings:
         default_factory=lambda:
         _env_float(
             "VOLUME_SPIKE_RATIO",
-            2.0,
+            3.0,
         )
     )
 
@@ -524,7 +524,7 @@ class Settings:
         default_factory=lambda:
         _env_float(
             "VOLUME_SIGNAL_MULTIPLIER",
-            2.0,
+            3.0,
         )
     )
 

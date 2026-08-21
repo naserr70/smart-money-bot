@@ -398,13 +398,13 @@ def market_loop():
                     targets,
                 )
 
-                notifier.broadcast_chunked(
-                    [
-                        signal.to_telegram()
-                        for signal in signals
-                    ],
-                    targets,
-                )
+                # Each signal is sent as its own Telegram message
+                # (no batching of multiple signals into one message).
+                for signal in signals:
+                    notifier.broadcast(
+                        signal.to_telegram(),
+                        targets,
+                    )
 
             else:
 
@@ -529,13 +529,12 @@ def whale_loop():
 
             if signals:
 
-                notifier.broadcast_chunked(
-                    [
-                        signal.to_telegram()
-                        for signal in signals
-                    ],
-                    targets,
-                )
+                # Each whale signal is sent as its own Telegram message.
+                for signal in signals:
+                    notifier.broadcast(
+                        signal.to_telegram(),
+                        targets,
+                    )
 
             else:
 
@@ -938,4 +937,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
-
