@@ -18,6 +18,9 @@ free GitHub Gist instead of (or in addition to) a local file:
     (works fine on any host with real persistent disk; on Render's free
     tier it will keep resetting on restart, exactly as before).
 
+Also stores a permanent "startup_announced" flag so the one-time
+welcome message is never re-sent after the very first successful start.
+
 Expiry is checked lazily (at authorization-check time and at broadcast
 time) rather than via a background sweep thread — simpler, and just as
 correct at this scale.
@@ -56,6 +59,8 @@ class AccessControl:
         # password(str) -> {"days": float|None, "created_at": iso, "label": str,
         #                    "used_by": chat_id|None, "used_at": iso|None}
         self._invites: Dict[str, dict] = {}
+        # Permanent flags that must survive restarts (e.g. first-start announce)
+        self._flags: Dict[str, bool] = {}
         self._load()
 
     # ==================== persistence backends ====================
@@ -72,6 +77,7 @@ class AccessControl:
             if data is not None:
                 self._users = data.get("users", {})
                 self._invites = data.get("invites", {})
+                self._flags = data.get("flags", {}) or {}
                 log.info(f"{len(self._users)} کاربر و {len(self._invites)} رمز دعوت از GitHub Gist بازیابی شد.")
                 return
             log.warning("بازیابی از GitHub Gist ناموفق بود؛ به فایل محلی برمی‌گردم (ممکن است خالی باشد).")
@@ -92,7 +98,7 @@ class AccessControl:
             files = res.json().get("files", {})
             file_entry = files.get(GIST_FILENAME)
             if not file_entry:
-                return {"users": {}, "invites": {}}  # gist exists but this file isn't in it yet
+                return {"users": {}, "invites": {}, "flags": {}}
             return json.loads(file_entry.get("content") or "{}")
         except (requests.RequestException, ValueError) as e:
             log.warning(f"خطا در خواندن GitHub Gist: {e}")
@@ -100,7 +106,11 @@ class AccessControl:
 
     def _gist_save(self) -> None:
         with self._lock:
-            content = json.dumps({"users": self._users, "invites": self._invites}, ensure_ascii=False, indent=2)
+            content = json.dumps({
+                "users": self._users,
+                "invites": self._invites,
+                "flags": self._flags,
+            }, ensure_ascii=False, indent=2)
         payload = {"files": {GIST_FILENAME: {"content": content}}}
         try:
             res = self._http.patch(f"{GIST_API_BASE}/{self._gist_id}", headers=self._gist_headers(),
@@ -118,6 +128,7 @@ class AccessControl:
                 data = json.load(f)
             self._users = data.get("users", {})
             self._invites = data.get("invites", {})
+            self._flags = data.get("flags", {}) or {}
             log.info(f"{len(self._users)} کاربر و {len(self._invites)} رمز دعوت از فایل محلی بازیابی شد.")
         except (OSError, json.JSONDecodeError) as e:
             log.warning(f"بازیابی لیست کاربران مجاز از فایل محلی ناموفق بود: {e}")
@@ -126,7 +137,11 @@ class AccessControl:
         if not self._state_file_path:
             return
         with self._lock:
-            payload = {"users": self._users, "invites": self._invites}
+            payload = {
+                "users": self._users,
+                "invites": self._invites,
+                "flags": self._flags,
+            }
         tmp_path = f"{self._state_file_path}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -134,6 +149,17 @@ class AccessControl:
             os.replace(tmp_path, self._state_file_path)
         except OSError as e:
             log.warning(f"ذخیره‌ی لیست کاربران مجاز در فایل محلی ناموفق بود: {e}")
+
+    # ==================== permanent flags ====================
+
+    def is_startup_announced(self) -> bool:
+        with self._lock:
+            return bool(self._flags.get("startup_announced"))
+
+    def mark_startup_announced(self) -> None:
+        with self._lock:
+            self._flags["startup_announced"] = True
+        self._persist()
 
     # ==================== users ====================
 
