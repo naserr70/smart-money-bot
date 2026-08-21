@@ -251,3 +251,4 @@ class ExchangeFlowSignal:
         ]
 
         return "\n".join(lines)
+
