@@ -117,7 +117,67 @@ class GitHubCandleBackup:
         try:
             data = response.json()
             encoded = data.get("content", "").replace("\n", "")
-            return json.loads(base64.b64decode(encoded).decode("utf-8"))
+            payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
+            if not isinstance(payload, dict):
+                return None
+
+            # Normalize old persisted files: only CLOSED candles belong in
+            # `candles`; the currently-open 5m candle belongs in `current`.
+            # This also repairs histories written by older bot versions.
+            now_ms = int(time.time() * 1000)
+            raw_candles = payload.get("candles") or []
+            parsed = []
+            for item in raw_candles:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    parsed.append({
+                        "open_time": int(item["open_time"]),
+                        "close_time": int(item["close_time"]),
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
+                        "volume": float(item["volume"]),
+                        "quote_volume": float(item["quote_volume"]),
+                        "trades": int(item.get("trades", 0)),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            unique = {item["open_time"]: item for item in parsed}
+            parsed = sorted(unique.values(), key=lambda item: item["open_time"])
+            closed = [item for item in parsed if item["close_time"] < now_ms]
+            active = [item for item in parsed if item["close_time"] >= now_ms]
+
+            current = payload.get("current")
+            if isinstance(current, dict):
+                try:
+                    current = {
+                        "open_time": int(current["open_time"]),
+                        "close_time": int(current["close_time"]),
+                        "open": float(current["open"]),
+                        "high": float(current["high"]),
+                        "low": float(current["low"]),
+                        "close": float(current["close"]),
+                        "volume": float(current["volume"]),
+                        "quote_volume": float(current["quote_volume"]),
+                        "trades": int(current.get("trades", 0)),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    current = None
+            else:
+                current = None
+
+            if active:
+                newest_active = max(active, key=lambda item: item["open_time"])
+                if current is None or newest_active["open_time"] > current["open_time"]:
+                    current = newest_active
+
+            payload["candles"] = closed[-864:]
+            payload["current"] = current
+            payload["max_candles"] = 864
+            return payload
         except (ValueError, TypeError, KeyError, base64.binascii.Error, UnicodeDecodeError) as exc:
             log.warning("GITHUB DOWNLOAD INVALID | path=%s error=%s", path, exc)
             return None
@@ -125,11 +185,10 @@ class GitHubCandleBackup:
     def backup(self) -> bool:
         """Persist every queued candle file in one Git tree commit.
 
-        The previous implementation committed only the first 20 queued files.
-        On an ephemeral Render restart the in-memory remainder was lost, which
-        caused the next boot to download those histories from the exchanges
-        again. A startup backup must drain the complete pending queue before
-        reporting success.
+        The old implementation committed only the first 20 queued files.
+        On an ephemeral Render restart the in-memory remainder disappeared,
+        so the next boot downloaded those histories again. A successful
+        startup backup now drains the complete queue.
         """
         if not self.is_configured():
             return False
@@ -145,7 +204,6 @@ class GitHubCandleBackup:
             if ref.status_code != 200:
                 raise RuntimeError(f"ref lookup HTTP {ref.status_code}: {ref.text[:200]}")
             head_sha = ref.json()["object"]["sha"]
-
             commit = self._request("GET", self._url(f"git/commits/{head_sha}"))
             if commit.status_code != 200:
                 raise RuntimeError(f"commit lookup HTTP {commit.status_code}: {commit.text[:200]}")
@@ -154,22 +212,17 @@ class GitHubCandleBackup:
             tree_entries = []
             for path, content in items:
                 blob = self._request(
-                    "POST",
-                    self._url("git/blobs"),
+                    "POST", self._url("git/blobs"),
                     json={"content": content, "encoding": "utf-8"},
                 )
                 if blob.status_code not in (200, 201):
                     raise RuntimeError(f"blob create HTTP {blob.status_code}: {blob.text[:200]}")
                 tree_entries.append({
-                    "path": path,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": blob.json()["sha"],
+                    "path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]
                 })
 
             tree = self._request(
-                "POST",
-                self._url("git/trees"),
+                "POST", self._url("git/trees"),
                 json={"base_tree": base_tree, "tree": tree_entries},
             )
             if tree.status_code not in (200, 201):
@@ -177,8 +230,7 @@ class GitHubCandleBackup:
             tree_sha = tree.json()["sha"]
 
             new_commit = self._request(
-                "POST",
-                self._url("git/commits"),
+                "POST", self._url("git/commits"),
                 json={
                     "message": f"chore: persist candle history ({len(items)} files)",
                     "tree": tree_sha,
@@ -190,8 +242,7 @@ class GitHubCandleBackup:
             commit_sha = new_commit.json()["sha"]
 
             update = self._request(
-                "PATCH",
-                self._url(f"git/refs/heads/{self.branch}"),
+                "PATCH", self._url(f"git/refs/heads/{self.branch}"),
                 json={"sha": commit_sha, "force": False},
             )
             if update.status_code != 200:
@@ -209,12 +260,9 @@ class GitHubCandleBackup:
 
             log.info(
                 "GITHUB BACKUP OK | files=%s commit=%s pending=%s",
-                len(items),
-                commit_sha[:12],
-                self.pending_count(),
+                len(items), commit_sha[:12], self.pending_count(),
             )
             return True
-
         except Exception as exc:
             with self._lock:
                 self._last_backup_ok = False
