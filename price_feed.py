@@ -515,3 +515,4 @@ class PriceFeed:
                 result[address] = price
 
         return result
+        
