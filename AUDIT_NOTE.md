@@ -1,1 +1,0 @@
-Initial architecture audit started on 2026-08-21. This file is temporary and will be removed before the final PR.
