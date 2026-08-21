@@ -460,7 +460,7 @@ class Settings:
         default_factory=lambda:
         _env_int(
             "GITHUB_MAX_FILES_PER_SYNC",
-            0,
+            20,
         )
     )
 
