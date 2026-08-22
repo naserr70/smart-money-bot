@@ -28,7 +28,7 @@ class TelegramNotifier:
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=frozenset(["GET", "POST"]),
         )
-        session.mount("https://", HTTPAdapter(max_retries=max_retries))
+        session.mount("https://", HTTPAdapter(max_retries=retries))
         session.headers.update({"User-Agent": "SmartMoneyBot/2.0"})
         return session
 
