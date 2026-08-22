@@ -18,13 +18,9 @@ from telegram_notifier import TelegramNotifier
 
 log = logging.getLogger("smart_money_bot.bot_commands")
 
-# admin_chat_id -> {"action": str, ...}
 _pending: Dict[str, dict] = {}
-
 CANCEL_WORDS = {"لغو", "cancel", "/cancel"}
 
-
-# ==================== menu builders ====================
 
 def _signal_control_text(access: AccessControl) -> str:
     smart = access.is_signal_enabled("smart_money")
@@ -122,7 +118,6 @@ def _users_list_text(access: AccessControl) -> str:
             label = entry.get("label") or ""
             label_part = f" ({esc(label)})" if label else ""
             lines.append(f"<code>{esc(chat_id)}</code>{label_part} — تا <code>{esc(expires_at)}</code>")
-
     invites = access.list_unused_invites()
     if invites:
         lines.append("\n🔑 <b>رمزهای ساخته‌شده و هنوز استفاده‌نشده:</b>\n")
@@ -140,17 +135,14 @@ def _broadcast_targets(settings: Settings, access: AccessControl):
 
 
 def _broadcast_custom_message(text: str, settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
-    """Sends an admin-authored message to every currently-active target."""
     targets = _broadcast_targets(settings, access)
     if not targets:
         return "📤 هیچ گیرنده‌ی فعالی (حتی ادمین) پیدا نشد — چیزی برای ارسال نیست."
-
     message_text = f"📢 <b>پیام از ادمین:</b>\n\n{esc(text)}"
     ok, failed = [], []
     for target in targets:
         msg_id = notifier.send(message_text, chat_id=target)
         (ok if msg_id else failed).append(target)
-
     lines = [f"📤 <b>نتیجه‌ی ارسال</b> ({len(ok)}/{len(targets)} موفق):\n"]
     if failed:
         lines.append("❌ <b>ناموفق برای:</b> " + ", ".join(f"<code>{esc(t)}</code>" for t in failed))
@@ -169,7 +161,7 @@ def _send_test_signal(settings: Settings, access: AccessControl, notifier: Teleg
     targets = _broadcast_targets(settings, access)
     if not targets:
         return "هیچ گیرنده‌ی فعالی پیدا نشد."
-    notifier.broadcast_chunked([fake_signal.to_telegram()], targets)
+    notifier.broadcast_chunked([fake_signal.to_telegram()], targets, respect_signal_control=False)
     recipients = "\n".join(f"• <code>{esc(t)}</code>" for t in targets)
     return (
         f"🧪 یک سیگنال آزمایشی، دقیقاً از همون کدی که سیگنال‌های واقعی رد می‌شن، "
@@ -179,19 +171,15 @@ def _send_test_signal(settings: Settings, access: AccessControl, notifier: Teleg
     )
 
 
-# ==================== top-level dispatch ====================
-
 def handle_update(update: dict, settings: Settings, access: AccessControl, notifier: TelegramNotifier,
                    admin_status_provider: Optional[Callable[[], str]] = None) -> None:
     if "callback_query" in update:
         _handle_callback_query(update["callback_query"], settings, access, notifier, admin_status_provider)
         return
-
     message = update.get("message") or update.get("edited_message")
     if not message:
         log.info(f"نوع آپدیت پشتیبانی‌نشده نادیده گرفته شد: {list(update.keys())}")
         return
-
     chat = message.get("chat", {})
     raw_chat_id = chat.get("id")
     if raw_chat_id is None:
@@ -201,16 +189,13 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
     message_id = message.get("message_id")
     if not text:
         return
-
     is_admin = access.is_admin(chat_id)
     log.info(f"پیام از chat_id={chat_id} is_admin={is_admin} admin_chat_id_resolved={settings.admin_chat_id_resolved!r} text={text[:40]!r}")
     pending = _pending.get(chat_id)
-
     if text in CANCEL_WORDS and pending:
         _pending.pop(chat_id, None)
         notifier.send("لغو شد.", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
         return
-
     if is_admin and pending:
         if pending["action"] == "awaiting_invite_password":
             pending["action"], pending["password"] = "awaiting_invite_days", text
@@ -228,13 +213,11 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
             result_text = _broadcast_custom_message(text, settings, access, notifier)
             notifier.send(result_text, chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
             return
-
     if text in ("/start", "/menu"):
         already = access.is_authorized(chat_id)
         notifier.send(_welcome_text(settings, already, access.expiry_text(chat_id)), chat_id=chat_id,
                       reply_markup=_main_menu_markup(is_admin, access) if already else None)
         return
-
     if is_admin and text.startswith("/grant"):
         _legacy_grant(text, chat_id, access, notifier)
         return
@@ -244,7 +227,6 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
     if is_admin and text.startswith("/users"):
         notifier.send(_users_list_text(access), chat_id=chat_id, reply_markup=_back_markup())
         return
-
     if not access.is_authorized(chat_id):
         found, days = access.consume_invite(text, chat_id)
         if found:
@@ -259,7 +241,6 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
         if message_id:
             notifier.delete(message_id, chat_id=chat_id)
         return
-
     notifier.send("از منوی زیر استفاده کنید 👇", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
 
 
@@ -280,21 +261,16 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     message = callback.get("message", {}) or {}
     chat_id = str(message.get("chat", {}).get("id", ""))
     message_id = message.get("message_id")
-
     notifier.answer_callback_query(callback_id)
-
     if not chat_id or not message_id:
         log.warning(f"callback_query بدون chat_id/message_id قابل استفاده نادیده گرفته شد: data={data!r}")
         return
-
     if not access.is_authorized(chat_id):
         log.info(f"callback از chat_id غیرمجاز رد شد: {chat_id}")
         notifier.edit_message(chat_id, message_id, "🔒 دسترسی شما فعال نیست. لطفاً ابتدا رمز عبور را ارسال کنید.")
         return
-
     is_admin = access.is_admin(chat_id)
     log.info(f"callback data={data!r} از chat_id={chat_id} is_admin={is_admin}")
-
     if data == "info":
         notifier.edit_message(chat_id, message_id, _info_text(chat_id, access), reply_markup=_back_markup())
         return
@@ -307,13 +283,10 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         _pending.pop(chat_id, None)
         notifier.edit_message(chat_id, message_id, "لغو شد.", reply_markup=_main_menu_markup(is_admin, access))
         return
-
     if not is_admin:
         log.info(f"دسترسی ادمین رد شد برای chat_id={chat_id} (admin_chat_id_resolved={settings.admin_chat_id_resolved!r})")
         notifier.edit_message(chat_id, message_id, "⛔ این بخش فقط برای ادمین است.", reply_markup=_back_markup())
         return
-
-    # ---------- admin-only callbacks ----------
     if data == "admin_users":
         notifier.edit_message(chat_id, message_id, _users_list_text(access), reply_markup=_back_markup())
         return
@@ -346,18 +319,15 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         return
     if data == "admin_testsend":
         _pending[chat_id] = {"action": "awaiting_broadcast_message"}
-        notifier.edit_message(
-            chat_id, message_id,
-            "📝 پیامی که می‌خواهید برای همه‌ی کاربران فعال ارسال شود را بنویسید:",
-            reply_markup=_cancel_markup(),
-        )
+        notifier.edit_message(chat_id, message_id,
+                              "📝 پیامی که می‌خواهید برای همه‌ی کاربران فعال ارسال شود را بنویسید:",
+                              reply_markup=_cancel_markup())
         return
     if data == "admin_testsignal":
         notifier.edit_message(chat_id, message_id, "⏳ در حال ارسال سیگنال تستی...")
         result_text = _send_test_signal(settings, access, notifier)
         notifier.edit_message(chat_id, message_id, result_text, reply_markup=_back_markup())
         return
-
     if data == "admin_grant":
         _pending[chat_id] = {"action": "awaiting_invite_password"}
         notifier.edit_message(
@@ -373,7 +343,6 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         notifier.edit_message(chat_id, message_id, "🆔 شناسه چت کاربری که می‌خواهید دسترسی‌اش را حذف کنید ارسال کنید:",
                               reply_markup=_cancel_markup())
         return
-
     if data.startswith("invitedays:"):
         pending = _pending.get(chat_id)
         if not pending or pending.get("action") != "awaiting_invite_days":
@@ -394,8 +363,6 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         )
         return
 
-
-# ==================== legacy text-command helpers (direct chat_id grant) ====================
 
 def _legacy_grant(text: str, admin_chat_id: str, access: AccessControl, notifier: TelegramNotifier) -> None:
     parts = text.split()
