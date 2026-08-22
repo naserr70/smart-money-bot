@@ -62,9 +62,6 @@ log = logging.getLogger("smart_money_bot")
 
 INSTANCE_ID = uuid.uuid4().hex[:8]
 
-STARTUP_ANNOUNCE_KEY = "bot_startup_announce"
-STARTUP_ANNOUNCE_TTL_SEC = 30 * 365 * 24 * 3600
-
 log.info(
     "SMART MONEY BOT START | instance_id=%s",
     INSTANCE_ID,
@@ -203,10 +200,7 @@ def broadcast_targets():
 
 def send_startup_announcement_once() -> None:
 
-    if state.is_in_cooldown(
-        STARTUP_ANNOUNCE_KEY,
-        STARTUP_ANNOUNCE_TTL_SEC,
-    ):
+    if access.is_startup_announced():
         log.info(
             "STARTUP ANNOUNCE SKIPPED | already sent previously"
         )
@@ -221,12 +215,7 @@ def send_startup_announcement_once() -> None:
             ),
             broadcast_targets(),
         )
-        state.mark_alerted(STARTUP_ANNOUNCE_KEY)
-        try:
-            state.save()
-        except Exception:
-            log.exception("STARTUP ANNOUNCE STATE SAVE FAILED")
-
+        access.mark_startup_announced()
         log.info("STARTUP ANNOUNCE SENT")
 
     except Exception:
