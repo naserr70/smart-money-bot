@@ -59,7 +59,16 @@ def _main_menu_markup(is_admin: bool, access: Optional[AccessControl] = None) ->
                      {"text": "➖ حذف دسترسی", "callback_data": "admin_revoke"}])
         rows.append([{"text": "📢 ارسال پیام به همه", "callback_data": "admin_testsend"},
                      {"text": "🧪 تست سیگنال", "callback_data": "admin_testsignal"}])
-        rows.append([{"text": "🎛 کنترل پیام‌های سیگنال", "callback_data": "admin_signal_controls"}])
+        smart = access.is_signal_enabled("smart_money") if access else True
+        whale = access.is_signal_enabled("whale") if access else True
+        pump = access.is_signal_enabled("pump_dump") if access else True
+        rows.append([
+            {"text": f"💰 پول هوشمند {'🟢' if smart else '🔴'}", "callback_data": "admin_toggle_smart_money"},
+            {"text": f"🐋 نهنگ {'🟢' if whale else '🔴'}", "callback_data": "admin_toggle_whale"},
+        ])
+        rows.append([
+            {"text": f"🚀 پامپ/دامپ {'🟢' if pump else '🔴'}", "callback_data": "admin_toggle_pump_dump"},
+        ])
     return {"inline_keyboard": rows}
 
 
@@ -314,7 +323,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
             chat_id, message_id,
             f"{'🟢 فعال شد' if enabled else '🔴 غیرفعال شد'}\n\n"
             f"دریافت پیام «{labels[category]}» اکنون {'فعال' if enabled else 'غیرفعال'} است.",
-            reply_markup=_signal_control_markup(access),
+            reply_markup=_main_menu_markup(True, access),
         )
         return
     if data == "admin_testsend":
