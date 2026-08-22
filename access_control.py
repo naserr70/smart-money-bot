@@ -5,29 +5,13 @@ per user — the "give the bot to someone for a set amount of time"
 requirement, plus admin-defined unique per-user invite passwords.
 
 Persistence: Render's free web-service plan wipes local disk on every
-restart/spin-down (this bit us repeatedly in practice — grants would
-silently disappear a few minutes after being made). To fix that WITHOUT
-needing a paid Render Persistent Disk, this class can sync its state to a
-free GitHub Gist instead of (or in addition to) a local file:
-
-  - If GITHUB_GIST_ID + GITHUB_GIST_TOKEN are set, every grant/revoke/
-    invite-creation is written straight to that Gist, and state is loaded
-    from the Gist at startup — this survives restarts because the Gist
-    lives outside the container entirely.
-  - If they're not set, falls back to the original local-file behavior
-    (works fine on any host with real persistent disk; on Render's free
-    tier it will keep resetting on restart, exactly as before).
-
-Also stores a permanent "startup_announced" flag so the one-time
-welcome message is never re-sent after the very first successful start.
-
-Expiry is checked lazily (at authorization-check time and at broadcast
-time) rather than via a background sweep thread — simpler, and just as
-correct at this scale.
+restart/spin-down. To keep grants and admin controls across restarts, this
+class can sync its state to a free GitHub Gist instead of (or in addition to)
+a local file.
 
 This module is intentionally UI-agnostic: it only tracks state and answers
-"is this chat_id currently allowed in?". The actual Telegram command
-parsing (/start, /grant, password text, etc.) lives in bot_commands.py.
+"is this chat_id currently allowed in?". The actual Telegram command parsing
+lives in bot_commands.py.
 """
 import json
 import logging
@@ -54,12 +38,10 @@ class AccessControl:
         self._gist_token = gist_token
         self._http = http_session or requests.Session()
 
-        # chat_id(str) -> {"granted_at": iso, "expires_at": iso|None, "label": str}
         self._users: Dict[str, dict] = {}
-        # password(str) -> {"days": float|None, "created_at": iso, "label": str,
-        #                    "used_by": chat_id|None, "used_at": iso|None}
         self._invites: Dict[str, dict] = {}
-        # Permanent flags that must survive restarts (e.g. first-start announce)
+        # Permanent flags that must survive restarts (e.g. first-start announce
+        # and the admin's per-category Telegram signal delivery controls).
         self._flags: Dict[str, bool] = {}
         self._load()
 
@@ -160,6 +142,34 @@ class AccessControl:
         with self._lock:
             self._flags["startup_announced"] = True
         self._persist()
+
+    # ==================== Telegram signal delivery controls ====================
+
+    SIGNAL_CONTROL_DEFAULTS = {
+        "smart_money": True,
+        "whale": True,
+        "pump_dump": True,
+    }
+
+    def is_signal_enabled(self, category: str) -> bool:
+        default = self.SIGNAL_CONTROL_DEFAULTS.get(category, True)
+        with self._lock:
+            return bool(self._flags.get(f"signal_{category}", default))
+
+    def set_signal_enabled(self, category: str, enabled: bool) -> bool:
+        if category not in self.SIGNAL_CONTROL_DEFAULTS:
+            raise ValueError(f"unknown signal category: {category}")
+        enabled = bool(enabled)
+        with self._lock:
+            self._flags[f"signal_{category}"] = enabled
+        self._persist()
+        return enabled
+
+    def toggle_signal(self, category: str) -> bool:
+        return self.set_signal_enabled(category, not self.is_signal_enabled(category))
+
+    def signal_controls(self) -> Dict[str, bool]:
+        return {category: self.is_signal_enabled(category) for category in self.SIGNAL_CONTROL_DEFAULTS}
 
     # ==================== users ====================
 
