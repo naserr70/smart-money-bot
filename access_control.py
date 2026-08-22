@@ -27,8 +27,24 @@ log = logging.getLogger("smart_money_bot.access_control")
 GIST_API_BASE = "https://api.github.com/gists"
 GIST_FILENAME = "smart_money_bot_access.json"
 
+_SIGNAL_DELIVERY_STATE = {
+    "smart_money": True,
+    "whale": True,
+    "pump_dump": True,
+}
+
+
+def signal_delivery_enabled(category: str) -> bool:
+    return bool(_SIGNAL_DELIVERY_STATE.get(category, True))
+
 
 class AccessControl:
+    SIGNAL_CONTROL_DEFAULTS = {
+        "smart_money": True,
+        "whale": True,
+        "pump_dump": True,
+    }
+
     def __init__(self, state_file_path: str, admin_chat_id: str,
                  gist_id: str = "", gist_token: str = "", http_session: requests.Session = None):
         self._lock = threading.RLock()
@@ -44,6 +60,7 @@ class AccessControl:
         # and the admin's per-category Telegram signal delivery controls).
         self._flags: Dict[str, bool] = {}
         self._load()
+        self._sync_signal_delivery_state()
 
     # ==================== persistence backends ====================
 
@@ -145,11 +162,11 @@ class AccessControl:
 
     # ==================== Telegram signal delivery controls ====================
 
-    SIGNAL_CONTROL_DEFAULTS = {
-        "smart_money": True,
-        "whale": True,
-        "pump_dump": True,
-    }
+    def _sync_signal_delivery_state(self) -> None:
+        for category, default in self.SIGNAL_CONTROL_DEFAULTS.items():
+            _SIGNAL_DELIVERY_STATE[category] = bool(
+                self._flags.get(f"signal_{category}", default)
+            )
 
     def is_signal_enabled(self, category: str) -> bool:
         default = self.SIGNAL_CONTROL_DEFAULTS.get(category, True)
@@ -162,6 +179,7 @@ class AccessControl:
         enabled = bool(enabled)
         with self._lock:
             self._flags[f"signal_{category}"] = enabled
+            _SIGNAL_DELIVERY_STATE[category] = enabled
         self._persist()
         return enabled
 
