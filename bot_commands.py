@@ -1,43 +1,11 @@
 """
 Persian inline-button menu + command handling for incoming Telegram
 updates (via webhook — see main.py's /telegram/webhook route).
-access_control.py just tracks state; this is the only place that builds UI
-or parses user input.
+access_control.py tracks state; this is the place that builds UI or parses
+user input.
 
-Menu (available to everyone once authorized):
-  📊 اطلاعات من — shows role, join date, expiry, days remaining
-
-Admin-only menu items (admin = ADMIN_CHAT_ID / defaults to CHAT_ID):
-  👥 لیست کاربران   — list every active user + any unused invite passwords
-  📈 وضعیت ربات     — bot health (last cycle times, errors, active users)
-  ➕ اعطای دسترسی   — create a UNIQUE password for one person, with its own
-                       access duration, without needing to know their
-                       chat_id in advance. They redeem it themselves by
-                       sending that password to the bot.
-  ➖ حذف دسترسی     — revoke an already-authorized user's access (by chat_id)
-  📢 ارسال پیام به همه — admin types any message, it's sent to every active
-                       user right now (also doubles as a delivery test)
-  🧪 تست سیگنال      — pushes a fake signal through the exact same
-                       to_telegram()+broadcast_chunked path real signals use
-
-Old-style text commands (/grant <chat_id> <days>, /revoke, /users) still
-work too, for anyone who prefers typing and already knows a chat_id.
-
-Messages use Telegram's HTML parse_mode — every non-literal string (a
-password the admin typed, a Telegram username, a chat_id string, etc.) goes
-through formatting.esc() before being interpolated, so a value containing
-'<' or '&' can't break message parsing the way unescaped Markdown
-characters used to ("can't parse entities").
-
-Multi-step admin flows track a small amount of per-admin in-memory "what
-are we waiting for" state in `_pending`. This is NOT persisted across
-restarts — if the service restarts mid-flow, the admin just taps the
-button again.
-
-Every admin-gate check logs its outcome (chat_id + result) — if a button
-looks unresponsive, the Render logs will show exactly whether the request
-even arrived and what `is_admin` resolved to, which is almost always a
-mismatched ADMIN_CHAT_ID rather than a code bug.
+Admin-only signal controls are separate from the analysis engines: they only
+control which already-generated signal categories are delivered to Telegram.
 """
 import logging
 from typing import Callable, Dict, Optional
@@ -58,7 +26,35 @@ CANCEL_WORDS = {"لغو", "cancel", "/cancel"}
 
 # ==================== menu builders ====================
 
-def _main_menu_markup(is_admin: bool) -> dict:
+def _signal_control_text(access: AccessControl) -> str:
+    smart = access.is_signal_enabled("smart_money")
+    whale = access.is_signal_enabled("whale")
+    pump = access.is_signal_enabled("pump_dump")
+    return (
+        "🎛 <b>کنترل پیام‌های سیگنال</b>\n\n"
+        "🟢 = پیام ارسال می‌شود\n"
+        "🔴 = پیام ارسال نمی‌شود\n\n"
+        f"💰 ورود/خروج پول هوشمند: {'🟢 فعال' if smart else '🔴 غیرفعال'}\n"
+        f"🐋 واریز/برداشت نهنگ: {'🟢 فعال' if whale else '🔴 غیرفعال'}\n"
+        f"🚀 پامپ/دامپ: {'🟢 فعال' if pump else '🔴 غیرفعال'}\n\n"
+        "با زدن هر دکمه، فقط ارسال همان دسته روشن/خاموش می‌شود؛ "
+        "خود تحلیل و جمع‌آوری داده متوقف نمی‌شود."
+    )
+
+
+def _signal_control_markup(access: AccessControl) -> dict:
+    smart = access.is_signal_enabled("smart_money")
+    whale = access.is_signal_enabled("whale")
+    pump = access.is_signal_enabled("pump_dump")
+    return {"inline_keyboard": [
+        [{"text": f"💰 پول هوشمند {'🟢' if smart else '🔴'}", "callback_data": "admin_toggle_smart_money"}],
+        [{"text": f"🐋 نهنگ {'🟢' if whale else '🔴'}", "callback_data": "admin_toggle_whale"}],
+        [{"text": f"🚀 پامپ/دامپ {'🟢' if pump else '🔴'}", "callback_data": "admin_toggle_pump_dump"}],
+        [{"text": "🔙 بازگشت به منو", "callback_data": "back"}],
+    ]}
+
+
+def _main_menu_markup(is_admin: bool, access: Optional[AccessControl] = None) -> dict:
     rows = [[{"text": "📊 اطلاعات من", "callback_data": "info"}]]
     if is_admin:
         rows.append([{"text": "👥 لیست کاربران", "callback_data": "admin_users"},
@@ -67,6 +63,7 @@ def _main_menu_markup(is_admin: bool) -> dict:
                      {"text": "➖ حذف دسترسی", "callback_data": "admin_revoke"}])
         rows.append([{"text": "📢 ارسال پیام به همه", "callback_data": "admin_testsend"},
                      {"text": "🧪 تست سیگنال", "callback_data": "admin_testsignal"}])
+        rows.append([{"text": "🎛 کنترل پیام‌های سیگنال", "callback_data": "admin_signal_controls"}])
     return {"inline_keyboard": rows}
 
 
@@ -143,10 +140,7 @@ def _broadcast_targets(settings: Settings, access: AccessControl):
 
 
 def _broadcast_custom_message(text: str, settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
-    """Sends an admin-authored message to every currently-active target
-    RIGHT NOW and reports exactly which chat_ids succeeded and which
-    failed — this doubles as a delivery diagnostic (like the old fixed
-    test message did) while also being an actual announcement tool."""
+    """Sends an admin-authored message to every currently-active target."""
     targets = _broadcast_targets(settings, access)
     if not targets:
         return "📤 هیچ گیرنده‌ی فعالی (حتی ادمین) پیدا نشد — چیزی برای ارسال نیست."
@@ -160,23 +154,13 @@ def _broadcast_custom_message(text: str, settings: Settings, access: AccessContr
     lines = [f"📤 <b>نتیجه‌ی ارسال</b> ({len(ok)}/{len(targets)} موفق):\n"]
     if failed:
         lines.append("❌ <b>ناموفق برای:</b> " + ", ".join(f"<code>{esc(t)}</code>" for t in failed))
-        lines.append("\nدلیل دقیق هرکدوم رو توی لاگ Render، دنبال همین chat_id بگرد (خط «تلگرام خطای HTTP ...»). "
-                     "علت رایج: آن کاربر هرگز مستقیماً با ربات /start نزده، یا ربات را بلاک کرده.")
+        lines.append("\nدلیل دقیق هرکدوم رو توی لاگ Render، دنبال همین chat_id بگرد (خط «تلگرام خطای HTTP ...»). علت رایج: آن کاربر هرگز مستقیماً با ربات /start نزده، یا ربات را بلاک کرده.")
     else:
         lines.append("✅ به همه با موفقیت ارسال شد.")
     return "\n".join(lines)
 
 
 def _send_test_signal(settings: Settings, access: AccessControl, notifier: TelegramNotifier) -> str:
-    """Builds a fake-but-realistic MarketSignal and pushes it through
-    to_telegram() + broadcast_chunked — the EXACT same two functions a real
-    market signal goes through in main.py's market_loop. This is what
-    proves (or disproves) that the full signal pipeline reaches everyone,
-    as opposed to just plain text messages (which _test_broadcast_text
-    already confirmed). If this arrives for everyone but real signals
-    still don't, the remaining explanation is simply that no real
-    volume/price/whale event has crossed the configured thresholds yet —
-    not a delivery problem."""
     fake_signal = MarketSignal(
         symbol="TEST", price=1.2345, change_5m=5.0, change_24h=12.3,
         inflow_usd=123456.0, spike_multiplier=4.2,
@@ -224,7 +208,7 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
 
     if text in CANCEL_WORDS and pending:
         _pending.pop(chat_id, None)
-        notifier.send("لغو شد.", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
+        notifier.send("لغو شد.", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
         return
 
     if is_admin and pending:
@@ -237,21 +221,20 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
             existed = access.revoke(text)
             _pending.pop(chat_id, None)
             notifier.send("✅ دسترسی حذف شد." if existed else "این کاربر از قبل دسترسی نداشت.",
-                          chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
+                          chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
             return
         if pending["action"] == "awaiting_broadcast_message":
             _pending.pop(chat_id, None)
             result_text = _broadcast_custom_message(text, settings, access, notifier)
-            notifier.send(result_text, chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
+            notifier.send(result_text, chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
             return
 
     if text in ("/start", "/menu"):
         already = access.is_authorized(chat_id)
         notifier.send(_welcome_text(settings, already, access.expiry_text(chat_id)), chat_id=chat_id,
-                      reply_markup=_main_menu_markup(is_admin) if already else None)
+                      reply_markup=_main_menu_markup(is_admin, access) if already else None)
         return
 
-    # Backward-compatible text commands (direct chat_id-based grant), still admin-only.
     if is_admin and text.startswith("/grant"):
         _legacy_grant(text, chat_id, access, notifier)
         return
@@ -262,7 +245,6 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
         notifier.send(_users_list_text(access), chat_id=chat_id, reply_markup=_back_markup())
         return
 
-    # ---------- password gate ----------
     if not access.is_authorized(chat_id):
         found, days = access.consume_invite(text, chat_id)
         if found:
@@ -275,17 +257,16 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
         else:
             notifier.send("❌ رمز عبور اشتباه است.", chat_id=chat_id)
         if message_id:
-            notifier.delete(message_id, chat_id=chat_id)  # don't leave the password sitting in the chat
+            notifier.delete(message_id, chat_id=chat_id)
         return
 
-    # Authorized user sent free text with nothing pending — just show the menu.
-    notifier.send("از منوی زیر استفاده کنید 👇", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin))
+    notifier.send("از منوی زیر استفاده کنید 👇", chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
 
 
 def _notify_new_authorization(settings: Settings, access: AccessControl, notifier: TelegramNotifier, chat_id: str) -> None:
     notifier.send(
         f"✅ <b>دسترسی تایید شد.</b>\n⏳ <b>انقضا:</b> <code>{esc(access.expiry_text(chat_id))}</code>",
-        chat_id=chat_id, reply_markup=_main_menu_markup(access.is_admin(chat_id)),
+        chat_id=chat_id, reply_markup=_main_menu_markup(access.is_admin(chat_id), access),
     )
     admin_id = settings.admin_chat_id_resolved
     if admin_id and admin_id != chat_id:
@@ -300,7 +281,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     chat_id = str(message.get("chat", {}).get("id", ""))
     message_id = message.get("message_id")
 
-    notifier.answer_callback_query(callback_id)  # clears the button's loading spinner regardless
+    notifier.answer_callback_query(callback_id)
 
     if not chat_id or not message_id:
         log.warning(f"callback_query بدون chat_id/message_id قابل استفاده نادیده گرفته شد: data={data!r}")
@@ -320,11 +301,11 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     if data == "back":
         _pending.pop(chat_id, None)
         notifier.edit_message(chat_id, message_id, _welcome_text(settings, True, access.expiry_text(chat_id)),
-                              reply_markup=_main_menu_markup(is_admin))
+                              reply_markup=_main_menu_markup(is_admin, access))
         return
     if data == "cancel":
         _pending.pop(chat_id, None)
-        notifier.edit_message(chat_id, message_id, "لغو شد.", reply_markup=_main_menu_markup(is_admin))
+        notifier.edit_message(chat_id, message_id, "لغو شد.", reply_markup=_main_menu_markup(is_admin, access))
         return
 
     if not is_admin:
@@ -339,6 +320,29 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     if data == "admin_status":
         text = admin_status_provider() if admin_status_provider else "در دسترس نیست."
         notifier.edit_message(chat_id, message_id, text, reply_markup=_back_markup())
+        return
+    if data == "admin_signal_controls":
+        notifier.edit_message(chat_id, message_id, _signal_control_text(access), reply_markup=_signal_control_markup(access))
+        return
+    if data in {"admin_toggle_smart_money", "admin_toggle_whale", "admin_toggle_pump_dump"}:
+        category = {
+            "admin_toggle_smart_money": "smart_money",
+            "admin_toggle_whale": "whale",
+            "admin_toggle_pump_dump": "pump_dump",
+        }[data]
+        enabled = access.toggle_signal(category)
+        labels = {
+            "smart_money": "ورود/خروج پول هوشمند",
+            "whale": "واریز/برداشت نهنگ",
+            "pump_dump": "پامپ/دامپ",
+        }
+        log.info("SIGNAL DELIVERY CONTROL | admin=%s | category=%s | enabled=%s", chat_id, category, enabled)
+        notifier.edit_message(
+            chat_id, message_id,
+            f"{'🟢 فعال شد' if enabled else '🔴 غیرفعال شد'}\n\n"
+            f"دریافت پیام «{labels[category]}» اکنون {'فعال' if enabled else 'غیرفعال'} است.",
+            reply_markup=_signal_control_markup(access),
+        )
         return
     if data == "admin_testsend":
         _pending[chat_id] = {"action": "awaiting_broadcast_message"}
@@ -374,7 +378,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         pending = _pending.get(chat_id)
         if not pending or pending.get("action") != "awaiting_invite_days":
             notifier.edit_message(chat_id, message_id, "این عملیات منقضی شده؛ دوباره از منو تلاش کنید.",
-                                  reply_markup=_main_menu_markup(is_admin))
+                                  reply_markup=_main_menu_markup(is_admin, access))
             return
         password = pending["password"]
         days_str = data.split(":", 1)[1]
@@ -386,7 +390,7 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
             chat_id, message_id,
             f"✅ رمز اختصاصی ساخته شد:\n\n🔑 رمز: <code>{esc(password)}</code>\n⏳ مدت: {esc(days_text)}\n\n"
             f"این رمز را به کاربر مورد نظر بدهید تا با ارسال /start و سپس این رمز، دسترسی‌اش فعال شود.",
-            reply_markup=_main_menu_markup(is_admin),
+            reply_markup=_main_menu_markup(is_admin, access),
         )
         return
 
@@ -408,7 +412,7 @@ def _legacy_grant(text: str, admin_chat_id: str, access: AccessControl, notifier
             return
     access.grant(target_chat_id, days=days)
     notifier.send(f"✅ دسترسی برای <code>{esc(target_chat_id)}</code> تنظیم شد. انقضا: <code>{esc(access.expiry_text(target_chat_id))}</code>",
-                  chat_id=admin_chat_id, reply_markup=_main_menu_markup(True))
+                  chat_id=admin_chat_id, reply_markup=_main_menu_markup(True, access))
     notifier.send(f"🎉 دسترسی شما فعال شد.\n⏳ <b>انقضا:</b> <code>{esc(access.expiry_text(target_chat_id))}</code>", chat_id=target_chat_id)
 
 
@@ -419,4 +423,4 @@ def _legacy_revoke(text: str, admin_chat_id: str, access: AccessControl, notifie
         return
     existed = access.revoke(parts[1])
     notifier.send("✅ دسترسی حذف شد." if existed else "این کاربر از قبل دسترسی نداشت.",
-                  chat_id=admin_chat_id, reply_markup=_main_menu_markup(True))
+                  chat_id=admin_chat_id, reply_markup=_main_menu_markup(True, access))
