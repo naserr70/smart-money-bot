@@ -30,8 +30,11 @@ When GITHUB_TOKEN + GITHUB_REPO are set, GitHubCandleBackup
 periodically uploads changed files in a single Trees API commit.
 """
 
+import atexit
 import logging
 import os
+import signal as os_signal
+import sys
 import threading
 import time
 import uuid
@@ -74,14 +77,20 @@ def build_http_session() -> requests.Session:
 
     session = requests.Session()
 
+    # 429 is deliberately NOT retried here: Binance escalates repeated
+    # requests after a 429 into an IP ban (418), and MarketDataProvider
+    # already applies its own cooldown on 418/429. Retry-After is not
+    # honoured by the adapter either, so a long header value can never
+    # freeze the market/whale loop inside urllib3.
     retries = Retry(
         total=settings.http_max_retries,
         connect=settings.http_max_retries,
         read=settings.http_max_retries,
         backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "POST"]),
         raise_on_status=False,
+        respect_retry_after_header=False,
     )
 
     adapter = HTTPAdapter(
@@ -908,7 +917,19 @@ def shutdown_persistence():
     log.info("PERSISTENCE SHUTDOWN COMPLETE")
 
 
+# Flush candle history / GitHub queue / bot state when the process exits
+# (e.g. SIGTERM from Render during a redeploy). Previously never called.
+atexit.register(shutdown_persistence)
+
+
 if __name__ == "__main__":
+
+    # Turn SIGTERM into a normal exit so the atexit persistence hook runs
+    # when the platform stops the process (gunicorn already does this).
+    os_signal.signal(
+        os_signal.SIGTERM,
+        lambda *_: sys.exit(0),
+    )
 
     port = int(
         os.environ.get(

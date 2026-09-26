@@ -38,6 +38,7 @@ Limitations (documented honestly rather than hidden):
     verify against their current docs if this stops working.
 """
 import logging
+import time
 from typing import Dict, List
 
 import requests
@@ -61,6 +62,12 @@ TRONGRID_BASE = "https://api.trongrid.io"
 # Which adapter handles which chain key (as used in EXCHANGE_WALLETS_JSON).
 CHAIN_TYPE = {"ETH": "evm", "BSC": "evm", "TRON": "tron"}
 
+# Never alert on transfers older than this many seconds (or 3 scan intervals,
+# whichever is longer). The dedupe set lives in bot_state.json, which is wiped
+# on every Render restart — without an age limit each restart re-announced the
+# last ~30 transfers of every watched wallet.
+TX_ALERT_MAX_AGE_SEC = 900
+
 
 class ExchangeFlowTracker:
     def __init__(self, settings: Settings, state: BotState, session: requests.Session):
@@ -72,6 +79,41 @@ class ExchangeFlowTracker:
             "ETH": settings.etherscan_api_key,
             "BSC": settings.bscscan_api_key or settings.etherscan_api_key,
         }
+        # Normalized watch-list per chain (EVM addresses are case-insensitive,
+        # TRON base58 addresses are case-sensitive).
+        self._watched = {
+            chain: {self._norm_addr(chain, addr) for addr in (wallets or {})}
+            for chain, wallets in settings.exchange_wallets.items()
+        }
+
+    @staticmethod
+    def _norm_addr(chain: str, address: str) -> str:
+        address = (address or "").strip()
+        return address.lower() if CHAIN_TYPE.get(chain) == "evm" else address
+
+    def _is_internal_transfer(self, chain: str, from_addr: str, to_addr: str) -> bool:
+        """Both ends are watched exchange wallets: not an exchange in/outflow."""
+        watched = self._watched.get(chain) or set()
+        return (
+            self._norm_addr(chain, from_addr) in watched
+            and self._norm_addr(chain, to_addr) in watched
+        )
+
+    def _max_tx_age_sec(self) -> float:
+        return max(
+            TX_ALERT_MAX_AGE_SEC,
+            3 * float(self.settings.whale_scan_interval_sec or 0),
+        )
+
+    def _is_recent(self, timestamp) -> bool:
+        """timestamp in seconds or milliseconds; unknown -> treated as recent."""
+        try:
+            ts = float(timestamp)
+        except (TypeError, ValueError):
+            return True
+        if ts > 1e12:
+            ts /= 1000.0
+        return (time.time() - ts) <= self._max_tx_age_sec()
 
     def is_enabled(self) -> bool:
         for chain, wallets in self.settings.exchange_wallets.items():
@@ -155,6 +197,10 @@ class ExchangeFlowTracker:
             contract = tx.get("contractAddress", "").lower()
             if not tx_hash or not self.state.is_new_tx(f"{tx_hash}:{contract}"):
                 continue
+            if not self._is_recent(tx.get("timeStamp")):
+                continue
+            if self._is_internal_transfer(chain, tx.get("from", ""), tx.get("to", "")):
+                continue
             try:
                 decimals = int(tx.get("tokenDecimal", 18))
                 value_native = float(tx.get("value", 0)) / (10 ** decimals)
@@ -196,6 +242,10 @@ class ExchangeFlowTracker:
         for tx in txs:
             tx_hash = tx.get("hash", "")
             if not tx_hash or not self.state.is_new_tx(tx_hash):
+                continue
+            if not self._is_recent(tx.get("timeStamp")):
+                continue
+            if self._is_internal_transfer(chain, tx.get("from", ""), tx.get("to", "")):
                 continue
             try:
                 value_native = float(tx.get("value", 0)) / 1e18
@@ -250,6 +300,10 @@ class ExchangeFlowTracker:
             token_info = tx.get("token_info", {}) or {}
             contract = token_info.get("address", "")
             if not tx_id or not self.state.is_new_tx(f"{tx_id}:{contract}"):
+                continue
+            if not self._is_recent(tx.get("block_timestamp")):
+                continue
+            if self._is_internal_transfer("TRON", tx.get("from", ""), tx.get("to", "")):
                 continue
             try:
                 decimals = int(token_info.get("decimals", 6))

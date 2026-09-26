@@ -48,6 +48,26 @@ DEFAULT_TTL_SEC = 300
 MIN_CALL_INTERVAL_SEC = 2.0
 RATE_LIMIT_COOLDOWN_SEC = 90
 
+# TRON contract addresses are base58 and case-sensitive; lower-casing them
+# (fine for EVM hex addresses) makes the CoinGecko lookup miss.
+CASE_SENSITIVE_CHAINS = {"TRON"}
+
+
+def _query_address(chain: str, address: str) -> str:
+    address = (address or "").strip()
+    return address if chain in CASE_SENSITIVE_CHAINS else address.lower()
+
+
+def _find_price_entry(data: dict, address: str):
+    """Find the response entry for `address`, whatever case CoinGecko used."""
+    if address in data:
+        return data[address]
+    wanted = address.lower()
+    for key, value in data.items():
+        if str(key).lower() == wanted:
+            return value
+    return None
+
 
 class PriceFeed:
 
@@ -339,6 +359,11 @@ class PriceFeed:
         ):
             return None
 
+        query_address = _query_address(
+            chain,
+            contract_address,
+        )
+
         contract_address = (
             contract_address.strip()
             .lower()
@@ -363,7 +388,7 @@ class PriceFeed:
             ),
             {
                 "contract_addresses":
-                    contract_address,
+                    query_address,
                 "vs_currencies": "usd",
             },
         )
@@ -373,9 +398,10 @@ class PriceFeed:
 
         try:
             price = float(
-                data[
-                    contract_address
-                ]["usd"]
+                _find_price_entry(
+                    data,
+                    query_address,
+                )["usd"]
             )
         except (
             KeyError,
@@ -423,13 +449,16 @@ class PriceFeed:
         to_fetch = []
         seen = set()
 
-        for address in (
+        for raw_address in (
             contract_addresses or []
         ):
 
-            address = (
-                address or ""
-            ).strip().lower()
+            query = _query_address(
+                chain,
+                raw_address,
+            )
+
+            address = query.lower()
 
             if not address:
                 continue
@@ -450,7 +479,7 @@ class PriceFeed:
             if cached is not None:
                 result[address] = cached
             else:
-                to_fetch.append(address)
+                to_fetch.append(query)
 
         if not to_fetch:
             return result

@@ -403,10 +403,13 @@ class Settings:
     # GitHub candle persistence
     # ========================================================
 
+    # README documents GITHUB_REPOSITORY; the code historically read
+    # GITHUB_REPO. Accept both (GITHUB_REPO wins).
     github_repo: str = field(
         default_factory=lambda:
-        _env_str(
-            "GITHUB_REPO",
+        _env_str("GITHUB_REPO")
+        or _env_str(
+            "GITHUB_REPOSITORY",
             "naserr70/smart-money-bot",
         )
     )

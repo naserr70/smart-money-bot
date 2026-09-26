@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -26,6 +27,7 @@ log = logging.getLogger("smart_money_bot.access_control")
 
 GIST_API_BASE = "https://api.github.com/gists"
 GIST_FILENAME = "smart_money_bot_access.json"
+GIST_LOAD_ATTEMPTS = 3
 
 _SIGNAL_DELIVERY_STATE = {
     "smart_money": True,
@@ -36,6 +38,33 @@ _SIGNAL_DELIVERY_STATE = {
 
 def signal_delivery_enabled(category: str) -> bool:
     return bool(_SIGNAL_DELIVERY_STATE.get(category, True))
+
+
+def _parse_expiry(expires_at) -> Optional[datetime]:
+    """Parse a stored ISO timestamp as an aware UTC datetime.
+
+    Naive timestamps (older/hand-edited state) are treated as UTC instead of
+    raising TypeError when compared with an aware "now" — that exception used
+    to break broadcast_targets() and with it every signal delivery.
+    Returns None for unparseable values (callers treat those as expired).
+    """
+    try:
+        parsed = datetime.fromisoformat(str(expires_at))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _is_unexpired(expires_at, now: Optional[datetime] = None) -> bool:
+    if expires_at is None:
+        return True
+    parsed = _parse_expiry(expires_at)
+    if parsed is None:
+        log.warning("تاریخ انقضای نامعتبر در لیست کاربران: %r (منقضی در نظر گرفته شد)", expires_at)
+        return False
+    return parsed > (now or datetime.now(timezone.utc))
 
 
 class AccessControl:
@@ -59,6 +88,10 @@ class AccessControl:
         # Permanent flags that must survive restarts (e.g. first-start announce
         # and the admin's per-category Telegram signal delivery controls).
         self._flags: Dict[str, bool] = {}
+        # True once the Gist state was read successfully. Until then we must
+        # never PATCH the Gist, or a transient read error at startup would
+        # overwrite every stored user with an empty list.
+        self._gist_synced = False
         self._load()
         self._sync_signal_delivery_state()
 
@@ -70,20 +103,62 @@ class AccessControl:
     def _gist_headers(self) -> dict:
         return {"Authorization": f"token {self._gist_token}", "Accept": "application/vnd.github+json"}
 
+    def _apply_loaded_state(self, data: dict) -> None:
+        users = data.get("users") or {}
+        invites = data.get("invites") or {}
+        flags = data.get("flags") or {}
+        with self._lock:
+            self._users = users if isinstance(users, dict) else {}
+            self._invites = invites if isinstance(invites, dict) else {}
+            self._flags = flags if isinstance(flags, dict) else {}
+
     def _load(self) -> None:
         if self._gist_enabled():
-            data = self._gist_fetch()
+            data = None
+            for attempt in range(GIST_LOAD_ATTEMPTS):
+                data = self._gist_fetch()
+                if data is not None:
+                    break
+                if attempt < GIST_LOAD_ATTEMPTS - 1:
+                    time.sleep(2 * (attempt + 1))
             if data is not None:
-                self._users = data.get("users", {})
-                self._invites = data.get("invites", {})
-                self._flags = data.get("flags", {}) or {}
+                self._apply_loaded_state(data)
+                self._gist_synced = True
                 log.info(f"{len(self._users)} کاربر و {len(self._invites)} رمز دعوت از GitHub Gist بازیابی شد.")
                 return
-            log.warning("بازیابی از GitHub Gist ناموفق بود؛ به فایل محلی برمی‌گردم (ممکن است خالی باشد).")
+            log.warning("بازیابی از GitHub Gist ناموفق بود؛ به فایل محلی برمی‌گردم (ممکن است خالی باشد). "
+                        "تا وقتی Gist دوباره خوانده نشود، روی آن چیزی نوشته نمی‌شود.")
         self._load_local()
+
+    def _recover_gist_state(self) -> bool:
+        """Re-read the Gist after a failed startup load and merge local changes on top."""
+        data = self._gist_fetch()
+        if data is None:
+            return False
+        remote = {"users": {}, "invites": {}, "flags": {}}
+        for key in remote:
+            value = data.get(key) or {}
+            if isinstance(value, dict):
+                remote[key] = dict(value)
+        with self._lock:
+            remote["users"].update(self._users)
+            remote["invites"].update(self._invites)
+            remote["flags"].update(self._flags)
+            self._users = remote["users"]
+            self._invites = remote["invites"]
+            self._flags = remote["flags"]
+            self._gist_synced = True
+        self._sync_signal_delivery_state()
+        log.info("اتصال به GitHub Gist برقرار شد؛ داده‌ی محلی با Gist ادغام شد.")
+        return True
 
     def _persist(self) -> None:
         if self._gist_enabled():
+            if not self._gist_synced and not self._recover_gist_state():
+                log.warning("GitHub Gist هنوز خوانده نشده؛ برای جلوگیری از پاک شدن کاربران، "
+                            "فقط در فایل محلی ذخیره شد.")
+                self._save_local()
+                return
             self._gist_save()
         else:
             self._save_local()
@@ -98,8 +173,12 @@ class AccessControl:
             file_entry = files.get(GIST_FILENAME)
             if not file_entry:
                 return {"users": {}, "invites": {}, "flags": {}}
-            return json.loads(file_entry.get("content") or "{}")
-        except (requests.RequestException, ValueError) as e:
+            data = json.loads(file_entry.get("content") or "{}")
+            if not isinstance(data, dict):
+                log.warning("محتوای GitHub Gist ساختار معتبری ندارد.")
+                return None
+            return data
+        except (requests.RequestException, ValueError, AttributeError) as e:
             log.warning(f"خطا در خواندن GitHub Gist: {e}")
             return None
 
@@ -125,9 +204,10 @@ class AccessControl:
         try:
             with open(self._state_file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self._users = data.get("users", {})
-            self._invites = data.get("invites", {})
-            self._flags = data.get("flags", {}) or {}
+            if not isinstance(data, dict):
+                log.warning("فایل محلی کاربران مجاز ساختار معتبری ندارد.")
+                return
+            self._apply_loaded_state(data)
             log.info(f"{len(self._users)} کاربر و {len(self._invites)} رمز دعوت از فایل محلی بازیابی شد.")
         except (OSError, json.JSONDecodeError) as e:
             log.warning(f"بازیابی لیست کاربران مجاز از فایل محلی ناموفق بود: {e}")
@@ -202,10 +282,7 @@ class AccessControl:
             entry = self._users.get(chat_id)
         if not entry:
             return False
-        expires_at = entry.get("expires_at")
-        if expires_at is None:
-            return True
-        return datetime.fromisoformat(expires_at) > datetime.now(timezone.utc)
+        return _is_unexpired(entry.get("expires_at"))
 
     def expiry_text(self, chat_id) -> str:
         chat_id = str(chat_id)
@@ -218,7 +295,10 @@ class AccessControl:
         expires_at = entry.get("expires_at")
         if expires_at is None:
             return "نامحدود"
-        return datetime.fromisoformat(expires_at).strftime("%Y-%m-%d %H:%M UTC")
+        parsed = _parse_expiry(expires_at)
+        if parsed is None:
+            return "نامعتبر"
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     def days_remaining(self, chat_id) -> Optional[float]:
         chat_id = str(chat_id)
@@ -231,7 +311,10 @@ class AccessControl:
         expires_at = entry.get("expires_at")
         if expires_at is None:
             return None
-        delta = datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)
+        parsed = _parse_expiry(expires_at)
+        if parsed is None:
+            return 0.0
+        delta = parsed - datetime.now(timezone.utc)
         return max(delta.total_seconds() / 86400, 0.0)
 
     def get_entry(self, chat_id) -> Optional[dict]:
@@ -266,8 +349,9 @@ class AccessControl:
         with self._lock:
             items = list(self._users.items())
         for chat_id, entry in items:
-            expires_at = entry.get("expires_at")
-            if expires_at is None or datetime.fromisoformat(expires_at) > now:
+            if not isinstance(entry, dict):
+                continue
+            if _is_unexpired(entry.get("expires_at"), now):
                 result.append(chat_id)
         return result
 

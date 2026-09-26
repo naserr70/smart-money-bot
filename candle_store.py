@@ -13,6 +13,7 @@ IMPORTANT:
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -27,8 +28,17 @@ PUMP_HISTORY_CANDLES = 864
 
 VALID_SOURCES = ("binance", "bybit", "kucoin")
 
+# ~600 histories x 864 candles live in memory; __slots__ cuts roughly a third
+# of the RAM they use (Python 3.10+; older versions fall back to a plain
+# dataclass with identical behaviour).
+_CANDLE_DATACLASS_OPTIONS = (
+    {"slots": True}
+    if sys.version_info >= (3, 10)
+    else {}
+)
 
-@dataclass
+
+@dataclass(**_CANDLE_DATACLASS_OPTIONS)
 class Candle:
     open_time: int
     close_time: int
@@ -616,6 +626,18 @@ class CandleStore:
 
             if current is None:
 
+                # Right after a bootstrap/restore there is no current
+                # candle yet, but the live window starts with candles that
+                # are already in closed history. Don't adopt those as the
+                # "current" candle (that produced 4 bogus OUT_OF_ORDER
+                # warnings per symbol on the first cycle).
+                if (
+                    history
+                    and candle.open_time
+                    <= history[-1].open_time
+                ):
+                    return "ignored"
+
                 self._current[source][symbol] = candle
 
                 log.debug(
@@ -688,7 +710,11 @@ class CandleStore:
 
                 return "closed"
 
-            log.warning(
+            # Older than the current candle. This is the normal case every
+            # cycle: the live window re-sends candles that are already in
+            # history, so it must not be logged as a warning (it produced
+            # ~3 warnings per symbol per source per cycle).
+            log.debug(
                 "CANDLE IGNORED OUT_OF_ORDER | "
                 "source=%s symbol=%s incoming=%s current=%s",
                 source,
@@ -1015,10 +1041,19 @@ class CandleStore:
             source
         )
 
-        payload = self.to_payload(
-            source,
-            symbol,
-        )
+        # Clear the dirty flag in the same critical section as the snapshot:
+        # an update() landing between "snapshot" and "discard" used to be
+        # silently dropped from the next save.
+        with self._lock:
+
+            self._dirty[source].discard(
+                symbol
+            )
+
+            payload = self.to_payload(
+                source,
+                symbol,
+            )
 
         path = self._path(
             source,
@@ -1047,13 +1082,13 @@ class CandleStore:
                 path,
             )
 
+        except OSError as e:
+
             with self._lock:
 
-                self._dirty[source].discard(
+                self._dirty[source].add(
                     symbol
                 )
-
-        except OSError as e:
 
             log.warning(
                 "HISTORY LOCAL SAVE FAILED | "

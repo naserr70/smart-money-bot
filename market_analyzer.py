@@ -63,6 +63,20 @@ log = logging.getLogger("smart_money_bot.market_analyzer")
 # Only recent candles are requested during normal runtime.
 LIVE_UPDATE_LIMIT = 5
 
+CANDLE_INTERVAL_MS = 5 * 60 * 1000
+
+# Upper bound for one runtime fetch. MarketDataProvider.fetch_candles()
+# switches to bootstrap mode at limit >= 100, so runtime must stay below it.
+# A gap up to (this - 2) candles (~8h) is closed by the next live update.
+MAX_LIVE_CATCHUP_CANDLES = 99
+
+# Per-symbol analysis source priority.
+SOURCE_PRIORITY = ("binance", "bybit", "kucoin")
+
+# Stop trying GitHub restore during one startup after this many
+# consecutive download errors (GitHub unreachable / token broken).
+GITHUB_RESTORE_MAX_CONSECUTIVE_FAILURES = 5
+
 
 def _candles_from_payload(data: dict) -> List[Candle]:
     """
@@ -133,6 +147,129 @@ class MarketAnalyzer:
         self._startup_bootstrap_done = False
 
     # ------------------------------------------------------------------
+    # HISTORY FRESHNESS HELPERS
+    # ------------------------------------------------------------------
+
+    def _smart_baseline_count(self) -> int:
+        value = getattr(
+            self.settings,
+            "volume_baseline_candles",
+            SMART_MONEY_BASELINE_CANDLES,
+        )
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = SMART_MONEY_BASELINE_CANDLES
+        return value if value > 0 else SMART_MONEY_BASELINE_CANDLES
+
+    def _pump_history_count(self) -> int:
+        value = getattr(
+            self.settings,
+            "pump_history_candles",
+            PUMP_HISTORY_CANDLES,
+        )
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = PUMP_HISTORY_CANDLES
+        return value if value > 1 else PUMP_HISTORY_CANDLES
+
+    @staticmethod
+    def _ticker_is_live(ticker) -> bool:
+        """A ticker with zero 24h quote volume is a halted/delisted market."""
+        try:
+            return float(
+                (ticker or {}).get("quoteVolume", 0.0)
+            ) > 0
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _missing_candles(
+        self,
+        source: str,
+        symbol: str,
+    ) -> Optional[int]:
+        """
+        Number of 5m intervals between the newest candle we know
+        (closed or current) and now. None when there is no history.
+        """
+
+        newest = None
+
+        last_closed = self.candle_store.get_recent(
+            source,
+            symbol,
+            1,
+        )
+
+        if last_closed:
+            newest = last_closed[-1].open_time
+
+        current = self.candle_store.get_current(
+            source,
+            symbol,
+        )
+
+        if current is not None and (
+            newest is None
+            or current.open_time > newest
+        ):
+            newest = current.open_time
+
+        if newest is None:
+            return None
+
+        now_ms = int(time.time() * 1000)
+
+        return max(
+            0,
+            (now_ms - newest) // CANDLE_INTERVAL_MS,
+        )
+
+    def _history_is_fresh(
+        self,
+        source: str,
+        symbol: str,
+    ) -> bool:
+        """
+        True when the next live update can reach back to the newest stored
+        candle. A "full" (864) but hours-old history is NOT fresh: using it
+        would leave a gap and close a half-built candle as final.
+        """
+
+        missing = self._missing_candles(
+            source,
+            symbol,
+        )
+
+        return (
+            missing is not None
+            and missing <= MAX_LIVE_CATCHUP_CANDLES - 2
+        )
+
+    def _live_fetch_limit(
+        self,
+        source: str,
+        symbol: str,
+    ) -> int:
+
+        missing = self._missing_candles(
+            source,
+            symbol,
+        )
+
+        if missing is None:
+            return LIVE_UPDATE_LIMIT
+
+        return max(
+            LIVE_UPDATE_LIMIT,
+            min(
+                MAX_LIVE_CATCHUP_CANDLES,
+                missing + 2,
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # STARTUP HISTORY BOOTSTRAP
     # ------------------------------------------------------------------
 
@@ -178,6 +315,8 @@ class MarketAnalyzer:
             github_backup
             and github_backup.is_configured()
         )
+
+        github_failures = 0
 
         log.info(
             "STARTUP BOOTSTRAP START | symbols=%s target=%s github=%s",
@@ -231,11 +370,17 @@ class MarketAnalyzer:
                         symbol,
                     )
 
+                    fresh = self._history_is_fresh(
+                        source,
+                        symbol,
+                    )
+
                     # --------------------------------------------------
-                    # Already complete
+                    # Already complete AND recent enough to be continued
+                    # by the live update without a gap.
                     # --------------------------------------------------
 
-                    if count >= target_count:
+                    if count >= target_count and fresh:
 
                         stats["already_full"] += 1
                         stats["local_ok"] += 1
@@ -251,7 +396,7 @@ class MarketAnalyzer:
 
                         continue
 
-                    # Existing but incomplete.
+                    # Existing but incomplete or stale.
                     if count > 0:
                         stats["local_ok"] += 1
 
@@ -279,6 +424,28 @@ class MarketAnalyzer:
 
                             payload = None
 
+                            # Each failed download costs several seconds of
+                            # retries; don't let an unreachable GitHub hold
+                            # the first market cycle hostage for an hour.
+                            github_failures += 1
+
+                            if (
+                                github_failures
+                                >= GITHUB_RESTORE_MAX_CONSECUTIVE_FAILURES
+                            ):
+
+                                github_configured = False
+
+                                log.warning(
+                                    "GITHUB RESTORE SKIPPED FOR THIS STARTUP | "
+                                    "consecutive_failures=%s",
+                                    github_failures,
+                                )
+
+                        else:
+
+                            github_failures = 0
+
                         if payload:
 
                             restored = _candles_from_payload(
@@ -300,7 +467,12 @@ class MarketAnalyzer:
                                     )
                                 )
 
-                                if count >= target_count:
+                                fresh = self._history_is_fresh(
+                                    source,
+                                    symbol,
+                                )
+
+                                if count >= target_count and fresh:
 
                                     stats["github_restored"] += 1
                                     source_stats["restored"] += 1
@@ -316,10 +488,10 @@ class MarketAnalyzer:
                                     )
 
                     # --------------------------------------------------
-                    # Still incomplete
+                    # Still incomplete or stale
                     # --------------------------------------------------
 
-                    if count < target_count:
+                    if count < target_count or not fresh:
 
                         incomplete[source].append(
                             symbol
@@ -420,7 +592,12 @@ class MarketAnalyzer:
                     # endpoint support.
                     # --------------------------------------------------
 
-                    if symbol not in tickers:
+                    if (
+                        symbol not in tickers
+                        or not self._ticker_is_live(
+                            tickers.get(symbol)
+                        )
+                    ):
 
                         log.warning(
                             "STARTUP API HISTORY SYMBOL UNAVAILABLE | "
@@ -604,15 +781,20 @@ class MarketAnalyzer:
             )
 
         # --------------------------------------------------------------
-        # Select active analysis source.
+        # Select analysis source PER SYMBOL.
         #
         # Binance → Bybit → KuCoin
+        #
+        # Previously a whole cycle used one exchange, so every Nobitex
+        # asset missing from Binance spot (HYPE and ~20 others) was never
+        # analysed while Binance was up. Each symbol now uses the highest
+        # priority exchange where it is actually trading. Histories are
+        # still never mixed across exchanges.
         # --------------------------------------------------------------
 
         if binance_tickers:
 
             active_source = "binance"
-            ticker_stats = binance_tickers
 
             log.info(
                 "ACTIVE MARKET SOURCE | Binance PRIMARY"
@@ -621,7 +803,6 @@ class MarketAnalyzer:
         elif bybit_tickers:
 
             active_source = "bybit"
-            ticker_stats = bybit_tickers
 
             log.warning(
                 "ACTIVE MARKET SOURCE | "
@@ -631,7 +812,6 @@ class MarketAnalyzer:
         elif kucoin_tickers:
 
             active_source = "kucoin"
-            ticker_stats = kucoin_tickers
 
             log.warning(
                 "ACTIVE MARKET SOURCE | "
@@ -648,20 +828,52 @@ class MarketAnalyzer:
 
             return [], "none", 0
 
+        selected: Dict[str, Tuple[str, dict]] = {}
+
+        for source in SOURCE_PRIORITY:
+
+            for symbol, ticker in (
+                sources_tickers.get(source) or {}
+            ).items():
+
+                if symbol in selected:
+                    continue
+
+                if not self._ticker_is_live(ticker):
+                    continue
+
+                selected[symbol] = (
+                    source,
+                    ticker,
+                )
+
+        per_source = {
+            source: sum(
+                1
+                for chosen, _ in selected.values()
+                if chosen == source
+            )
+            for source in SOURCE_PRIORITY
+        }
+
         log.info(
-            "ANALYSIS START | source=%s symbols=%s",
+            "ANALYSIS START | primary=%s symbols=%s | "
+            "binance=%s bybit=%s kucoin=%s",
             active_source,
-            len(ticker_stats),
+            len(selected),
+            per_source["binance"],
+            per_source["bybit"],
+            per_source["kucoin"],
         )
 
         signals: List[MarketSignal] = []
 
-        for symbol, ticker in ticker_stats.items():
+        for symbol, (source, ticker) in selected.items():
 
             try:
 
                 signal = self._analyze_symbol(
-                    active_source,
+                    source,
                     symbol,
                     ticker,
                 )
@@ -674,22 +886,22 @@ class MarketAnalyzer:
                 log.exception(
                     "ANALYSIS ERROR | "
                     "source=%s symbol=%s",
-                    active_source,
+                    source,
                     symbol,
                 )
 
         log.info(
             "ANALYSIS COMPLETE | "
-            "source=%s signals=%s symbols=%s",
+            "primary=%s signals=%s symbols=%s",
             active_source,
             len(signals),
-            len(ticker_stats),
+            len(selected),
         )
 
         return (
             signals,
             active_source,
-            len(ticker_stats),
+            len(selected),
         )
 
     # ------------------------------------------------------------------
@@ -707,10 +919,18 @@ class MarketAnalyzer:
 
         updated = 0
         closed_total = 0
+        skipped_dead = 0
+        gaps = 0
 
-        for symbol in tickers:
+        for symbol, ticker in tickers.items():
 
             try:
+
+                # Halted/delisted markets (zero 24h volume) only return
+                # stale candles — don't spend a request on them.
+                if not self._ticker_is_live(ticker):
+                    skipped_dead += 1
+                    continue
 
                 # Load local history only if not already loaded.
                 if self.candle_store.count(
@@ -724,15 +944,32 @@ class MarketAnalyzer:
                     )
 
                 # ------------------------------------------------------
-                # ONLY 5 recent candles.
-                #
-                # No 864-candle history download here.
+                # Normally 5 recent candles; after a pause/restart just
+                # enough to reach back to the newest stored candle, so no
+                # gap is created and a half-built candle is never closed
+                # as final. Still never the 864-candle history here.
                 # ------------------------------------------------------
+
+                limit = self._live_fetch_limit(
+                    source,
+                    symbol,
+                )
+
+                missing = self._missing_candles(
+                    source,
+                    symbol,
+                )
+
+                if (
+                    missing is not None
+                    and missing > MAX_LIVE_CATCHUP_CANDLES - 2
+                ):
+                    gaps += 1
 
                 candles = self.provider.fetch_candles(
                     source,
                     symbol,
-                    LIVE_UPDATE_LIMIT,
+                    limit,
                 )
 
                 if not candles:
@@ -758,11 +995,23 @@ class MarketAnalyzer:
 
         log.info(
             "LIVE UPDATE DONE | "
-            "source=%s symbols=%s newly_closed=%s",
+            "source=%s symbols=%s newly_closed=%s "
+            "skipped_inactive=%s",
             source,
             updated,
             closed_total,
+            skipped_dead,
         )
+
+        if gaps:
+
+            log.warning(
+                "LIVE UPDATE HISTORY GAP | source=%s symbols=%s | "
+                "newest stored candle older than the live catch-up "
+                "window; those histories contain a gap",
+                source,
+                gaps,
+            )
 
     # ------------------------------------------------------------------
     # BASELINE
@@ -814,8 +1063,13 @@ class MarketAnalyzer:
             symbol,
         )
 
+        # VOLUME_BASELINE_CANDLES / PUMP_HISTORY_CANDLES were defined in
+        # config but ignored (hard-coded 48 / 864). Same defaults.
+        smart_baseline_count = self._smart_baseline_count()
+        pump_history_count = self._pump_history_count()
+
         minimum_smart = (
-            SMART_MONEY_BASELINE_CANDLES + 1
+            smart_baseline_count + 1
         )
 
         if len(history) < minimum_smart:
@@ -874,7 +1128,7 @@ class MarketAnalyzer:
 
         baseline_48 = self._baseline_mean(
             history,
-            SMART_MONEY_BASELINE_CANDLES,
+            smart_baseline_count,
         )
 
         smart_spike = None
@@ -920,7 +1174,7 @@ class MarketAnalyzer:
         # --------------------------------------------------------------
 
         pump_baseline_count = min(
-            PUMP_HISTORY_CANDLES,
+            pump_history_count,
             len(history) - 1,
         )
 
@@ -959,7 +1213,7 @@ class MarketAnalyzer:
             is_pump_volume_spike = False
 
         long_history = history[
-            -PUMP_HISTORY_CANDLES:
+            -pump_history_count:
         ]
 
         current_close_to_close = None

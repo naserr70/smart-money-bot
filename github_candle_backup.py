@@ -16,8 +16,9 @@ import json
 import logging
 import threading
 import time
+import zlib
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import requests
 
@@ -25,6 +26,16 @@ log = logging.getLogger("smart_money_bot.github_backup")
 
 CANDLE_LIMIT = 864
 DEFAULT_BACKUP_BATCH_SIZE = 25
+
+# One bounded commit per worker wake-up. Each commit of 25 files costs ~27
+# content-creating GitHub API calls (blobs + tree + commit); GitHub's
+# secondary rate limit allows ~500 of those per hour, so draining the whole
+# queue back-to-back gets the token throttled/blocked.
+MAX_BATCHES_PER_RUN = 1
+
+# Render (and similar hosts) auto-deploy on every push to the tracked branch.
+# Data-only commits must not trigger a redeploy/restart loop.
+COMMIT_SKIP_DEPLOY_TAG = "[skip render]"
 
 
 class GitHubCandleBackup:
@@ -39,7 +50,11 @@ class GitHubCandleBackup:
         self.timeout = max(1, int(timeout))
         self.max_retries = max(0, int(max_retries))
         self._lock = threading.RLock()
-        self._pending: Dict[str, str] = {}
+        # Serializes whole backup() runs (startup, worker, shutdown) so two
+        # commits are never built on the same head concurrently.
+        self._backup_lock = threading.Lock()
+        # path -> (zlib-compressed JSON content, semantic digest)
+        self._pending: Dict[str, Tuple[bytes, str]] = {}
         self._committed_hashes: Dict[str, str] = {}
         self._worker_started = False
         self._last_backup_ok = None
@@ -141,18 +156,30 @@ class GitHubCandleBackup:
 
         canonical = self._partition_payload(dict(payload))
         canonical.pop("updated_at", None)
-        canonical["updated_at"] = int(time.time() * 1000)
         path = self._path(source, symbol, self.root_path)
-        content = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        digest = self._hash(content)
+
+        # Semantic digest = everything except updated_at. Computed directly
+        # from the payload (same result as _hash(content)) instead of a
+        # dumps -> loads -> dumps round-trip for every file on every cycle.
+        semantic = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        digest = hashlib.sha256(semantic.encode("utf-8")).hexdigest()
+        del semantic
 
         with self._lock:
             if self._committed_hashes.get(path) == digest:
                 return False
             previous = self._pending.get(path)
-            if previous is not None and self._hash(previous) == digest:
+            if previous is not None and previous[1] == digest:
                 return False
-            self._pending[path] = content
+
+        canonical["updated_at"] = int(time.time() * 1000)
+        content = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        # Hundreds of ~300 KB JSON files can sit in the queue at once; keep
+        # them compressed in memory (small instances have ~512 MB RAM).
+        packed = zlib.compress(content.encode("utf-8"), 1)
+
+        with self._lock:
+            self._pending[path] = (packed, digest)
         return True
 
     def pending_count(self) -> int:
@@ -296,6 +323,10 @@ class GitHubCandleBackup:
         if not self.is_configured():
             return False
         max_files = max(1, int(max_files))
+        with self._backup_lock:
+            return self._backup_batch(max_files)
+
+    def _backup_batch(self, max_files: int) -> bool:
         with self._lock:
             if not self._pending:
                 self._last_backup_ok = True
@@ -314,11 +345,13 @@ class GitHubCandleBackup:
             base_tree = commit.json()["tree"]["sha"]
 
             tree_entries = []
-            for path, content in items:
+            for path, (packed, _digest) in items:
+                content = zlib.decompress(packed).decode("utf-8")
                 blob = self._request(
                     "POST", self._url("git/blobs"),
                     json={"content": content, "encoding": "utf-8"},
                 )
+                del content
                 if blob.status_code not in (200, 201):
                     raise RuntimeError(f"blob create HTTP {blob.status_code}: {blob.text[:200]}")
                 tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]})
@@ -334,7 +367,10 @@ class GitHubCandleBackup:
             new_commit = self._request(
                 "POST", self._url("git/commits"),
                 json={
-                    "message": f"chore: persist date-partitioned candle history ({len(items)} files)",
+                    "message": (
+                        f"{COMMIT_SKIP_DEPLOY_TAG} chore: persist date-partitioned "
+                        f"candle history ({len(items)} files)"
+                    ),
                     "tree": tree_sha,
                     "parents": [head_sha],
                 },
@@ -351,10 +387,14 @@ class GitHubCandleBackup:
                 raise RuntimeError(f"ref update HTTP {update.status_code}: {update.text[:200]}")
 
             with self._lock:
-                for path, content in items:
-                    if self._pending.get(path) == content:
-                        self._pending.pop(path, None)
-                    self._committed_hashes[path] = self._hash(content)
+                for path, (_packed, digest) in items:
+                    self._committed_hashes[path] = digest
+                    current = self._pending.pop(path, None)
+                    if current is not None and current[1] != digest:
+                        # A newer version arrived while committing: requeue it
+                        # at the END so the rest of the queue gets its turn
+                        # (otherwise the same first files are committed forever).
+                        self._pending[path] = current
                 self._last_commit_sha = commit_sha
                 self._last_backup_ok = True
                 self._last_backup_at = time.time()
@@ -381,13 +421,13 @@ class GitHubCandleBackup:
             while True:
                 time.sleep(interval_sec)
                 try:
-                    # Drain the queue in bounded commits. This keeps each
-                    # commit small while ensuring a large startup queue does
-                    # not remain pending for hours.
-                    while self.pending_count() > 0:
+                    # Bounded commits per wake-up (see MAX_BATCHES_PER_RUN).
+                    # The queue rotates, so every file gets its turn.
+                    for _ in range(MAX_BATCHES_PER_RUN):
+                        if self.pending_count() <= 0:
+                            break
                         if not self.backup(DEFAULT_BACKUP_BATCH_SIZE):
                             break
-                        time.sleep(0.5)
                 except Exception:
                     log.exception("GITHUB BACKUP WORKER ERROR")
 

@@ -91,6 +91,27 @@ MAX_COOLDOWN_SEC = 3 * 24 * 3600
 KUCOIN_CANDLE_BATCH = 100
 
 
+def _keep_most_liquid(
+    result: Dict[str, dict],
+    canonical: str,
+    entry: dict,
+) -> None:
+    """
+    Several exchange tickers can resolve to the same canonical symbol
+    (e.g. a delisted MATICUSDT next to POLUSDT). Keep the listing that is
+    actually trading instead of whichever one happens to come last.
+    """
+
+    existing = result.get(canonical)
+
+    if (
+        existing is None
+        or entry.get("quoteVolume", 0.0)
+        > existing.get("quoteVolume", 0.0)
+    ):
+        result[canonical] = entry
+
+
 class MarketDataProvider:
 
     def __init__(
@@ -472,19 +493,23 @@ class MarketDataProvider:
                             symbol
                         )
 
-                        result[normalized] = {
-                            "lastPrice": float(
-                                item["lastPrice"]
-                            ),
-                            "quoteVolume": float(
-                                item["quoteVolume"]
-                            ),
-                            "priceChangePercent": float(
-                                item[
-                                    "priceChangePercent"
-                                ]
-                            ),
-                        }
+                        _keep_most_liquid(
+                            result,
+                            normalized,
+                            {
+                                "lastPrice": float(
+                                    item["lastPrice"]
+                                ),
+                                "quoteVolume": float(
+                                    item["quoteVolume"]
+                                ),
+                                "priceChangePercent": float(
+                                    item[
+                                        "priceChangePercent"
+                                    ]
+                                ),
+                            },
+                        )
 
                     except (
                         KeyError,
@@ -614,29 +639,33 @@ class MarketDataProvider:
                         symbol
                     )
 
-                    result[canonical] = {
-                        "lastPrice": float(
-                            item["lastPrice"]
-                        ),
-                        "quoteVolume": float(
-                            item.get(
-                                "turnover24h"
-                            )
-                            or item.get(
-                                "turnover24H"
-                            )
-                            or 0.0
-                        ),
-                        "priceChangePercent": (
-                            float(
+                    _keep_most_liquid(
+                        result,
+                        canonical,
+                        {
+                            "lastPrice": float(
+                                item["lastPrice"]
+                            ),
+                            "quoteVolume": float(
                                 item.get(
-                                    "price24hPcnt",
-                                    0.0,
+                                    "turnover24h"
                                 )
-                            )
-                            * 100.0
-                        ),
-                    }
+                                or item.get(
+                                    "turnover24H"
+                                )
+                                or 0.0
+                            ),
+                            "priceChangePercent": (
+                                float(
+                                    item.get(
+                                        "price24hPcnt",
+                                        0.0,
+                                    )
+                                )
+                                * 100.0
+                            ),
+                        },
+                    )
 
                 except (
                     KeyError,
@@ -766,20 +795,24 @@ class MarketDataProvider:
                         normalized
                     )
 
-                    result[canonical] = {
-                        "lastPrice": float(
-                            item["last"]
-                        ),
-                        "quoteVolume": float(
-                            item["volValue"]
-                        ),
-                        "priceChangePercent": (
-                            float(
-                                item["changeRate"]
-                            )
-                            * 100.0
-                        ),
-                    }
+                    _keep_most_liquid(
+                        result,
+                        canonical,
+                        {
+                            "lastPrice": float(
+                                item["last"]
+                            ),
+                            "quoteVolume": float(
+                                item["volValue"]
+                            ),
+                            "priceChangePercent": (
+                                float(
+                                    item["changeRate"]
+                                )
+                                * 100.0
+                            ),
+                        },
+                    )
 
                 except (
                     KeyError,
@@ -1114,6 +1147,8 @@ class MarketDataProvider:
 
             request_count += 1
 
+            # On a failed page keep what earlier pages already returned
+            # (the store merges by open_time) instead of discarding it all.
             try:
 
                 response = self.session.get(
@@ -1132,6 +1167,9 @@ class MarketDataProvider:
                     exc,
                 )
 
+                if collected:
+                    break
+
                 return None
 
             if response.status_code != 200:
@@ -1143,6 +1181,9 @@ class MarketDataProvider:
                     request_count,
                     response.status_code,
                 )
+
+                if collected:
+                    break
 
                 return None
 
@@ -1159,12 +1200,17 @@ class MarketDataProvider:
                     request_count,
                 )
 
+                if collected:
+                    break
+
                 return None
 
             if not isinstance(
                 payload,
                 dict,
             ):
+                if collected:
+                    break
                 return None
 
             raw = payload.get(
