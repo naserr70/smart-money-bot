@@ -21,54 +21,65 @@ log = logging.getLogger("smart_money_bot.bot_commands")
 _pending: Dict[str, dict] = {}
 CANCEL_WORDS = {"لغو", "cancel", "/cancel"}
 
+# Admin message-delivery categories, in menu order.
+SIGNAL_CONTROL_ITEMS = (
+    ("smart_money", "💰", "سیگنال ورود/خروج پول هوشمند"),
+    ("pump_dump", "🚀", "سیگنال پامپ/دامپ"),
+    ("whale", "🐋", "واریز/برداشت نهنگ"),
+    ("status_report", "📡", "گزارش وضعیت دوره‌ای (هر ۵ دقیقه)"),
+)
 
-def _signal_control_text(access: AccessControl) -> str:
-    smart = access.is_signal_enabled("smart_money")
-    whale = access.is_signal_enabled("whale")
-    pump = access.is_signal_enabled("pump_dump")
-    return (
-        "🎛 <b>کنترل پیام‌های سیگنال</b>\n\n"
-        "🟢 = پیام ارسال می‌شود\n"
-        "🔴 = پیام ارسال نمی‌شود\n\n"
-        f"💰 ورود/خروج پول هوشمند: {'🟢 فعال' if smart else '🔴 غیرفعال'}\n"
-        f"🐋 واریز/برداشت نهنگ: {'🟢 فعال' if whale else '🔴 غیرفعال'}\n"
-        f"🚀 پامپ/دامپ: {'🟢 فعال' if pump else '🔴 غیرفعال'}\n\n"
-        "با زدن هر دکمه، فقط ارسال همان دسته روشن/خاموش می‌شود؛ "
-        "خود تحلیل و جمع‌آوری داده متوقف نمی‌شود."
-    )
+SIGNAL_TOGGLE_CALLBACKS = {
+    f"admin_toggle_{category}": category
+    for category, _, _ in SIGNAL_CONTROL_ITEMS
+}
+
+
+def _signal_control_text(access: AccessControl, notice: str = "") -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend([
+        "🎛 <b>مدیریت پیام‌ها</b>",
+        "",
+        "روی هر مورد بزنید تا روشن/خاموش شود:",
+        "🟢 = ارسال می‌شود   🔴 = ارسال نمی‌شود",
+        "",
+    ])
+    for category, emoji, label in SIGNAL_CONTROL_ITEMS:
+        state = "🟢 فعال" if access.is_signal_enabled(category) else "🔴 غیرفعال"
+        lines.append(f"{emoji} {label}: {state}")
+    lines.extend([
+        "",
+        "این تنظیم برای همه‌ی کاربران اعمال می‌شود و بعد از ری‌استارت هم باقی می‌ماند. "
+        "فقط ارسال پیام قطع می‌شود؛ تحلیل و جمع‌آوری داده ادامه دارد.",
+    ])
+    return "\n".join(lines)
 
 
 def _signal_control_markup(access: AccessControl) -> dict:
-    smart = access.is_signal_enabled("smart_money")
-    whale = access.is_signal_enabled("whale")
-    pump = access.is_signal_enabled("pump_dump")
-    return {"inline_keyboard": [
-        [{"text": f"💰 پول هوشمند {'🟢' if smart else '🔴'}", "callback_data": "admin_toggle_smart_money"}],
-        [{"text": f"🐋 نهنگ {'🟢' if whale else '🔴'}", "callback_data": "admin_toggle_whale"}],
-        [{"text": f"🚀 پامپ/دامپ {'🟢' if pump else '🔴'}", "callback_data": "admin_toggle_pump_dump"}],
-        [{"text": "🔙 بازگشت به منو", "callback_data": "back"}],
-    ]}
+    rows = []
+    for category, emoji, label in SIGNAL_CONTROL_ITEMS:
+        state = "🟢" if access.is_signal_enabled(category) else "🔴"
+        rows.append([{"text": f"{state} {emoji} {label}", "callback_data": f"admin_toggle_{category}"}])
+    rows.append([
+        {"text": "🔕 خاموش کردن همه", "callback_data": "admin_signals_all_off"},
+        {"text": "🔔 روشن کردن همه", "callback_data": "admin_signals_all_on"},
+    ])
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "back"}])
+    return {"inline_keyboard": rows}
 
 
 def _main_menu_markup(is_admin: bool, access: Optional[AccessControl] = None) -> dict:
     rows = [[{"text": "📊 اطلاعات من", "callback_data": "info"}]]
     if is_admin:
+        rows.append([{"text": "🎛 مدیریت پیام‌ها (روشن/خاموش)", "callback_data": "admin_signal_controls"}])
         rows.append([{"text": "👥 لیست کاربران", "callback_data": "admin_users"},
                      {"text": "📈 وضعیت ربات", "callback_data": "admin_status"}])
         rows.append([{"text": "➕ اعطای دسترسی", "callback_data": "admin_grant"},
                      {"text": "➖ حذف دسترسی", "callback_data": "admin_revoke"}])
         rows.append([{"text": "📢 ارسال پیام به همه", "callback_data": "admin_testsend"},
                      {"text": "🧪 تست سیگنال", "callback_data": "admin_testsignal"}])
-        smart = access.is_signal_enabled("smart_money") if access else True
-        whale = access.is_signal_enabled("whale") if access else True
-        pump = access.is_signal_enabled("pump_dump") if access else True
-        rows.append([
-            {"text": f"💰 پول هوشمند {'🟢' if smart else '🔴'}", "callback_data": "admin_toggle_smart_money"},
-            {"text": f"🐋 نهنگ {'🟢' if whale else '🔴'}", "callback_data": "admin_toggle_whale"},
-        ])
-        rows.append([
-            {"text": f"🚀 پامپ/دامپ {'🟢' if pump else '🔴'}", "callback_data": "admin_toggle_pump_dump"},
-        ])
     return {"inline_keyboard": rows}
 
 
@@ -306,25 +317,23 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     if data == "admin_signal_controls":
         notifier.edit_message(chat_id, message_id, _signal_control_text(access), reply_markup=_signal_control_markup(access))
         return
-    if data in {"admin_toggle_smart_money", "admin_toggle_whale", "admin_toggle_pump_dump"}:
-        category = {
-            "admin_toggle_smart_money": "smart_money",
-            "admin_toggle_whale": "whale",
-            "admin_toggle_pump_dump": "pump_dump",
-        }[data]
+    if data in SIGNAL_TOGGLE_CALLBACKS:
+        category = SIGNAL_TOGGLE_CALLBACKS[data]
         enabled = access.toggle_signal(category)
-        labels = {
-            "smart_money": "ورود/خروج پول هوشمند",
-            "whale": "واریز/برداشت نهنگ",
-            "pump_dump": "پامپ/دامپ",
-        }
+        label = next(label for cat, _, label in SIGNAL_CONTROL_ITEMS if cat == category)
         log.info("SIGNAL DELIVERY CONTROL | admin=%s | category=%s | enabled=%s", chat_id, category, enabled)
-        notifier.edit_message(
-            chat_id, message_id,
-            f"{'🟢 فعال شد' if enabled else '🔴 غیرفعال شد'}\n\n"
-            f"دریافت پیام «{labels[category]}» اکنون {'فعال' if enabled else 'غیرفعال'} است.",
-            reply_markup=_main_menu_markup(True, access),
-        )
+        notice = f"{'🟢' if enabled else '🔴'} «{label}» {'فعال' if enabled else 'غیرفعال'} شد."
+        # Stay on the control panel so the admin can flip several in a row.
+        notifier.edit_message(chat_id, message_id, _signal_control_text(access, notice),
+                              reply_markup=_signal_control_markup(access))
+        return
+    if data in {"admin_signals_all_off", "admin_signals_all_on"}:
+        enabled = data == "admin_signals_all_on"
+        access.set_all_signals(enabled)
+        log.info("SIGNAL DELIVERY CONTROL | admin=%s | category=ALL | enabled=%s", chat_id, enabled)
+        notice = "🔔 ارسال همه‌ی پیام‌ها فعال شد." if enabled else "🔕 ارسال همه‌ی پیام‌ها غیرفعال شد."
+        notifier.edit_message(chat_id, message_id, _signal_control_text(access, notice),
+                              reply_markup=_signal_control_markup(access))
         return
     if data == "admin_testsend":
         _pending[chat_id] = {"action": "awaiting_broadcast_message"}

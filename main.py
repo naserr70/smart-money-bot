@@ -414,7 +414,10 @@ def market_loop():
                     scanned,
                 )
 
-            if settings.send_status_report:
+            if (
+                settings.send_status_report
+                and access.is_signal_enabled("status_report")
+            ):
 
                 status_msg = (
                     market_analyzer.build_status_message(

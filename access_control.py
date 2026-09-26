@@ -33,6 +33,7 @@ _SIGNAL_DELIVERY_STATE = {
     "smart_money": True,
     "whale": True,
     "pump_dump": True,
+    "status_report": True,
 }
 
 
@@ -72,6 +73,8 @@ class AccessControl:
         "smart_money": True,
         "whale": True,
         "pump_dump": True,
+        # Periodic "📡 وضعیت رصد" message sent every market cycle.
+        "status_report": True,
     }
 
     def __init__(self, state_file_path: str, admin_chat_id: str,
@@ -265,6 +268,15 @@ class AccessControl:
 
     def toggle_signal(self, category: str) -> bool:
         return self.set_signal_enabled(category, not self.is_signal_enabled(category))
+
+    def set_all_signals(self, enabled: bool) -> None:
+        """Turn every message category on/off with a single save."""
+        enabled = bool(enabled)
+        with self._lock:
+            for category in self.SIGNAL_CONTROL_DEFAULTS:
+                self._flags[f"signal_{category}"] = enabled
+                _SIGNAL_DELIVERY_STATE[category] = enabled
+        self._persist()
 
     def signal_controls(self) -> Dict[str, bool]:
         return {category: self.is_signal_enabled(category) for category in self.SIGNAL_CONTROL_DEFAULTS}
