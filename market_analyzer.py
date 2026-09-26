@@ -60,8 +60,10 @@ from state import BotState
 
 log = logging.getLogger("smart_money_bot.market_analyzer")
 
-# Only recent candles are requested during normal runtime.
-LIVE_UPDATE_LIMIT = 5
+# Only recent candles are requested during normal runtime. With the
+# gap-sized catch-up below a normal cycle asks for 3 (previous closed,
+# just-closed, current), which is all the analysis needs.
+LIVE_UPDATE_LIMIT = 3
 
 CANDLE_INTERVAL_MS = 5 * 60 * 1000
 
@@ -76,6 +78,14 @@ SOURCE_PRIORITY = ("binance", "bybit", "kucoin")
 # Stop trying GitHub restore during one startup after this many
 # consecutive download errors (GitHub unreachable / token broken).
 GITHUB_RESTORE_MAX_CONSECUTIVE_FAILURES = 5
+
+# Candles are only kept up to date on the exchange each symbol is analysed
+# on (not on all three), which cuts exchange traffic by ~60% on Render's
+# metered bandwidth. When a symbol moves to another exchange (e.g. Binance
+# down) its history there is backfilled on demand, a bounded number per
+# cycle, and not retried for a while if the exchange has little history.
+MAX_BACKFILLS_PER_CYCLE = 40
+BACKFILL_RETRY_SEC = 6 * 3600
 
 
 def _candles_from_payload(data: dict) -> List[Candle]:
@@ -145,6 +155,9 @@ class MarketAnalyzer:
 
         # Bootstrap must execute once per process.
         self._startup_bootstrap_done = False
+
+        # source:symbol -> last on-demand history backfill attempt (epoch s)
+        self._backfill_attempted: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # HISTORY FRESHNESS HELPERS
@@ -246,6 +259,102 @@ class MarketAnalyzer:
             missing is not None
             and missing <= MAX_LIVE_CATCHUP_CANDLES - 2
         )
+
+    def _select_analysis_sources(
+        self,
+        sources_tickers: Dict[str, Dict[str, dict]],
+    ) -> Dict[str, Tuple[str, dict]]:
+        """
+        symbol -> (exchange, ticker): the highest-priority exchange
+        (Binance → Bybit → KuCoin) where the symbol is actually trading.
+        """
+
+        selected: Dict[str, Tuple[str, dict]] = {}
+
+        for source in SOURCE_PRIORITY:
+
+            for symbol, ticker in (
+                sources_tickers.get(source) or {}
+            ).items():
+
+                if symbol in selected:
+                    continue
+
+                if not self._ticker_is_live(ticker):
+                    continue
+
+                selected[symbol] = (
+                    source,
+                    ticker,
+                )
+
+        return selected
+
+    def _needs_backfill(
+        self,
+        source: str,
+        symbol: str,
+    ) -> bool:
+        """
+        History can't be continued by a small live update: missing,
+        older than the catch-up window, or too short to analyse.
+        """
+
+        missing = self._missing_candles(
+            source,
+            symbol,
+        )
+
+        if (
+            missing is None
+            or missing > MAX_LIVE_CATCHUP_CANDLES - 2
+        ):
+            return True
+
+        return (
+            self.candle_store.count(source, symbol)
+            < self._smart_baseline_count() + 1
+        )
+
+    def _backfill_due(
+        self,
+        source: str,
+        symbol: str,
+    ) -> bool:
+        last = self._backfill_attempted.get(
+            f"{source}:{symbol}"
+        )
+        return (
+            last is None
+            or time.time() - last >= BACKFILL_RETRY_SEC
+        )
+
+    def _backfill_history(
+        self,
+        source: str,
+        symbol: str,
+    ) -> bool:
+
+        self._backfill_attempted[
+            f"{source}:{symbol}"
+        ] = time.time()
+
+        candles = self.provider.fetch_candles(
+            source,
+            symbol,
+            self.candle_store.max_candles,
+        )
+
+        if not candles:
+            return False
+
+        self.candle_store.seed(
+            source,
+            symbol,
+            candles,
+        )
+
+        return True
 
     def _live_fetch_limit(
         self,
@@ -557,6 +666,19 @@ class MarketAnalyzer:
                 "kucoin": kucoin_tickers,
             }
 
+            # Only the exchange each symbol is analysed on is seeded now;
+            # the others are backfilled on demand if ever needed.
+            analysis_source = {
+                symbol: chosen
+                for symbol, (chosen, _) in (
+                    self._select_analysis_sources(
+                        source_tickers
+                    ).items()
+                )
+            }
+
+            stats["deferred"] = 0
+
             # ----------------------------------------------------------
             # Seed each source independently.
             # ----------------------------------------------------------
@@ -585,6 +707,10 @@ class MarketAnalyzer:
                     continue
 
                 for symbol in missing_symbols:
+
+                    if analysis_source.get(symbol) != source:
+                        stats["deferred"] += 1
+                        continue
 
                     # --------------------------------------------------
                     # IMPORTANT:
@@ -617,6 +743,10 @@ class MarketAnalyzer:
                             symbol,
                             target_count,
                         )
+
+                        self._backfill_attempted[
+                            f"{source}:{symbol}"
+                        ] = time.time()
 
                         candles = self.provider.fetch_candles(
                             source=source,
@@ -767,18 +897,11 @@ class MarketAnalyzer:
         #
         # DO NOT CALL _maintain_history() HERE.
         #
-        # Full 864-candle history belongs exclusively to startup
-        # bootstrap.
-        #
-        # Runtime only updates the latest candles.
+        # Runtime only updates the latest candles; a full history is
+        # fetched only by the startup bootstrap or, for a symbol whose
+        # history on its analysis exchange is missing/stale, by the
+        # bounded on-demand backfill in _live_update_candles().
         # --------------------------------------------------------------
-
-        for source, tickers in sources_tickers.items():
-
-            self._live_update_candles(
-                source,
-                tickers,
-            )
 
         # --------------------------------------------------------------
         # Select analysis source PER SYMBOL.
@@ -828,24 +951,22 @@ class MarketAnalyzer:
 
             return [], "none", 0
 
-        selected: Dict[str, Tuple[str, dict]] = {}
+        selected = self._select_analysis_sources(
+            sources_tickers
+        )
 
+        # Keep candles current ONLY on the exchange each symbol is
+        # analysed on (see MAX_BACKFILLS_PER_CYCLE).
         for source in SOURCE_PRIORITY:
 
-            for symbol, ticker in (
-                sources_tickers.get(source) or {}
-            ).items():
-
-                if symbol in selected:
-                    continue
-
-                if not self._ticker_is_live(ticker):
-                    continue
-
-                selected[symbol] = (
-                    source,
-                    ticker,
-                )
+            self._live_update_candles(
+                source,
+                {
+                    symbol: ticker
+                    for symbol, (chosen, ticker) in selected.items()
+                    if chosen == source
+                },
+            )
 
         per_source = {
             source: sum(
@@ -921,6 +1042,7 @@ class MarketAnalyzer:
         closed_total = 0
         skipped_dead = 0
         gaps = 0
+        backfilled = 0
 
         for symbol, ticker in tickers.items():
 
@@ -944,10 +1066,36 @@ class MarketAnalyzer:
                     )
 
                 # ------------------------------------------------------
-                # Normally 5 recent candles; after a pause/restart just
+                # Missing / stale / too-short history on this exchange
+                # (e.g. the symbol just moved here from Binance): fetch
+                # its closed history once, a bounded number per cycle.
+                # ------------------------------------------------------
+
+                if (
+                    self._needs_backfill(source, symbol)
+                    and self._backfill_due(source, symbol)
+                ):
+
+                    if backfilled >= MAX_BACKFILLS_PER_CYCLE:
+                        # Wait for next cycle's quota; a small live
+                        # update now would leave a permanent gap.
+                        continue
+
+                    backfilled += 1
+
+                    if self._backfill_history(
+                        source,
+                        symbol,
+                    ):
+                        updated += 1
+
+                    continue
+
+                # ------------------------------------------------------
+                # Normally 3 recent candles; after a pause/restart just
                 # enough to reach back to the newest stored candle, so no
                 # gap is created and a half-built candle is never closed
-                # as final. Still never the 864-candle history here.
+                # as final.
                 # ------------------------------------------------------
 
                 limit = self._live_fetch_limit(
@@ -996,10 +1144,11 @@ class MarketAnalyzer:
         log.info(
             "LIVE UPDATE DONE | "
             "source=%s symbols=%s newly_closed=%s "
-            "skipped_inactive=%s",
+            "backfilled=%s skipped_inactive=%s",
             source,
             updated,
             closed_total,
+            backfilled,
             skipped_dead,
         )
 
@@ -1046,6 +1195,32 @@ class MarketAnalyzer:
             return None
 
         return sum(values) / len(values)
+
+    @staticmethod
+    def _change_24h_from_history(
+        history: List,
+    ) -> Optional[float]:
+
+        candles_24h = 24 * 60 * 60 * 1000 // CANDLE_INTERVAL_MS
+
+        if len(history) <= candles_24h:
+            return None
+
+        current = history[-1]
+        base = history[-(candles_24h + 1)]
+
+        # Only when that candle really is 24h earlier (no gaps between).
+        if (
+            current.open_time - base.open_time
+            != candles_24h * CANDLE_INTERVAL_MS
+            or base.close <= 0
+        ):
+            return None
+
+        return (
+            (current.close - base.close)
+            / base.close
+        ) * 100.0
 
     # ------------------------------------------------------------------
     # SYMBOL ANALYSIS
@@ -1485,18 +1660,28 @@ class MarketAnalyzer:
 
             return None
 
-        try:
+        # 24h change up to the signal candle's close, from the candle
+        # history itself (ticker lists of the backup exchanges are reused
+        # for up to 30 min). Falls back to the ticker value when the
+        # history doesn't reach exactly 24h back.
+        change_24h = self._change_24h_from_history(
+            history
+        )
 
-            change_24h = float(
-                ticker.get(
-                    "priceChangePercent",
-                    0.0,
+        if change_24h is None:
+
+            try:
+
+                change_24h = float(
+                    ticker.get(
+                        "priceChangePercent",
+                        0.0,
+                    )
                 )
-            )
 
-        except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
 
-            change_24h = 0.0
+                change_24h = 0.0
 
         # --------------------------------------------------------------
         # CREATE SIGNAL

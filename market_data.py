@@ -30,6 +30,7 @@ After 418/429:
 Retry-After is honored whenever available.
 """
 
+import json
 import logging
 import time
 from typing import Dict, Optional, Tuple
@@ -90,6 +91,14 @@ MAX_COOLDOWN_SEC = 3 * 24 * 3600
 
 KUCOIN_CANDLE_BATCH = 100
 
+# Bandwidth (Render meters traffic the service initiates):
+# - Binance: full all-market ticker only hourly; filtered MINI otherwise.
+# - Bybit/KuCoin full ticker lists (backup sources, only needed for the
+#   few symbols Binance doesn't list) are reused for 30 min, and fetched
+#   fresh every cycle while Binance is unavailable.
+BINANCE_FULL_TICKER_REFRESH_SEC = 3600
+FALLBACK_TICKER_TTL_SEC = 1800
+
 
 def _keep_most_liquid(
     result: Dict[str, dict],
@@ -140,6 +149,13 @@ class MarketDataProvider:
         self._binance_cooldown_until = 0.0
 
         self._binance_cooldown_reason = ""
+
+        # Tracked symbols that exist on Binance (from the last full ticker).
+        self._binance_known_symbols = []
+        self._binance_known_at = 0.0
+
+        # name -> (fetched_at, tickers) for the backup exchanges.
+        self._ticker_cache: Dict[str, Tuple[float, Dict[str, dict]]] = {}
 
     # ==================================================================
     # BINANCE COOLDOWN
@@ -401,9 +417,189 @@ class MarketDataProvider:
     # TICKERS
     # ==================================================================
 
+    def _binance_ticker_get(
+        self,
+        params: Optional[dict],
+        context: str,
+    ) -> Tuple[Optional[list], bool]:
+        """
+        GET /api/v3/ticker/24hr over the endpoint list.
+
+        Returns (rows or None, rate_limited).
+        """
+
+        for endpoint in BINANCE_TICKER_ENDPOINTS:
+
+            try:
+
+                response = self.session.get(
+                    endpoint,
+                    params=params,
+                    timeout=self.timeout,
+                )
+
+            except requests.RequestException as exc:
+
+                log.warning(
+                    "BINANCE TICKER REQUEST ERROR | "
+                    "endpoint=%s error=%s",
+                    endpoint,
+                    exc,
+                )
+
+                continue
+
+            if response.status_code in (
+                418,
+                429,
+            ):
+
+                self._handle_binance_limit_response(
+                    response,
+                    context,
+                )
+
+                return None, True
+
+            if (
+                response.status_code == 400
+                and params
+            ):
+
+                # e.g. a symbol in the filtered list was delisted.
+                log.warning(
+                    "BINANCE TICKER BAD REQUEST | "
+                    "context=%s body=%s",
+                    context,
+                    response.text[:200],
+                )
+
+                return None, False
+
+            if response.status_code != 200:
+
+                log.warning(
+                    "BINANCE TICKER HTTP ERROR | "
+                    "status=%s endpoint=%s",
+                    response.status_code,
+                    endpoint,
+                )
+
+                continue
+
+            try:
+
+                raw = response.json()
+
+            except ValueError:
+
+                log.warning(
+                    "BINANCE TICKER INVALID JSON | "
+                    "endpoint=%s",
+                    endpoint,
+                )
+
+                continue
+
+            if isinstance(
+                raw,
+                list,
+            ):
+                return raw, False
+
+        return None, False
+
+    def _parse_binance_tickers(
+        self,
+        raw: list,
+        remember_symbols: bool,
+    ) -> Dict[str, dict]:
+
+        result: Dict[str, dict] = {}
+        present = []
+
+        for item in raw:
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            symbol = item.get(
+                "symbol"
+            )
+
+            if (
+                symbol
+                not in TARGET_SYMBOLS
+            ):
+                continue
+
+            present.append(symbol)
+
+            try:
+
+                last_price = float(
+                    item["lastPrice"]
+                )
+
+                if "priceChangePercent" in item:
+
+                    change_pct = float(
+                        item["priceChangePercent"]
+                    )
+
+                else:
+
+                    # type=MINI has no priceChangePercent; Binance
+                    # defines it as (last - open) / open * 100.
+                    open_price = float(
+                        item["openPrice"]
+                    )
+
+                    change_pct = (
+                        (last_price - open_price)
+                        / open_price
+                        * 100.0
+                        if open_price > 0
+                        else 0.0
+                    )
+
+                _keep_most_liquid(
+                    result,
+                    resolve_alias(symbol),
+                    {
+                        "lastPrice": last_price,
+                        "quoteVolume": float(
+                            item["quoteVolume"]
+                        ),
+                        "priceChangePercent": change_pct,
+                    },
+                )
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        if remember_symbols and present:
+            self._binance_known_symbols = sorted(set(present))
+            self._binance_known_at = time.time()
+
+        return result
+
     def fetch_binance(
         self,
     ) -> Dict[str, dict]:
+        """
+        Every cycle only the ~230 tracked symbols are requested, in the
+        compact MINI form (about 1/15 of the full all-market response).
+        The full list is fetched at start, hourly, and whenever the
+        filtered request is rejected, to learn which symbols exist.
+        """
 
         if (
             not self.binance_enabled
@@ -415,128 +611,67 @@ class MarketDataProvider:
             "BINANCE TICKER FETCH START"
         )
 
-        for endpoint in BINANCE_TICKER_ENDPOINTS:
+        if (
+            self._binance_known_symbols
+            and time.time() - self._binance_known_at
+            < BINANCE_FULL_TICKER_REFRESH_SEC
+        ):
 
-            try:
+            raw, limited = self._binance_ticker_get(
+                {
+                    "symbols": json.dumps(
+                        self._binance_known_symbols,
+                        separators=(",", ":"),
+                    ),
+                    "type": "MINI",
+                },
+                "ticker",
+            )
 
-                response = self.session.get(
-                    endpoint,
-                    timeout=self.timeout,
-                )
+            if limited:
+                return {}
 
-                if response.status_code in (
-                    418,
-                    429,
-                ):
+            if raw is not None:
 
-                    self._handle_binance_limit_response(
-                        response,
-                        "ticker",
-                    )
-
-                    return {}
-
-                if response.status_code != 200:
-
-                    log.warning(
-                        "BINANCE TICKER HTTP ERROR | "
-                        "status=%s endpoint=%s",
-                        response.status_code,
-                        endpoint,
-                    )
-
-                    continue
-
-                try:
-
-                    raw = response.json()
-
-                except ValueError:
-
-                    log.warning(
-                        "BINANCE TICKER INVALID JSON | "
-                        "endpoint=%s",
-                        endpoint,
-                    )
-
-                    continue
-
-                if not isinstance(
+                result = self._parse_binance_tickers(
                     raw,
-                    list,
-                ):
-                    continue
-
-                result = {}
-
-                for item in raw:
-
-                    if not isinstance(
-                        item,
-                        dict,
-                    ):
-                        continue
-
-                    symbol = item.get(
-                        "symbol"
-                    )
-
-                    if (
-                        symbol
-                        not in TARGET_SYMBOLS
-                    ):
-                        continue
-
-                    try:
-
-                        normalized = resolve_alias(
-                            symbol
-                        )
-
-                        _keep_most_liquid(
-                            result,
-                            normalized,
-                            {
-                                "lastPrice": float(
-                                    item["lastPrice"]
-                                ),
-                                "quoteVolume": float(
-                                    item["quoteVolume"]
-                                ),
-                                "priceChangePercent": float(
-                                    item[
-                                        "priceChangePercent"
-                                    ]
-                                ),
-                            },
-                        )
-
-                    except (
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ):
-                        continue
+                    remember_symbols=False,
+                )
 
                 if result:
 
                     log.info(
-                        "BINANCE TICKER OK | "
-                        "symbols=%s endpoint=%s",
+                        "BINANCE TICKER OK | symbols=%s mode=filtered",
                         len(result),
-                        endpoint,
                     )
 
                     return result
 
-            except requests.RequestException as exc:
+            log.info(
+                "BINANCE FILTERED TICKER UNAVAILABLE | "
+                "refreshing full symbol list"
+            )
 
-                log.warning(
-                    "BINANCE TICKER REQUEST ERROR | "
-                    "endpoint=%s error=%s",
-                    endpoint,
-                    exc,
+        raw, limited = self._binance_ticker_get(
+            None,
+            "ticker",
+        )
+
+        if not limited and raw is not None:
+
+            result = self._parse_binance_tickers(
+                raw,
+                remember_symbols=True,
+            )
+
+            if result:
+
+                log.info(
+                    "BINANCE TICKER OK | symbols=%s mode=full",
+                    len(result),
                 )
+
+                return result
 
         log.error(
             "BINANCE TICKER FAILED | "
@@ -1578,6 +1713,36 @@ class MarketDataProvider:
     # ALL SOURCES
     # ==================================================================
 
+    def _cached_tickers(
+        self,
+        name: str,
+        fetcher,
+        force: bool,
+    ) -> Dict[str, dict]:
+
+        fetched_at, cached = self._ticker_cache.get(
+            name,
+            (0.0, {}),
+        )
+
+        if (
+            not force
+            and cached
+            and time.time() - fetched_at
+            < FALLBACK_TICKER_TTL_SEC
+        ):
+            return cached
+
+        fresh = fetcher()
+
+        if fresh:
+            self._ticker_cache[name] = (
+                time.time(),
+                fresh,
+            )
+
+        return fresh
+
     def fetch_all_sources(
         self,
     ) -> Tuple[
@@ -1588,9 +1753,21 @@ class MarketDataProvider:
 
         binance = self.fetch_binance()
 
-        bybit = self.fetch_bybit()
+        # Binance down -> the backup exchanges become the analysis source
+        # for everything, so they must be current.
+        force = not binance
 
-        kucoin = self.fetch_kucoin()
+        bybit = self._cached_tickers(
+            "bybit",
+            self.fetch_bybit,
+            force,
+        )
+
+        kucoin = self._cached_tickers(
+            "kucoin",
+            self.fetch_kucoin,
+            force,
+        )
 
         log.info(
             "MARKET SOURCES | "

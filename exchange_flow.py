@@ -85,6 +85,20 @@ class ExchangeFlowTracker:
             chain: {self._norm_addr(chain, addr) for addr in (wallets or {})}
             for chain, wallets in settings.exchange_wallets.items()
         }
+        # "chain:address:action" -> newest block (EVM) / timestamp ms (TRON)
+        # seen, so later scans only request newer transfers instead of
+        # re-downloading the last 20-30 every 2 minutes (Render bandwidth).
+        self._cursor: Dict[str, int] = {}
+
+    def _advance_cursor(self, key: str, txs: list, field: str) -> None:
+        newest = self._cursor.get(key, 0)
+        for tx in txs:
+            try:
+                newest = max(newest, int(tx.get(field) or 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if newest:
+            self._cursor[key] = newest
 
     @staticmethod
     def _norm_addr(chain: str, address: str) -> str:
@@ -182,10 +196,16 @@ class ExchangeFlowTracker:
         for address, label in wallets.items():
             if native_price is not None:
                 signals.extend(self._scan_evm_native(chain, api_key, address, label, native_symbol, native_price))
-            txs = self._evm_api_get(chain, {
+            cursor_key = f"{chain}:{address}:tokentx"
+            params = {
                 "module": "account", "action": "tokentx", "address": address,
                 "sort": "desc", "offset": 30, "page": 1, "apikey": api_key,
-            })
+            }
+            if cursor_key in self._cursor:
+                # inclusive: same-block transfers are deduped by is_new_tx
+                params["startblock"] = self._cursor[cursor_key]
+            txs = self._evm_api_get(chain, params)
+            self._advance_cursor(cursor_key, txs, "blockNumber")
             for tx in txs:
                 token_candidates.append((address, label, tx))
 
@@ -234,10 +254,15 @@ class ExchangeFlowTracker:
 
     def _scan_evm_native(self, chain: str, api_key: str, address: str, label: str,
                           native_symbol: str, native_price: float) -> List[ExchangeFlowSignal]:
-        txs = self._evm_api_get(chain, {
+        cursor_key = f"{chain}:{address}:txlist"
+        params = {
             "module": "account", "action": "txlist", "address": address,
             "sort": "desc", "offset": 20, "page": 1, "apikey": api_key,
-        })
+        }
+        if cursor_key in self._cursor:
+            params["startblock"] = self._cursor[cursor_key]
+        txs = self._evm_api_get(chain, params)
+        self._advance_cursor(cursor_key, txs, "blockNumber")
         out: List[ExchangeFlowSignal] = []
         for tx in txs:
             tx_hash = tx.get("hash", "")
@@ -280,9 +305,13 @@ class ExchangeFlowTracker:
 
     def _scan_tron_trc20(self, address: str, label: str) -> List[ExchangeFlowSignal]:
         url = f"{TRONGRID_BASE}/v1/accounts/{address}/transactions/trc20"
+        cursor_key = f"TRON:{address}:trc20"
+        params = {"limit": 30, "only_confirmed": "true"}
+        if cursor_key in self._cursor:
+            params["min_timestamp"] = self._cursor[cursor_key]
         try:
             res = self.session.get(
-                url, params={"limit": 30, "only_confirmed": "true"},
+                url, params=params,
                 headers=self._tron_headers(), timeout=self.settings.http_timeout_sec,
             )
             payload = res.json()
@@ -293,6 +322,10 @@ class ExchangeFlowTracker:
         except (requests.RequestException, ValueError) as e:
             log.warning(f"TRON API خطا داد: {e}")
             return []
+        if isinstance(txs, list):
+            self._advance_cursor(cursor_key, txs, "block_timestamp")
+        else:
+            txs = []
 
         out: List[ExchangeFlowSignal] = []
         for tx in txs:
