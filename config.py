@@ -203,6 +203,33 @@ class Settings:
         _env_str("TELEGRAM_WEBHOOK_SECRET")
     )
 
+    # User list / invites / admin toggles stored (encrypted) in the GitHub
+    # repo, using GITHUB_TOKEN + GITHUB_REPO like the candle backup.
+    # Ignored when a Gist is configured (the Gist keeps priority).
+    users_github_enabled: bool = field(
+        default_factory=lambda:
+        _env_bool(
+            "USERS_GITHUB_ENABLED",
+            True,
+        )
+    )
+
+    users_github_path: str = field(
+        default_factory=lambda:
+        _env_str(
+            "USERS_GITHUB_PATH",
+            "bot_data/access_state.enc.json",
+        )
+    )
+
+    # Encryption key for that file. Empty -> derived from BOT_TOKEN.
+    # If you ever change BOT_TOKEN, put the OLD token here to keep access
+    # to the stored user list.
+    users_encryption_key: str = field(
+        default_factory=lambda:
+        _env_str("USERS_ENCRYPTION_KEY")
+    )
+
     # ========================================================
     # CEX market analysis
     # ========================================================
@@ -432,6 +459,18 @@ class Settings:
         _env_str(
             "GITHUB_CANDLE_PATH",
             "market_history",
+        )
+    )
+
+    # Candle history backup to the GitHub repo. OFF by default: it uploaded
+    # ~90 MB/hour (~2 GB/day), which alone exhausts Render's 5 GB monthly
+    # outbound bandwidth in 2-3 days. Refetching history from the exchange
+    # after a restart costs far less. Set CANDLE_GITHUB_BACKUP=true to enable.
+    candle_github_backup_enabled: bool = field(
+        default_factory=lambda:
+        _env_bool(
+            "CANDLE_GITHUB_BACKUP",
+            False,
         )
     )
 
@@ -718,7 +757,11 @@ class Settings:
 
     @property
     def github_candle_store_enabled(self) -> bool:
-        return bool(self.github_token and self.github_repo)
+        return bool(
+            self.candle_github_backup_enabled
+            and self.github_token
+            and self.github_repo
+        )
 
     @property
     def github_candle_store_token(self) -> str:
@@ -778,7 +821,7 @@ class Settings:
         if not self.github_token:
             problems.append(
                 "GITHUB_TOKEN تنظیم نشده است — "
-                "ذخیره تاریخچه کندل‌ها روی GitHub انجام نخواهد شد."
+                "لیست کاربران فقط روی دیسک محلی ذخیره می‌شود و با ری‌استارت پاک می‌شود."
             )
 
         if not self.github_repo:

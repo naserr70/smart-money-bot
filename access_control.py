@@ -5,14 +5,24 @@ per user — the "give the bot to someone for a set amount of time"
 requirement, plus admin-defined unique per-user invite passwords.
 
 Persistence: Render's free web-service plan wipes local disk on every
-restart/spin-down. To keep grants and admin controls across restarts, this
-class can sync its state to a free GitHub Gist instead of (or in addition to)
-a local file.
+restart/spin-down. To keep grants and admin controls across restarts, the
+state (users, invites, admin flags) is synced to one remote backend, and a
+local file is always kept as well:
+
+    1. GitHub Gist            — when GITHUB_GIST_ID + GITHUB_GIST_TOKEN are set
+    2. The GitHub repository  — otherwise, when GITHUB_TOKEN + GITHUB_REPO are
+       set (same credentials as the candle backup). The file is ENCRYPTED
+       (Fernet, key from USERS_ENCRYPTION_KEY or BOT_TOKEN) because the repo
+       can be public and the state contains chat IDs and invite passwords.
+    3. Local file only
 
 This module is intentionally UI-agnostic: it only tracks state and answers
 "is this chat_id currently allowed in?". The actual Telegram command parsing
 lives in bot_commands.py.
 """
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import os
@@ -23,11 +33,25 @@ from typing import Dict, List, Optional
 
 import requests
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:  # pragma: no cover - listed in requirements.txt
+    Fernet = None
+
+    class InvalidToken(Exception):
+        pass
+
 log = logging.getLogger("smart_money_bot.access_control")
 
 GIST_API_BASE = "https://api.github.com/gists"
 GIST_FILENAME = "smart_money_bot_access.json"
 GIST_LOAD_ATTEMPTS = 3
+
+GITHUB_API_BASE = "https://api.github.com"
+USERS_GITHUB_DEFAULT_PATH = "bot_data/access_state.enc.json"
+STATE_FILE_FORMAT = "fernet-v1"
+# Render auto-deploys on pushes to the tracked branch; state commits must not.
+STATE_COMMIT_MESSAGE = "[skip render] chore: persist bot access state (encrypted)"
 
 _SIGNAL_DELIVERY_STATE = {
     "smart_money": True,
@@ -68,6 +92,149 @@ def _is_unexpired(expires_at, now: Optional[datetime] = None) -> bool:
     return parsed > (now or datetime.now(timezone.utc))
 
 
+class GitHubRepoStateStore:
+    """Encrypted access-state file inside the GitHub repository.
+
+    Uses the Contents API (one small file, one commit per change). Reads go
+    through the API, not raw.githubusercontent.com, whose CDN can serve a
+    minutes-old copy and silently drop a recent grant.
+    """
+
+    def __init__(self, session: requests.Session, repo: str, token: str, secret: str,
+                 branch: str = "main", path: str = USERS_GITHUB_DEFAULT_PATH, timeout: int = 15):
+        self.session = session
+        self.repo = (repo or "").strip()
+        self.token = (token or "").strip()
+        self.branch = (branch or "main").strip()
+        self.path = (path or USERS_GITHUB_DEFAULT_PATH).strip("/")
+        self.timeout = max(1, int(timeout))
+        self._sha: Optional[str] = None
+        self._last_saved_digest: Optional[str] = None
+        self._lock = threading.Lock()
+        key_material = hashlib.sha256(f"smart-money-bot/access-state/v1:{secret}".encode("utf-8")).digest()
+        self._fernet = Fernet(base64.urlsafe_b64encode(key_material))
+
+    @classmethod
+    def build(cls, session: requests.Session, repo: str, token: str, secret: str,
+              branch: str = "main", path: str = USERS_GITHUB_DEFAULT_PATH) -> Optional["GitHubRepoStateStore"]:
+        if not (repo and "/" in repo and token):
+            return None
+        if not secret:
+            log.warning("ذخیره‌ی کاربران روی GitHub غیرفعال است: کلید رمزنگاری "
+                        "(USERS_ENCRYPTION_KEY یا BOT_TOKEN) تنظیم نشده.")
+            return None
+        if Fernet is None:
+            log.error("ذخیره‌ی کاربران روی GitHub غیرفعال است: پکیج cryptography نصب نیست "
+                      "(requirements.txt را دوباره نصب کنید).")
+            return None
+        return cls(session, repo, token, secret, branch=branch, path=path)
+
+    def _url(self) -> str:
+        return f"{GITHUB_API_BASE}/repos/{self.repo}/contents/{self.path}"
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "SmartMoneyBot/2.0",
+        }
+
+    def _get(self):
+        return self.session.get(self._url(), params={"ref": self.branch},
+                                headers=self._headers(), timeout=self.timeout)
+
+    def fetch(self) -> Optional[dict]:
+        """State dict; an empty state when the file doesn't exist yet;
+        None on any error (callers must then NOT overwrite the remote file)."""
+        try:
+            res = self._get()
+        except requests.RequestException as e:
+            log.warning(f"خطا در خواندن لیست کاربران از GitHub: {e}")
+            return None
+        if res.status_code == 404:
+            self._sha = None
+            return {"users": {}, "invites": {}, "flags": {}}
+        if res.status_code != 200:
+            log.warning(f"خواندن لیست کاربران از GitHub خطا داد: {res.status_code} {res.text[:200]}")
+            return None
+        try:
+            meta = res.json()
+            raw = base64.b64decode((meta.get("content") or "").replace("\n", ""))
+            envelope = json.loads(raw.decode("utf-8"))
+            if envelope.get("format") != STATE_FILE_FORMAT:
+                log.error("فایل کاربران روی GitHub فرمت ناشناخته دارد؛ روی آن نوشته نمی‌شود.")
+                return None
+            plain = self._fernet.decrypt(envelope["data"].encode("ascii"))
+            data = json.loads(plain.decode("utf-8"))
+        except InvalidToken:
+            log.error("رمزگشایی لیست کاربران از GitHub ناموفق بود (کلید عوض شده؟ اگر BOT_TOKEN را "
+                      "تغییر داده‌اید، مقدار قبلی را در USERS_ENCRYPTION_KEY بگذارید). روی فایل چیزی نوشته نمی‌شود.")
+            return None
+        except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError, binascii.Error) as e:
+            log.error(f"فایل کاربران روی GitHub خوانا نیست: {e}")
+            return None
+        if not isinstance(data, dict):
+            log.error("فایل کاربران روی GitHub ساختار معتبری ندارد.")
+            return None
+        self._sha = meta.get("sha")
+        self._last_saved_digest = hashlib.sha256(
+            json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return data
+
+    def _refresh_sha(self) -> bool:
+        try:
+            res = self._get()
+        except requests.RequestException:
+            return False
+        if res.status_code == 404:
+            self._sha = None
+            return True
+        if res.status_code != 200:
+            return False
+        try:
+            self._sha = res.json().get("sha")
+        except ValueError:
+            return False
+        return True
+
+    def save(self, state: dict) -> bool:
+        plain = json.dumps(state, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(plain).hexdigest()
+        envelope = {
+            "format": STATE_FILE_FORMAT,
+            "note": "Smart Money Bot access state (users, invites, admin flags). "
+                    "Encrypted; the key is derived from USERS_ENCRYPTION_KEY or BOT_TOKEN.",
+            "data": self._fernet.encrypt(plain).decode("ascii"),
+        }
+        content_b64 = base64.b64encode(json.dumps(envelope, indent=2).encode("utf-8")).decode("ascii")
+        with self._lock:
+            if digest == self._last_saved_digest:
+                return True
+            for attempt in range(2):
+                body = {"message": STATE_COMMIT_MESSAGE, "content": content_b64, "branch": self.branch}
+                if self._sha:
+                    body["sha"] = self._sha
+                try:
+                    res = self.session.put(self._url(), json=body, headers=self._headers(), timeout=self.timeout)
+                except requests.RequestException as e:
+                    log.warning(f"خطا در ذخیره‌ی لیست کاربران روی GitHub: {e}")
+                    return False
+                if res.status_code in (200, 201):
+                    try:
+                        self._sha = res.json()["content"]["sha"]
+                    except (ValueError, KeyError, TypeError):
+                        self._sha = None
+                    self._last_saved_digest = digest
+                    return True
+                if res.status_code in (409, 422) and attempt == 0 and self._refresh_sha():
+                    continue  # file changed on GitHub meanwhile: retry on its latest version
+                log.warning(f"ذخیره‌ی لیست کاربران روی GitHub خطا داد: {res.status_code} {res.text[:200]}")
+                return False
+        return False
+
+
 class AccessControl:
     SIGNAL_CONTROL_DEFAULTS = {
         "smart_money": True,
@@ -78,23 +245,32 @@ class AccessControl:
     }
 
     def __init__(self, state_file_path: str, admin_chat_id: str,
-                 gist_id: str = "", gist_token: str = "", http_session: requests.Session = None):
+                 gist_id: str = "", gist_token: str = "", http_session: requests.Session = None,
+                 github_repo: str = "", github_token: str = "", github_branch: str = "main",
+                 github_path: str = USERS_GITHUB_DEFAULT_PATH, encryption_secret: str = ""):
         self._lock = threading.RLock()
         self._state_file_path = state_file_path
         self.admin_chat_id = str(admin_chat_id) if admin_chat_id else ""
         self._gist_id = gist_id
         self._gist_token = gist_token
         self._http = http_session or requests.Session()
+        # The Gist keeps priority when configured (existing setups keep working).
+        self._repo_store: Optional[GitHubRepoStateStore] = None
+        if not self._gist_enabled():
+            self._repo_store = GitHubRepoStateStore.build(
+                self._http, github_repo, github_token, encryption_secret,
+                branch=github_branch, path=github_path,
+            )
 
         self._users: Dict[str, dict] = {}
         self._invites: Dict[str, dict] = {}
         # Permanent flags that must survive restarts (e.g. first-start announce
         # and the admin's per-category Telegram signal delivery controls).
         self._flags: Dict[str, bool] = {}
-        # True once the Gist state was read successfully. Until then we must
-        # never PATCH the Gist, or a transient read error at startup would
-        # overwrite every stored user with an empty list.
-        self._gist_synced = False
+        # True once the remote state was read successfully. Until then we must
+        # never write the remote copy, or a transient read error at startup
+        # would overwrite every stored user with an empty list.
+        self._remote_synced = False
         self._load()
         self._sync_signal_delivery_state()
 
@@ -106,6 +282,42 @@ class AccessControl:
     def _gist_headers(self) -> dict:
         return {"Authorization": f"token {self._gist_token}", "Accept": "application/vnd.github+json"}
 
+    def _remote_backend(self) -> Optional[str]:
+        if self._gist_enabled():
+            return "gist"
+        if self._repo_store is not None:
+            return "repo"
+        return None
+
+    def storage_label(self) -> str:
+        return {
+            "gist": "GitHub Gist",
+            "repo": "GitHub (رمزنگاری‌شده)",
+        }.get(self._remote_backend(), "محلی (با ری‌استارت پاک می‌شود)")
+
+    def _remote_fetch(self) -> Optional[dict]:
+        backend = self._remote_backend()
+        if backend == "gist":
+            return self._gist_fetch()
+        if backend == "repo":
+            return self._repo_store.fetch()
+        return None
+
+    def _state_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "users": dict(self._users),
+                "invites": dict(self._invites),
+                "flags": dict(self._flags),
+            }
+
+    def _remote_save(self) -> None:
+        backend = self._remote_backend()
+        if backend == "gist":
+            self._gist_save()
+        elif backend == "repo":
+            self._repo_store.save(self._state_snapshot())
+
     def _apply_loaded_state(self, data: dict) -> None:
         users = data.get("users") or {}
         invites = data.get("invites") or {}
@@ -116,26 +328,28 @@ class AccessControl:
             self._flags = flags if isinstance(flags, dict) else {}
 
     def _load(self) -> None:
-        if self._gist_enabled():
+        backend = self._remote_backend()
+        if backend:
+            label = self.storage_label()
             data = None
             for attempt in range(GIST_LOAD_ATTEMPTS):
-                data = self._gist_fetch()
+                data = self._remote_fetch()
                 if data is not None:
                     break
                 if attempt < GIST_LOAD_ATTEMPTS - 1:
                     time.sleep(2 * (attempt + 1))
             if data is not None:
                 self._apply_loaded_state(data)
-                self._gist_synced = True
-                log.info(f"{len(self._users)} کاربر و {len(self._invites)} رمز دعوت از GitHub Gist بازیابی شد.")
+                self._remote_synced = True
+                log.info(f"{len(self._users)} کاربر و {len(self._invites)} رمز دعوت از {label} بازیابی شد.")
                 return
-            log.warning("بازیابی از GitHub Gist ناموفق بود؛ به فایل محلی برمی‌گردم (ممکن است خالی باشد). "
-                        "تا وقتی Gist دوباره خوانده نشود، روی آن چیزی نوشته نمی‌شود.")
+            log.warning(f"بازیابی از {label} ناموفق بود؛ به فایل محلی برمی‌گردم (ممکن است خالی باشد). "
+                        "تا وقتی نسخه‌ی آنلاین دوباره خوانده نشود، روی آن چیزی نوشته نمی‌شود.")
         self._load_local()
 
-    def _recover_gist_state(self) -> bool:
-        """Re-read the Gist after a failed startup load and merge local changes on top."""
-        data = self._gist_fetch()
+    def _recover_remote_state(self) -> bool:
+        """Re-read the remote state after a failed startup load and merge local changes on top."""
+        data = self._remote_fetch()
         if data is None:
             return False
         remote = {"users": {}, "invites": {}, "flags": {}}
@@ -150,21 +364,21 @@ class AccessControl:
             self._users = remote["users"]
             self._invites = remote["invites"]
             self._flags = remote["flags"]
-            self._gist_synced = True
+            self._remote_synced = True
         self._sync_signal_delivery_state()
-        log.info("اتصال به GitHub Gist برقرار شد؛ داده‌ی محلی با Gist ادغام شد.")
+        log.info(f"اتصال به {self.storage_label()} برقرار شد؛ داده‌ی محلی با نسخه‌ی آنلاین ادغام شد.")
         return True
 
     def _persist(self) -> None:
-        if self._gist_enabled():
-            if not self._gist_synced and not self._recover_gist_state():
-                log.warning("GitHub Gist هنوز خوانده نشده؛ برای جلوگیری از پاک شدن کاربران، "
-                            "فقط در فایل محلی ذخیره شد.")
-                self._save_local()
-                return
-            self._gist_save()
-        else:
-            self._save_local()
+        # A local copy is always kept (fast restore within the same instance).
+        self._save_local()
+        if not self._remote_backend():
+            return
+        if not self._remote_synced and not self._recover_remote_state():
+            log.warning("نسخه‌ی آنلاین لیست کاربران هنوز خوانده نشده؛ برای جلوگیری از پاک شدن کاربران، "
+                        "فقط در فایل محلی ذخیره شد.")
+            return
+        self._remote_save()
 
     def _gist_fetch(self) -> Optional[dict]:
         try:
@@ -186,12 +400,7 @@ class AccessControl:
             return None
 
     def _gist_save(self) -> None:
-        with self._lock:
-            content = json.dumps({
-                "users": self._users,
-                "invites": self._invites,
-                "flags": self._flags,
-            }, ensure_ascii=False, indent=2)
+        content = json.dumps(self._state_snapshot(), ensure_ascii=False, indent=2)
         payload = {"files": {GIST_FILENAME: {"content": content}}}
         try:
             res = self._http.patch(f"{GIST_API_BASE}/{self._gist_id}", headers=self._gist_headers(),
@@ -218,12 +427,7 @@ class AccessControl:
     def _save_local(self) -> None:
         if not self._state_file_path:
             return
-        with self._lock:
-            payload = {
-                "users": self._users,
-                "invites": self._invites,
-                "flags": self._flags,
-            }
+        payload = self._state_snapshot()
         tmp_path = f"{self._state_file_path}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:

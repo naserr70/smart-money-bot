@@ -124,6 +124,23 @@ access = AccessControl(
     gist_id=settings.github_gist_id,
     gist_token=settings.github_gist_token,
     http_session=http_session,
+    github_repo=(
+        settings.github_repo
+        if settings.users_github_enabled
+        else ""
+    ),
+    github_token=settings.github_token,
+    github_branch=settings.github_branch,
+    github_path=settings.users_github_path,
+    encryption_secret=(
+        settings.users_encryption_key
+        or settings.bot_token
+    ),
+)
+
+log.info(
+    "USER STORAGE | backend=%s",
+    access.storage_label(),
 )
 
 notifier = TelegramNotifier(
@@ -153,7 +170,13 @@ log.info(
 github_backup = GitHubCandleBackup(
     session=http_session,
     repo=settings.github_repo,
-    token=settings.github_token,
+    # Without a token the backup is "not configured": no uploads, no
+    # restores (see CANDLE_GITHUB_BACKUP in config.py).
+    token=(
+        settings.github_token
+        if settings.candle_github_backup_enabled
+        else ""
+    ),
     branch=settings.github_branch,
     root_path=settings.github_candle_path,
     timeout=settings.github_http_timeout_sec,
@@ -168,8 +191,8 @@ if github_backup.is_configured():
     )
 else:
     log.warning(
-        "GITHUB CANDLE BACKUP DISABLED | "
-        "set GITHUB_TOKEN and GITHUB_REPO to enable"
+        "GITHUB CANDLE BACKUP DISABLED | saves Render bandwidth; "
+        "set CANDLE_GITHUB_BACKUP=true (+ GITHUB_TOKEN, GITHUB_REPO) to enable"
     )
 
 market_analyzer = MarketAnalyzer(
@@ -761,10 +784,6 @@ def build_admin_status_text() -> str:
 
     health = state.snapshot_health()
 
-    gist_active = bool(
-        settings.github_gist_id and settings.github_gist_token
-    )
-
     backup_ok = (
         github_backup.is_configured()
         and github_backup.status().get("last_backup_ok")
@@ -780,7 +799,7 @@ def build_admin_status_text() -> str:
 
         (
             f"💾 حافظه کاربران: "
-            f"<code>{'فعال (Gist)' if gist_active else 'محلی'}</code>"
+            f"<code>{esc(access.storage_label())}</code>"
         ),
 
         (
