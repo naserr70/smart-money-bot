@@ -1,0 +1,7 @@
+{
+  "format": "hmac-sha256-ctr-v1",
+  "note": "Smart Money Bot access state (users, invites, admin settings). Encrypted; the key is derived from USERS_ENCRYPTION_KEY or BOT_TOKEN.",
+  "nonce": "UIU30LpqbpJi85aYm/4YrA==",
+  "data": "dkIaqBWU0XA4HnxIvdb53IdD5bLlYdCq6pLwpxmoPeC3qRPFDkG9uIS1Ur7ADJBA1XLp6WWVKk8k1s9oYRgFpw6M",
+  "tag": "6Cf/+K8xpIo9TizsXvnsb0Ao5Rds6PDvgIKSMmcckhU="
+}
