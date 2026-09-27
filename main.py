@@ -31,10 +31,15 @@ periodically uploads changed files in a single Trees API commit.
 """
 
 import atexit
+import collections
+import hashlib
+import json
 import logging
 import os
+import queue
 import signal as os_signal
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -209,6 +214,44 @@ whale_tracker = ExchangeFlowTracker(
     state,
     http_session,
 )
+
+
+def _reset_http_pools_after_fork() -> None:
+    """
+    Under gunicorn --preload (Render's default) this module is imported once
+    and then forked into the worker processes. Pooled keep-alive sockets
+    created before the fork would be shared by two processes and garble each
+    other's HTTP traffic, so every forked child starts with empty pools.
+    Closing only drops the child's copy; the parent's connections stay open.
+    """
+
+    sessions = (
+        http_session,
+        notifier.session,
+        getattr(
+            getattr(whale_tracker, "price_feed", None),
+            "session",
+            None,
+        ),
+    )
+
+    for session in sessions:
+
+        if session is None:
+            continue
+
+        for adapter in list(session.adapters.values()):
+
+            try:
+                adapter.close()
+            except Exception:
+                pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_reset_http_pools_after_fork,
+    )
 
 
 def broadcast_targets():
@@ -653,11 +696,103 @@ def register_telegram_webhook():
         )
 
 
+# The signal loops must run in exactly ONE process. With gunicorn --preload
+# they run in the master; without it every worker imports this module, and
+# each would otherwise start its own loops and send every message N times.
+LOOP_LOCK_RETRY_SEC = 30
+
+_loop_owner = {
+    "pid": None,
+    "lock_handle": None,
+}
+
+
+def _loop_lock_path() -> str:
+
+    digest = hashlib.sha1(
+        os.path.abspath(os.getcwd()).encode("utf-8")
+    ).hexdigest()[:12]
+
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"smart_money_bot_loops_{digest}.lock",
+    )
+
+
+def _try_acquire_loop_lock() -> bool:
+
+    try:
+        import fcntl
+    except ImportError:
+        return True  # non-Unix: single-process deployments only
+
+    try:
+        handle = open(_loop_lock_path(), "a+")
+    except OSError:
+        log.exception("LOOP LOCK FILE UNAVAILABLE | running loops anyway")
+        return True
+
+    try:
+        fcntl.flock(
+            handle.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except OSError:
+        handle.close()
+        return False
+
+    # Keep the file open for the life of the process (holds the lock).
+    _loop_owner["lock_handle"] = handle
+
+    return True
+
+
+def _standby_for_loops() -> None:
+
+    while True:
+
+        time.sleep(LOOP_LOCK_RETRY_SEC)
+
+        if _try_acquire_loop_lock():
+
+            log.warning(
+                "BACKGROUND LOOPS TAKEN OVER | pid=%s",
+                os.getpid(),
+            )
+
+            _start_loops()
+
+            return
+
+
 def start_background_threads():
 
+    if not _try_acquire_loop_lock():
+
+        log.info(
+            "BACKGROUND LOOPS RUN IN ANOTHER PROCESS | pid=%s | standby",
+            os.getpid(),
+        )
+
+        threading.Thread(
+            target=_standby_for_loops,
+            daemon=True,
+            name="loops-standby",
+        ).start()
+
+        return
+
+    _start_loops()
+
+
+def _start_loops():
+
+    _loop_owner["pid"] = os.getpid()
+
     log.info(
-        "BACKGROUND SERVICES INITIALIZING | instance=%s",
+        "BACKGROUND SERVICES INITIALIZING | instance=%s pid=%s",
         INSTANCE_ID,
+        os.getpid(),
     )
 
     for problem in settings.validate():
@@ -799,7 +934,7 @@ def build_admin_status_text() -> str:
 
         (
             f"💾 حافظه کاربران: "
-            f"<code>{esc(access.storage_label())}</code>"
+            f"<code>{esc(access.storage_status_text())}</code>"
         ),
 
         (
@@ -897,6 +1032,110 @@ def telegram_webhook():
         or {}
     )
 
+    if _already_seen(update):
+
+        log.info(
+            "TELEGRAM UPDATE DUPLICATE IGNORED | update_id=%s",
+            update.get("update_id"),
+        )
+
+        return "ok", 200
+
+    # Answer Telegram at once and handle the update in the background.
+    # A slow handler (GitHub save, broadcast) used to risk a worker timeout;
+    # Telegram then re-sent the same update and a menu toggle flipped back.
+    _submit_update(update)
+
+    return "ok", 200
+
+
+MAX_REMEMBERED_UPDATES = 2000
+
+_update_lock = threading.Lock()
+_seen_update_ids = collections.OrderedDict()
+_update_worker = {
+    "pid": None,
+    "queue": None,
+}
+
+
+def _seen_updates_path() -> str:
+
+    digest = hashlib.sha1(
+        os.path.abspath(os.getcwd()).encode("utf-8")
+    ).hexdigest()[:12]
+
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"smart_money_bot_updates_{digest}.json",
+    )
+
+
+def _already_seen_shared(update_id: int) -> bool:
+    """
+    Check-and-record in a file shared by every gunicorn worker, so a
+    re-delivered update is ignored even when it reaches another worker.
+    """
+
+    try:
+        import fcntl
+    except ImportError:
+        return False
+
+    try:
+
+        with open(_seen_updates_path(), "a+", encoding="utf-8") as handle:
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+            handle.seek(0)
+
+            try:
+                seen = json.loads(handle.read() or "[]")
+            except ValueError:
+                seen = []
+
+            if not isinstance(seen, list):
+                seen = []
+
+            if update_id in seen:
+                return True
+
+            seen.append(update_id)
+
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps(seen[-MAX_REMEMBERED_UPDATES:]))
+            handle.flush()
+
+    except OSError:
+        log.exception("TELEGRAM UPDATE DEDUPE FILE UNAVAILABLE")
+
+    return False
+
+
+def _already_seen(update: dict) -> bool:
+
+    update_id = update.get("update_id")
+
+    if not isinstance(update_id, int):
+        return False
+
+    with _update_lock:
+
+        if update_id in _seen_update_ids:
+            return True
+
+        _seen_update_ids[update_id] = None
+
+        while len(_seen_update_ids) > MAX_REMEMBERED_UPDATES:
+            _seen_update_ids.popitem(last=False)
+
+        return _already_seen_shared(update_id)
+
+
+def _process_update(update: dict) -> None:
+
     try:
 
         bot_commands.handle_update(
@@ -913,10 +1152,52 @@ def telegram_webhook():
             "TELEGRAM UPDATE PROCESSING ERROR"
         )
 
-    return "ok", 200
+
+def _update_worker_loop(pending_updates: "queue.Queue") -> None:
+
+    while True:
+        _process_update(pending_updates.get())
+
+
+def _submit_update(update: dict) -> None:
+    """One ordered worker thread per process (forked workers start their own)."""
+
+    with _update_lock:
+
+        if _update_worker["pid"] != os.getpid():
+
+            pending_updates = queue.Queue(maxsize=500)
+
+            threading.Thread(
+                target=_update_worker_loop,
+                args=(pending_updates,),
+                daemon=True,
+                name="telegram-updates",
+            ).start()
+
+            _update_worker["pid"] = os.getpid()
+            _update_worker["queue"] = pending_updates
+
+        pending_updates = _update_worker["queue"]
+
+    try:
+
+        pending_updates.put_nowait(update)
+
+    except queue.Full:
+
+        log.warning("TELEGRAM UPDATE QUEUE FULL | processing inline")
+
+        _process_update(update)
 
 
 def shutdown_persistence():
+
+    # Only the process that runs the loops owns this data. Forked gunicorn
+    # workers inherit this hook but hold stale copies, which must never
+    # overwrite the real files on exit.
+    if _loop_owner["pid"] != os.getpid():
+        return
 
     log.info("PERSISTENCE SHUTDOWN START")
 

@@ -29,16 +29,26 @@ SIGNAL_CONTROL_ITEMS = (
     ("status_report", "📡", "گزارش وضعیت دوره‌ای (هر ۵ دقیقه)"),
 )
 
+# Buttons carry the TARGET state ("admin_set:whale:0"), so a press that is
+# delivered or tapped twice can't switch a setting back. The old
+# "admin_toggle_*" buttons in already-sent messages keep working.
 SIGNAL_TOGGLE_CALLBACKS = {
     f"admin_toggle_{category}": category
     for category, _, _ in SIGNAL_CONTROL_ITEMS
 }
+SIGNAL_SET_PREFIX = "admin_set:"
+
+
+def _with_save_warning(text: str, access: AccessControl) -> str:
+    """Append a visible warning when the change couldn't be saved online."""
+    warning = access.persistence_warning()
+    return f"{text}\n\n{warning}" if warning else text
 
 
 def _signal_control_text(access: AccessControl, notice: str = "") -> str:
     lines = []
     if notice:
-        lines.extend([notice, ""])
+        lines.extend([_with_save_warning(notice, access), ""])
     lines.extend([
         "🎛 <b>مدیریت پیام‌ها</b>",
         "",
@@ -57,11 +67,27 @@ def _signal_control_text(access: AccessControl, notice: str = "") -> str:
     return "\n".join(lines)
 
 
+def _parse_signal_set(data: str):
+    """"admin_set:<category>:<0|1>" -> (category, bool), else None."""
+    if not data.startswith(SIGNAL_SET_PREFIX):
+        return None
+    try:
+        category, target = data[len(SIGNAL_SET_PREFIX):].rsplit(":", 1)
+    except ValueError:
+        return None
+    if target not in ("0", "1") or category not in {cat for cat, _, _ in SIGNAL_CONTROL_ITEMS}:
+        return None
+    return category, target == "1"
+
+
 def _signal_control_markup(access: AccessControl) -> dict:
     rows = []
     for category, emoji, label in SIGNAL_CONTROL_ITEMS:
-        state = "🟢" if access.is_signal_enabled(category) else "🔴"
-        rows.append([{"text": f"{state} {emoji} {label}", "callback_data": f"admin_toggle_{category}"}])
+        enabled = access.is_signal_enabled(category)
+        state = "🟢" if enabled else "🔴"
+        target = 0 if enabled else 1
+        rows.append([{"text": f"{state} {emoji} {label}",
+                      "callback_data": f"{SIGNAL_SET_PREFIX}{category}:{target}"}])
     rows.append([
         {"text": "🔕 خاموش کردن همه", "callback_data": "admin_signals_all_off"},
         {"text": "🔔 روشن کردن همه", "callback_data": "admin_signals_all_on"},
@@ -225,7 +251,8 @@ def handle_update(update: dict, settings: Settings, access: AccessControl, notif
         if pending["action"] == "awaiting_revoke_target":
             existed = access.revoke(text)
             _pending.pop(chat_id, None)
-            notifier.send("✅ دسترسی حذف شد." if existed else "این کاربر از قبل دسترسی نداشت.",
+            notifier.send(_with_save_warning("✅ دسترسی حذف شد.", access) if existed
+                          else "این کاربر از قبل دسترسی نداشت.",
                           chat_id=chat_id, reply_markup=_main_menu_markup(is_admin, access))
             return
         if pending["action"] == "awaiting_broadcast_message":
@@ -271,7 +298,8 @@ def _notify_new_authorization(settings: Settings, access: AccessControl, notifie
     )
     admin_id = settings.admin_chat_id_resolved
     if admin_id and admin_id != chat_id:
-        notifier.send(f"👤 کاربر جدید تایید شد: <code>{esc(chat_id)}</code>", chat_id=admin_id)
+        notifier.send(_with_save_warning(f"👤 کاربر جدید تایید شد: <code>{esc(chat_id)}</code>", access),
+                      chat_id=admin_id)
 
 
 def _handle_callback_query(callback: dict, settings: Settings, access: AccessControl,
@@ -317,9 +345,14 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
     if data == "admin_signal_controls":
         notifier.edit_message(chat_id, message_id, _signal_control_text(access), reply_markup=_signal_control_markup(access))
         return
-    if data in SIGNAL_TOGGLE_CALLBACKS:
-        category = SIGNAL_TOGGLE_CALLBACKS[data]
-        enabled = access.toggle_signal(category)
+    set_request = _parse_signal_set(data)
+    if set_request is not None or data in SIGNAL_TOGGLE_CALLBACKS:
+        if set_request is not None:
+            category, target = set_request
+            enabled = access.set_signal_enabled(category, target)
+        else:
+            category = SIGNAL_TOGGLE_CALLBACKS[data]
+            enabled = access.toggle_signal(category)
         label = next(label for cat, _, label in SIGNAL_CONTROL_ITEMS if cat == category)
         log.info("SIGNAL DELIVERY CONTROL | admin=%s | category=%s | enabled=%s", chat_id, category, enabled)
         notice = f"{'🟢' if enabled else '🔴'} «{label}» {'فعال' if enabled else 'غیرفعال'} شد."
@@ -375,8 +408,11 @@ def _handle_callback_query(callback: dict, settings: Settings, access: AccessCon
         days_text = "نامحدود" if days is None else f"{days:.0f} روز"
         notifier.edit_message(
             chat_id, message_id,
-            f"✅ رمز اختصاصی ساخته شد:\n\n🔑 رمز: <code>{esc(password)}</code>\n⏳ مدت: {esc(days_text)}\n\n"
-            f"این رمز را به کاربر مورد نظر بدهید تا با ارسال /start و سپس این رمز، دسترسی‌اش فعال شود.",
+            _with_save_warning(
+                f"✅ رمز اختصاصی ساخته شد:\n\n🔑 رمز: <code>{esc(password)}</code>\n⏳ مدت: {esc(days_text)}\n\n"
+                f"این رمز را به کاربر مورد نظر بدهید تا با ارسال /start و سپس این رمز، دسترسی‌اش فعال شود.",
+                access,
+            ),
             reply_markup=_main_menu_markup(is_admin, access),
         )
         return
@@ -396,7 +432,9 @@ def _legacy_grant(text: str, admin_chat_id: str, access: AccessControl, notifier
             notifier.send("مقدار روز باید عدد باشد یا unlimited.", chat_id=admin_chat_id)
             return
     access.grant(target_chat_id, days=days)
-    notifier.send(f"✅ دسترسی برای <code>{esc(target_chat_id)}</code> تنظیم شد. انقضا: <code>{esc(access.expiry_text(target_chat_id))}</code>",
+    notifier.send(_with_save_warning(
+                      f"✅ دسترسی برای <code>{esc(target_chat_id)}</code> تنظیم شد. "
+                      f"انقضا: <code>{esc(access.expiry_text(target_chat_id))}</code>", access),
                   chat_id=admin_chat_id, reply_markup=_main_menu_markup(True, access))
     notifier.send(f"🎉 دسترسی شما فعال شد.\n⏳ <b>انقضا:</b> <code>{esc(access.expiry_text(target_chat_id))}</code>", chat_id=target_chat_id)
 
@@ -407,5 +445,6 @@ def _legacy_revoke(text: str, admin_chat_id: str, access: AccessControl, notifie
         notifier.send("فرمت درست: /revoke &lt;chat_id&gt;", chat_id=admin_chat_id)
         return
     existed = access.revoke(parts[1])
-    notifier.send("✅ دسترسی حذف شد." if existed else "این کاربر از قبل دسترسی نداشت.",
+    notifier.send(_with_save_warning("✅ دسترسی حذف شد.", access) if existed
+                  else "این کاربر از قبل دسترسی نداشت.",
                   chat_id=admin_chat_id, reply_markup=_main_menu_markup(True, access))
