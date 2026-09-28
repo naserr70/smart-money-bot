@@ -1,7 +1,7 @@
 {
   "format": "hmac-sha256-ctr-v1",
   "note": "Smart Money Bot access state (users, invites, admin settings). Encrypted; the key is derived from USERS_ENCRYPTION_KEY or BOT_TOKEN.",
-  "nonce": "F8aT3TSt7yUf33ZXoSxtYA==",
-  "data": "Gfc4Zl3x7PnvPL8Rc+i2eTk3Lc1Y4RVZYYKnJYp+aBiVg+EWH5PGuhTzRuVy7tAw0WA8bYn6Q2TetkYoCw3DVHWAi8eeONw8TNjiv9BQLePDkojGXrkmyUFdXRmhc/UpiTtwimjB11SXJ2FxWC+pKH5XNvdxww==",
-  "tag": "jAUmvwXNuvUkNhDPoIAGit9wLj5aAXT4Jfmsr2skXds="
+  "nonce": "l+60kAk0vXd/KutgVqk7hg==",
+  "data": "JdvWT27OQjJsLKpTmTW7fJPbRvf1FfvrE26Gve8ek7gP8vX5/iVDqSVif6UDF9FxIbZFp1926YMybhBfusymscTV2X67b96/OjkX7dljx98oM6PBPcrHzmrU+KKf50nxdvYC8ytfmkqA0FLw/Ht/8QZVOEC0qaDyxCf4t5tPl8qFiRpz62KZ0G+EtE51U7R6HNvwEH70Z9xhR21jahTKjkZC56A4lfOhvkScAaKSpxh5jXRmKoBXA9hbto5xhriaLOg4IRKdloWdFDaspY3ggRuIFtsweyYd/1nVQ7e3L8H9CQ/bjjvQVWtnCWSe64NC",
+  "tag": "gS0VtkcorSBgVssJXxvptBCGexkqCtqu1vKQEaZXsc4="
 }
